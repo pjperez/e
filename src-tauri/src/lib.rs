@@ -24,6 +24,14 @@ struct AppState {
     tools: Arc<ToolRegistry>,
     store: Mutex<engine::sessions::SessionStore>,
     runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Set once the frontend has registered its close handler. Until then the
+    /// close button must behave normally: preventing close while nothing can
+    /// draw the confirmation would leave the app impossible to quit.
+    ui_ready: AtomicBool,
+    /// A confirmation prompt is on screen. A second close attempt while it is
+    /// up means the user really wants out, so it is allowed through — the
+    /// escape hatch if the webview stops responding.
+    close_pending: AtomicBool,
 }
 
 impl AppState {
@@ -705,6 +713,32 @@ fn clear_session(state: tauri::State<AppState>, sid: Option<String>) -> Result<(
     Ok(())
 }
 
+/// Close the app for real. The window's own close is intercepted (see
+/// `on_window_event`) so the UI can confirm first; this is the path it calls
+/// once the user says yes. Going through `exit` rather than closing the window
+/// avoids re-entering the intercept.
+#[tauri::command]
+fn confirm_close(app: tauri::AppHandle, state: tauri::State<AppState>) {
+    // Signal in-flight runs to stop so they get the chance to write their
+    // tool results; a run killed mid-tool leaves history a provider rejects.
+    state.cancel_all();
+    app.exit(0);
+}
+
+/// The user chose to stay, so the next close attempt gets a fresh prompt
+/// instead of being waved straight through.
+#[tauri::command]
+fn close_dismissed(state: tauri::State<AppState>) {
+    state.close_pending.store(false, Ordering::SeqCst);
+}
+
+/// The frontend has booted and registered its close handler. Only from this
+/// point is it safe to intercept the close button.
+#[tauri::command]
+fn ui_ready(state: tauri::State<AppState>) {
+    state.ui_ready.store(true, Ordering::SeqCst);
+}
+
 pub fn run() {
     let config = Config::from_env();
     let state = AppState {
@@ -712,10 +746,34 @@ pub fn run() {
         tools: Arc::new(ToolRegistry::new()),
         store: Mutex::new(engine::sessions::SessionStore::new()),
         runs: Mutex::new(HashMap::new()),
+        ui_ready: AtomicBool::new(false),
+        close_pending: AtomicBool::new(false),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Closing is intercepted so the UI can confirm first — a run killed
+        // mid-tool loses work and leaves history the provider rejects.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let state = app.state::<AppState>();
+                // Never trap the user: if the UI hasn't booted it cannot draw
+                // the prompt, and a second attempt while the prompt is already
+                // up is taken as "yes, really". Both fall through to a normal
+                // close instead of preventing it.
+                if !state.ui_ready.load(Ordering::SeqCst) {
+                    return;
+                }
+                if state.close_pending.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                api.prevent_close();
+                let running: Vec<String> =
+                    state.runs.lock().map(|r| r.keys().cloned().collect()).unwrap_or_default();
+                let _ = window.emit("e:close_requested", serde_json::json!({ "running": running }));
+            }
+        })
         .setup(|app| {
             plugins::init(app.handle().clone());
             approval::init(app.handle().clone());
@@ -771,7 +829,10 @@ pub fn run() {
             project_remove,
             workspace_snapshot,
             workspace_revert,
-            search_sessions
+            search_sessions,
+            confirm_close,
+            close_dismissed,
+            ui_ready
         ])
         .run(tauri::generate_context!())
         .expect("error while running e");

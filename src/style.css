@@ -1040,7 +1040,13 @@ html[data-theme="light"] .empty-mark {
   background: var(--bg) !important;
   font-family: var(--mono) !important; font-size: 12px !important; line-height: 1.7 !important;
   color: var(--text-dim) !important; white-space: pre-wrap !important;
+  /* Reasoning runs long. Cap it and scroll inside so an expanded panel never
+     pushes the answer itself off screen. */
+  max-height: 260px !important; overflow-y: auto !important; overscroll-behavior: contain;
 }
+.think-body::-webkit-scrollbar { width: 8px; }
+.think-body::-webkit-scrollbar-thumb { background: var(--edge-2); border-radius: 999px; }
+.think-body::-webkit-scrollbar-track { background: transparent; }
 
 /* ---------- chat banner ---------- */
 #chat-banner {
