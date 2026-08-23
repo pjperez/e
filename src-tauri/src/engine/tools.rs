@@ -16,23 +16,33 @@ impl ToolContext {
     /// longer exists. Handing such a path to `Command::current_dir` fails with
     /// an opaque OS error ("The directory name is invalid. (os error 267)"),
     /// so resolve it up front and explain what to fix instead.
+    ///
+    /// Empty and relative paths are refused outright rather than resolved
+    /// against the process's current directory. That fallback depends on
+    /// wherever the app was launched from, so it silently pointed a project at
+    /// a folder inside the app's own source tree — and `write_file` then
+    /// created it, leaving stray directories behind. Failing loudly sends the
+    /// user to the project's ✎ to pick a real folder.
     pub fn dir(&self) -> Result<PathBuf, String> {
         let ws = self.workspace.as_path();
-        let abs = if ws.as_os_str().is_empty() {
-            std::env::current_dir().map_err(|e| format!("no working directory available: {e}"))?
-        } else if ws.is_absolute() {
-            ws.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| format!("no working directory available: {e}"))?
-                .join(ws)
-        };
-        if abs.is_dir() {
-            return Ok(abs);
+        if ws.as_os_str().is_empty() {
+            return Err(
+                "this chat has no project folder. Pick one for its project (sidebar → ✎)."
+                    .to_string(),
+            );
+        }
+        if ws.is_relative() {
+            return Err(format!(
+                "project folder is a relative path ({}), so it would resolve differently depending on where the app was started. Pick a real folder for this project (sidebar → ✎).",
+                ws.display()
+            ));
+        }
+        if ws.is_dir() {
+            return Ok(ws.to_path_buf());
         }
         Err(format!(
             "workspace folder does not exist: {}. Pick an existing folder for this project (sidebar → + New project), or move the folder back.",
-            abs.display()
+            ws.display()
         ))
     }
 }
@@ -423,3 +433,38 @@ pub fn run_tool(reg: &ToolRegistry, ctx: &ToolContext, name: &str, args: Value) 
 /// Millisecond timestamps collide when two plugin tools are called in the same
 /// tick, which used to make one call steal the other's reply.
 static PLUGIN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(ws: &str) -> ToolContext {
+        ToolContext { workspace: PathBuf::from(ws) }
+    }
+
+    /// A relative workspace resolves against wherever the app happened to be
+    /// launched from. If something once created a matching folder there, the
+    /// existence check passes and tools silently operate inside it.
+    #[test]
+    fn relative_workspace_is_refused_even_when_it_resolves() {
+        let cwd = std::env::current_dir().unwrap();
+        let stray = cwd.join("e-stray-check");
+        std::fs::create_dir_all(&stray).unwrap();
+
+        let got = ctx("e-stray-check").dir();
+        let _ = std::fs::remove_dir_all(&stray);
+
+        assert!(got.is_err(), "relative workspace resolved to {got:?}");
+    }
+
+    #[test]
+    fn an_absolute_existing_workspace_is_accepted() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(ctx(cwd.to_str().unwrap()).dir().unwrap(), cwd);
+    }
+
+    #[test]
+    fn an_empty_workspace_is_refused_rather_than_using_the_launch_dir() {
+        assert!(ctx("").dir().is_err());
+    }
+}

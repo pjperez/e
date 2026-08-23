@@ -1249,6 +1249,9 @@ function addSummaryCard(s: { steps: number; tools: number; stopped: boolean; err
 }
 
 // ---------- projects + sessions (left sidebar) ----------
+/// Name of the built-in bucket for work that belongs to no project. Chats there
+/// run in a scratch folder, not in whatever project was opened last.
+const DEFAULT_PROJECT = "Tasks";
 const sidebar = document.getElementById("sidebar") as HTMLElement;
 const sessList = document.getElementById("sess-list") as HTMLElement;
 const projAdd = document.getElementById("proj-add") as HTMLButtonElement;
@@ -1296,14 +1299,14 @@ function addStaticAssistant(content: string, reasoning = ""): Turn {
 function updateChatTitle(): void {
   const p = projects.find((x) => x.id === currentProject);
   const s = sessions.find((x) => x.id === currentSession);
-  chatTitle.textContent = ((p ? p.name : "Chats") + " / " + (s ? s.name : "New task"));
+  chatTitle.textContent = ((p ? p.name : DEFAULT_PROJECT) + " / " + (s ? s.name : "New task"));
 }
 
 function updateChatBanner(): void {
   const p = projects.find((x) => x.id === currentProject);
   const sess = sessions.find((x) => x.id === currentSession);
   const el = document.getElementById("chat-banner");
-  if (el) el.textContent = ((p ? p.name : "Chats") + " / " + (sess ? sess.name : "New task"));
+  if (el) el.textContent = ((p ? p.name : DEFAULT_PROJECT) + " / " + (sess ? sess.name : "New task"));
 }
 
 /// Seed context size for a chat we have never run in this app session. The
@@ -1363,29 +1366,38 @@ function renderSessions(): void {
       })();
     });
     row.addEventListener("click", () => {
-      if (p.id !== currentProject) {
-        currentProject = p.id;
-        void api.switchProject(p.id);
-      }
-      if (openProjs.has(p.id)) openProjs.delete(p.id);
-      else openProjs.add(p.id);
-      renderSessions();
+      void (async () => {
+        if (openProjs.has(p.id)) openProjs.delete(p.id);
+        else openProjs.add(p.id);
+        if (p.id !== currentProject) {
+          currentProject = p.id;
+          // Awaited: a new chat is created in whatever project the backend
+          // thinks is current, so the switch has to land before that can run.
+          await api.switchProject(p.id);
+        }
+        renderSessions();
+        await updateWorkspaceLabel();
+      })();
     });
     sessList.appendChild(row);
     if (!open) return;
     sessions
-      .filter((s) => (s as unknown as { project?: string }).project === p.id)
+      .filter((s) => s.project === p.id)
       .forEach((s) => {
         const c = document.createElement("div");
         c.className = "sess-item sub" + (s.id === currentSession ? " active" : "");
-        const st = chatState[s.id] || (s as unknown as { state?: string }).state || "idle";
+        const st = chatState[s.id] || s.state || "idle";
         const dot = document.createElement("span");
         dot.className = "sess-dot " + st;
         dot.title = st;
         const label = document.createElement("span");
         label.className = "sess-label";
         label.textContent = s.name;
-        label.title = "Open: " + s.name;
+        // A detached chat sits under this project but runs somewhere else, so
+        // say where rather than letting the folder it is filed under imply it.
+        label.title = s.detached
+          ? `Open: ${s.name}\nRuns in ${s.workspace} — not this project's folder (its original project was deleted).`
+          : "Open: " + s.name;
         const ren = document.createElement("button");
         ren.className = "sess-act";
         ren.textContent = "✎";
@@ -1462,19 +1474,42 @@ async function refreshSessions(): Promise<void> {
   for (const id of [...chatUI.keys()]) if (!alive.has(id)) chatUI.delete(id);
 
   renderSessions();
+  await updateWorkspaceLabel();
+}
+
+/// Footer line telling the user where the current project's chats run. Kept
+/// separate from `refreshSessions` so switching projects can update it without
+/// also re-expanding folders the user just collapsed.
+async function updateWorkspaceLabel(): Promise<void> {
+  const chat = sessions.find((x) => x.id === currentSession);
+  // A detached chat runs outside its project's folder, so showing the project's
+  // path here would answer "where does my work happen" with the wrong folder.
+  if (chat && chat.detached && chat.workspace) {
+    sbWs.textContent = chat.workspace;
+    sbWs.classList.toggle("missing", !(await api.pathIsDir(chat.workspace)));
+    sbWs.title = `This chat runs here, outside any project: ${chat.workspace}`;
+    return;
+  }
   const p0 = projects.find((x) => x.id === currentProject);
   const ws = p0 && p0.workspace ? p0.workspace : "";
-  sbWs.textContent = ws || ".";
+  // The scratch area does have a folder, but showing its path would imply a
+  // project that isn't there. Say what it means and keep the path in the title.
+  const scratch = !!(p0 && p0.scratch);
+  sbWs.textContent = scratch ? "no project folder" : ws || ".";
   // Flag a missing folder here rather than letting every tool call fail on it.
   const ok = ws ? await api.pathIsDir(ws) : true;
-  sbWs.classList.toggle("missing", !ok);
-  sbWs.title = ok ? ws : `Folder not found: ${ws} — open the project's ✎ to pick another`;
+  sbWs.classList.toggle("missing", !ok && !scratch);
+  sbWs.title = scratch
+    ? `One-off work, outside any project. Scratch folder: ${ws}`
+    : ok
+      ? ws
+      : `Folder not found: ${ws} — open the project's ✎ to pick another`;
 }
 
 async function loadSession(id: string): Promise<void> {
   const s0 = sessions.find((x) => x.id === id);
   if (s0) {
-    const proj = (s0 as unknown as { project?: string }).project;
+    const proj = s0.project;
     if (proj) {
       openProjs.add(proj);
       if (proj !== currentProject) {
@@ -2244,8 +2279,13 @@ let renameProjOrigWs = "";
 
 async function showRenameWorkspace(ws: string): Promise<void> {
   renameProjWs = ws;
-  rmWs.textContent = ws || "(not set)";
-  rmWarn.hidden = ws ? await api.pathIsDir(ws) : false;
+  // A scratch project is deliberately folder-less from the user's point of
+  // view; naming its internal path would suggest a codebase that isn't there.
+  // Picking a real folder turns it into an ordinary project, so re-check.
+  const isScratch =
+    !!projects.find((p) => p.id === renameProjId)?.scratch && ws === renameProjOrigWs;
+  rmWs.textContent = isScratch ? "none — one-off work" : ws || "(not set)";
+  rmWarn.hidden = isScratch ? true : ws ? await api.pathIsDir(ws) : false;
 }
 
 rm.querySelector("#rm-pick")!.addEventListener("click", () => {

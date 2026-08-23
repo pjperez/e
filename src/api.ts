@@ -95,7 +95,7 @@ export async function readAttachment(path: string): Promise<{ path: string; cont
   return invoke("read_attachment", { path });
 }
 
-export type ProjectMeta = { id: string; name: string; workspace: string; created: number };
+export type ProjectMeta = { id: string; name: string; workspace: string; created: number; scratch?: boolean };
 
 export type PluginToolDef = { name: string; description: string; parameters?: unknown };
 
@@ -159,7 +159,18 @@ export async function pathIsDir(path: string): Promise<boolean> {
   return invoke<boolean>("path_is_dir", { path }).catch(() => false);
 }
 
-export type SessionMetaItem = { id: string; name: string; created: number; state?: string };
+export type SessionMetaItem = {
+  id: string;
+  name: string;
+  created: number;
+  state?: string;
+  project?: string;
+  workspace?: string;
+  /// The chat's folder is not its project's folder — the project it belonged to
+  /// was deleted, or it was pointed elsewhere. Computed by the backend so the
+  /// sidebar and the agent's own context can never disagree.
+  detached?: boolean;
+};
 
 export async function listSessions(): Promise<{ sessions: SessionMetaItem[]; current: string; running: string[] }> {
   if (!inTauri) return { sessions: [], current: "", running: [] };
