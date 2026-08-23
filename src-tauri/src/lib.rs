@@ -367,7 +367,7 @@ fn get_skill(name: String) -> Result<String, String> {
 fn list_sessions(state: tauri::State<AppState>) -> serde_json::Value {
     let running: Vec<String> = state.runs.lock().map(|r| r.keys().cloned().collect()).unwrap_or_default();
     match state.store.lock() {
-        Ok(st) => serde_json::json!({ "sessions": st.sessions, "current": st.current, "running": running }),
+        Ok(st) => serde_json::json!({ "sessions": st.session_list_json(), "current": st.current, "running": running }),
         Err(_) => serde_json::json!({ "sessions": [], "current": "", "running": running }),
     }
 }
@@ -386,12 +386,59 @@ fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: O
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }
 
+/// Drop the snapshot stashes `workspace_snapshot` left in the user's own
+/// repository for a chat.
+///
+/// Nothing else ever reclaims them, so without this every snapshot a chat took
+/// stays in `git stash list` forever — in the user's real project, long after
+/// the chat is gone. Dropping renumbers the remaining entries, so remove them
+/// highest-index first.
+fn drop_snapshot_stashes(ws: &str, id: &str) {
+    let ws = ws.trim();
+    if ws.is_empty() || !std::path::Path::new(ws).is_dir() {
+        return;
+    }
+    let tag = format!("e-snapshot-{id}");
+    let Ok(out) = std::process::Command::new("git")
+        .args(["stash", "list", "--format=%gd %gs"])
+        .current_dir(ws)
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let mut refs: Vec<&str> = listing
+        .lines()
+        // Match the whole tag at the end, so chat `s1` cannot claim `s12`'s.
+        .filter(|l| l.trim_end().ends_with(&tag))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    refs.reverse();
+    for r in refs {
+        let _ = std::process::Command::new("git")
+            .args(["stash", "drop", r])
+            .current_dir(ws)
+            .output();
+    }
+}
+
 #[tauri::command]
 fn delete_session(state: tauri::State<AppState>, id: String) -> Result<(), String> {
     // Stop the run first: otherwise it keeps streaming into a chat that is gone
     // and re-creates its history file on the next save.
     state.cancel(&id);
-    state.store.lock().map_err(|_| "lock")?.remove(&id);
+    // Read the folder before the chat goes, and let the lock go before shelling
+    // out to git so a slow repo cannot block every other chat.
+    let ws = {
+        let mut st = state.store.lock().map_err(|_| "lock")?;
+        let ws = st.resolved_workspace(&id);
+        st.remove(&id);
+        ws
+    };
+    drop_snapshot_stashes(&ws, &id);
     Ok(())
 }
 
@@ -841,4 +888,57 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running e");
+}
+#[cfg(test)]
+mod stash_tests {
+    use super::drop_snapshot_stashes;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().expect("git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn snapshot(dir: &Path, body: &str, tag: &str) {
+        std::fs::write(dir.join("f.txt"), body).unwrap();
+        let sha = git(dir, &["stash", "create"]);
+        assert!(!sha.is_empty(), "stash create produced nothing");
+        git(dir, &["stash", "store", "-m", tag, &sha]);
+    }
+
+    #[test]
+    fn drops_only_the_deleted_chats_snapshots() {
+        let dir = std::env::temp_dir().join(format!("e-stash-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        git(&dir, &["init"]);
+        git(&dir, &["config", "user.email", "t@e.test"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "base").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-m", "base"]);
+
+        // Two snapshots for s1, plus lookalikes that must survive: `s12` shares
+        // s1's prefix, and a hand-made stash is none of our business.
+        snapshot(&dir, "one", "e-snapshot-s1");
+        snapshot(&dir, "two", "e-snapshot-s12");
+        snapshot(&dir, "three", "e-snapshot-s1");
+        snapshot(&dir, "four", "manual-thing");
+        assert_eq!(git(&dir, &["stash", "list"]).lines().count(), 4);
+
+        drop_snapshot_stashes(dir.to_str().unwrap(), "s1");
+
+        let left = git(&dir, &["stash", "list", "--format=%gs"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let left: Vec<&str> = left.lines().map(|l| l.trim()).collect();
+        assert_eq!(left, vec!["manual-thing", "e-snapshot-s12"], "left: {left:?}");
+    }
+
+    #[test]
+    fn a_missing_folder_is_not_an_error() {
+        drop_snapshot_stashes("C:/definitely/not/here", "s1");
+        drop_snapshot_stashes("", "s1");
+    }
 }

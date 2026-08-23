@@ -232,6 +232,10 @@ pub struct ProjectContext {
     /// True for the scratch "Tasks" area: one-off work with no project behind
     /// it. The agent must not assume a codebase in that case.
     pub scratch: bool,
+    /// True when the chat's folder is not the folder of the project it is filed
+    /// under — its original project was deleted, or it was pointed elsewhere.
+    /// The project name is then just a label and must not be presented as fact.
+    pub detached: bool,
 }
 
 /// The agent: holds provider, tools, config and the running conversation.
@@ -340,6 +344,13 @@ impl Agent {
                  Working folder (tools run here; relative paths resolve here): {ws}\n\
                  That folder is an empty scratch directory, not a codebase. There is no project, repository or existing code here: do not assume you are continuing any previous work, and do not guess at a project. If the request needs one, ask which folder to use or work from an absolute path the user gives you.",
                 if name.is_empty() { "Tasks" } else { name }
+            )
+        } else if self.project.detached {
+            format!(
+                "PROJECT: unresolved. This chat is filed under \"{}\", but that is only where it is listed — the folder below is not that project's folder. The project it belonged to was deleted, or it was pointed somewhere else.\n\
+                 Working folder (tools run here; relative paths resolve here): {ws}\n\
+                 Trust the folder, not the label: the folder is the only reliable statement about where you are working. Look at it to see what it actually is, and do not claim or assume this chat belongs to any particular project.",
+                if name.is_empty() { "(unnamed)" } else { name }
             )
         } else {
             format!(
@@ -557,7 +568,7 @@ mod tests {
     fn a_project_chat_is_told_which_project_it_is_in() {
         let mut a = agent(
             "C:/src/mascot",
-            ProjectContext { name: "mascot".into(), scratch: false },
+            ProjectContext { name: "mascot".into(), scratch: false, detached: false },
         );
         a.sync_system();
         let s = system_of(&a);
@@ -572,13 +583,28 @@ mod tests {
     fn a_scratch_chat_is_told_there_is_no_project() {
         let mut a = agent(
             "C:/Users/x/.e/tasks",
-            ProjectContext { name: "Tasks".into(), scratch: true },
+            ProjectContext { name: "Tasks".into(), scratch: true, detached: false },
         );
         a.sync_system();
         let s = system_of(&a);
         assert!(s.contains("PROJECT: none"), "{s}");
         assert!(s.contains("Tasks"), "{s}");
         assert!(!s.contains("mascot"), "{s}");
+    }
+
+    /// After its project is deleted a chat is refiled elsewhere but keeps its
+    /// folder, so the prompt must not present that label as the project.
+    #[test]
+    fn a_detached_chat_is_told_not_to_trust_its_label() {
+        let mut a = agent(
+            "C:/src/mascot",
+            ProjectContext { name: "Tasks".into(), scratch: false, detached: true },
+        );
+        a.sync_system();
+        let s = system_of(&a);
+        assert!(s.contains("PROJECT: unresolved"), "{s}");
+        assert!(s.contains("C:/src/mascot"), "{s}");
+        assert!(!s.contains("PROJECT: Tasks"), "{s}");
     }
 
     /// The system message is persisted with the history, so a chat written
@@ -588,7 +614,7 @@ mod tests {
     fn a_stale_system_message_is_replaced_not_appended() {
         let mut a = agent(
             "C:/src/mascot",
-            ProjectContext { name: "mascot".into(), scratch: false },
+            ProjectContext { name: "mascot".into(), scratch: false, detached: false },
         );
         a.set_history(vec![
             Msg::text("system", "Workspace: C:/src/somewhere-else"),

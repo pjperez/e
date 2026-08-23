@@ -266,22 +266,24 @@ impl SessionStore {
     /// What the agent is told about where it is working, so a chat opened under
     /// a project is never left to guess (or inherit) the wrong one.
     pub fn project_context(&self, id: &str) -> ProjectContext {
-        let pid = self
-            .sessions
-            .iter()
-            .find(|s| s.id == id)
+        let sess = self.sessions.iter().find(|s| s.id == id);
+        let pid = sess
             .map(|s| s.project.clone())
             .filter(|p| !p.trim().is_empty())
             .unwrap_or_else(|| self.current_project.clone());
-        let name = self
-            .projects
-            .iter()
-            .find(|p| p.id == pid)
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
+        let proj = self.projects.iter().find(|p| p.id == pid);
+        let name = proj.map(|p| p.name.clone()).unwrap_or_default();
+        let proj_ws = proj.map(|p| p.workspace.clone()).unwrap_or_default();
         let workspace = self.resolved_workspace(id);
+        // Chats survive the deletion of their project: they are refiled under
+        // whichever one remains but keep their own folder. Reporting the name of
+        // that fallback project would then be a plain lie, so flag the mismatch
+        // and let the prompt describe the folder instead of the label.
+        let detached = !proj_ws.trim().is_empty()
+            && std::path::Path::new(&workspace) != std::path::Path::new(proj_ws.trim());
         ProjectContext {
             scratch: is_scratch(&workspace),
+            detached,
             name,
         }
     }
@@ -400,7 +402,10 @@ impl SessionStore {
     }
 
     /// Delete a project; its chats are moved to the first remaining project
-    /// (so nothing is lost). At least one project always remains.
+    /// (so nothing is lost) and keep their own folder, which is why they end up
+    /// reported as detached rather than as members of that fallback project.
+    /// At least one project always remains. Nothing on disk is touched: the
+    /// project's folder is the user's, not ours.
     pub fn project_remove(&mut self, id: &str) -> bool {
         if self.projects.len() <= 1 {
             return false;
@@ -417,9 +422,9 @@ impl SessionStore {
                 self.current_project = fb;
             }
         }
-        if self.current == id {
-            self.current = self.sessions.first().map(|s| s.id.clone()).unwrap_or_default();
-        }
+        // The open chat needs no repair here: chats outlive their project, so
+        // whichever one was selected is still there. (This used to compare the
+        // selected *chat* id against a *project* id, which never matched.)
         self.save_index();
         true
     }
@@ -467,9 +472,29 @@ impl SessionStore {
         meta
     }
 
-#[allow(dead_code)]
-    pub fn sessions_in(&self, project: &str) -> Vec<SessionMeta> {
+    /// Chats for the UI, tagged with whether they are detached. Derived from the
+    /// same `project_context` the prompt uses, so the sidebar and the agent can
+    /// never disagree about which project a chat really belongs to.
+    pub fn session_list_json(&self) -> Vec<serde_json::Value> {
         self.sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "created": s.created,
+                    "workspace": s.workspace,
+                    "project": s.project,
+                    "model": s.model,
+                    "state": s.state,
+                    "detached": self.project_context(&s.id).detached,
+                })
+            })
+            .collect()
+    }
+
+#[allow(dead_code)]
+    pub fn sessions_in(&self, project: &str) -> Vec<SessionMeta> {        self.sessions
             .iter()
             .filter(|s| s.project == project)
             .cloned()
@@ -676,6 +701,50 @@ mod tests {
         );
         st.migrate();
         assert_eq!(st.projects[1].workspace, "0xAlpha");
+    }
+
+    /// A chat outlives its project, keeping its own folder. Reporting it as a
+    /// member of whichever project it was refiled under would be a lie.
+    #[test]
+    fn a_chat_whose_project_was_deleted_is_reported_as_detached() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p2", "")],
+        );
+        st.migrate();
+        assert!(!st.project_context("s1").detached);
+
+        assert!(st.project_remove("p2"));
+
+        let ctx = st.project_context("s1");
+        assert_eq!(st.resolved_workspace("s1"), "C:/src/mascot", "folder must be kept");
+        assert!(ctx.detached, "refiled under {:?} but still in mascot", ctx.name);
+        assert!(!ctx.scratch);
+    }
+
+    #[test]
+    fn a_chat_sitting_in_its_own_projects_folder_is_not_detached() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p2", ""), session("s2", "p1", "")],
+        );
+        st.migrate();
+        assert!(!st.project_context("s1").detached);
+        assert!(!st.project_context("s2").detached);
+    }
+
+    /// Deleting a project must not disturb the open chat; chats survive it.
+    #[test]
+    fn deleting_a_project_keeps_the_selected_chat() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p2", ""), session("s2", "p1", "")],
+        );
+        st.migrate();
+        st.current = "s1".into();
+        st.project_remove("p2");
+        assert_eq!(st.current, "s1");
+        assert_eq!(st.sessions.len(), 2, "chats are kept, not deleted");
     }
 
     #[test]
