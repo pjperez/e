@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>e — agent harness</title>
+    <link rel="icon" type="image/svg+xml" href="/e.svg" />
+    <link rel="stylesheet" href="/src/style.css" />
+  
+    <style>
+      /* Critical: chatbox font + centering */
+      #input {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif !important;
+        font-size: 15px;
+        font-weight: 400;
+        letter-spacing: normal;
+        line-height: 1.5;
+        color: var(--text);
+        caret-color: var(--accent);
+      }
+      footer#composer-wrap {
+        display: flex !important;
+        flex-direction: column;
+        align-items: center !important;
+        width: 100%;
+        padding: 0 16px 16px;
+      }
+      #composer {
+        width: 100% !important;
+        max-width: 780px !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+      }
+      #activity { width: 100%; max-width: 780px; margin: 0 auto 8px; }
+      .hint { max-width: 780px; margin: 8px auto 0; }
+      #chat-banner { max-width: 780px; margin: 0 auto; padding: 4px 22px 0; }
+    </style>
+</head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="sess-head"><span>Project</span><button id="sess-pin" type="button" title="Pin sidebar">&#128204;</button></div>
+        <div class="sess-newrow proj-row">
+          <button id="proj-rename" type="button" title="Rename active project">&#9998;</button>
+        </div>
+        <button id="proj-add" class="full-btn" type="button">+ New project</button>
+        <div class="sess-head"><span>Chats</span><button id="sess-new" type="button">+ New</button></div>
+        <div class="picker-list" id="sess-list"></div>
+      </aside>
+
+      <div id="maincol">
+        <header id="bar">
+          <div class="brand" id="sesswrap">
+            <span class="mark" id="mark" title="Sessions">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path d="M4 5h16M4 12h16M4 19h10" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" fill="none"/>
+              </svg>
+            </span>
+            <span class="word">e</span>
+          </div>
+          <span id="chat-title" title=""></span>
+          <div class="bar-spacer"></div>
+          <div class="status" id="status" title="engine status">
+            <span class="dot" id="status-dot"></span>
+            <span id="status-text">ready</span>
+          </div>
+          <button class="icon-btn" id="btn-clear" title="New chat">+</button>
+          <button class="icon-btn" id="btn-theme" title="Toggle theme">&#9681;</button>
+          <button class="icon-btn" id="btn-settings" title="Settings">&#9881;</button>
+          <div class="picker" id="picker">
+            <span class="model-pill" id="model-pill" title="Switch model">&hellip;</span>
+            <div class="picker-menu" id="picker-menu" hidden>
+              <input id="picker-input" placeholder="Filter models&hellip;" spellcheck="false" autocomplete="off"/>
+              <div class="picker-list" id="picker-list"></div>
+            </div>
+          </div>
+        </header>
+
+        <div id="chat-banner"></div>
+        <main id="conversation" aria-live="polite"></main>
+
+        <section id="empty">
+          <div class="empty-mark">e</div>
+          <h1 class="empty-title">What can we ship?</h1>
+          <div class="capabilities">
+            <span class="cap">&#9881; run commands</span>
+            <span class="cap">&#128196; read &amp; write files</span>
+            <span class="cap">&#128193; list directories</span>
+            <span class="cap">&#128269; search code</span>
+          </div>
+          <p class="empty-sub">Try one of these, or just ask:</p>
+          <div class="suggestions" id="suggestions"></div>
+        </section>
+
+        <footer id="composer-wrap">
+          <div id="activity" hidden>
+            <span class="act-spinner"></span>
+            <span id="act-text">thinking&hellip;</span>
+            <span id="act-step"></span>
+            <span id="act-time"></span>
+            <button id="act-steer" class="act-btn" type="button" hidden>Stop</button>
+            <button id="act-approve" class="act-btn act-ok" type="button" hidden>&#10003;</button>
+            <button id="act-deny" class="act-btn act-no" type="button" hidden>&#10005;</button>
+          </div>
+          <div id="composer">
+            <div id="attachments" class="attachments" style="display:none"></div>
+            <textarea id="input" rows="1" placeholder="Ask e to do something&hellip;"
+              autocomplete="off" spellcheck="false"></textarea>
+            <button id="send" title="Send" aria-label="Send">
+              <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 12l16-7-6 16-2.5-6.5L4 12z" fill="currentColor"/></svg>
+            </button>
+          </div>
+          <div class="hint"><kbd>Enter</kbd> to send &middot; <kbd>Shift&nbsp;Enter</kbd> newline &middot; <kbd>Esc</kbd> stop</div>
+        </footer>
+
+        <div id="statusbar">
+          <span id="sb-ws">.</span>
+          <span class="sb-sep"></span>
+          <span class="sb-metrics">
+            <span id="sb-arrows" title="tokens in/out">&uarr;0 &darr;0</span>
+            <span id="sb-context" title="context used">CH0%</span>
+            <span id="sb-cost" title="session cost">$0.000</span>
+          </span>
+          <span class="sb-right">
+            <span id="sb-prov">(provider)</span>
+            <span id="sb-model">model</span>
+            <span id="sb-reason">&middot; high</span>
+          </span>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
