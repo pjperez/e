@@ -411,7 +411,7 @@ fn running_sessions(state: tauri::State<AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>) -> Result<serde_json::Value, String> {
+fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>, project: Option<String>) -> Result<serde_json::Value, String> {
     // Resolve the provider up front so a chat started on a model from a
     // non-default provider keeps that connection on its first run.
     let model = model.unwrap_or_default();
@@ -421,6 +421,11 @@ fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: O
         state.config().resolve_provider_id(&model, &provider.unwrap_or_default())
     };
     let mut st = state.store.lock().map_err(|_| "lock")?;
+    // Chats are created inside the current project, so aim it at the folder the
+    // user clicked "+" on rather than wherever they happened to be last.
+    if let Some(p) = project.filter(|p| !p.trim().is_empty()) {
+        st.project_switch(p.trim());
+    }
     let meta = st.create(&name.unwrap_or_default(), &workspace.unwrap_or_default(), &model, &provider);
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }

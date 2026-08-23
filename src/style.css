@@ -806,11 +806,31 @@ html[data-theme="light"] .empty-mark {
   border-right-width: 1px;
   box-shadow: 4px 0 26px rgba(255, 45, 149, 0.14);
 }
-.sess-item.proj-folder .sess-act {
+/* ---------- sidebar row actions + overflow menu ---------- */
+.sess-item .sess-act {
   opacity: 0;
   transition: opacity 0.12s;
 }
-.sess-item.proj-folder:hover .sess-act { opacity: 1; }
+.sess-item:hover .sess-act,
+.sess-item.menu-open .sess-act,
+.sess-item .sess-act:focus-visible { opacity: 1; }
+.sess-act.add, .sess-act.more { font-size: 15px; line-height: 1; }
+.sess-item.menu-open .sess-act.more { background: var(--edge); color: var(--text); }
+
+.row-menu {
+  position: fixed; z-index: 95; min-width: 148px; padding: 4px;
+  display: flex; flex-direction: column;
+  background: var(--bg-2); border: 1px solid var(--edge-2); border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+.row-menu-item {
+  appearance: none; background: transparent; border: none; text-align: left;
+  padding: 7px 10px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font); font-size: 12.5px; color: var(--text-dim);
+}
+.row-menu-item:hover { background: var(--bg-3); color: var(--text); }
+.row-menu-item.danger { color: var(--err); }
+.row-menu-item.danger:hover { background: rgba(248, 113, 113, 0.12); }
 
 /* ============ thinking block (redesigned) ============ */
 .think {

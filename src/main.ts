@@ -1339,7 +1339,66 @@ function renderHistory(messages: { role: string; content: string; reasoning?: st
   scrollBottom();
 }
 
+/// Row overflow menu (the `⋯` on projects and chats). Lives in `body` because
+/// the sidebar's list scrolls with `overflow` set, which would clip a menu
+/// anchored inside a row.
+type RowMenuItem = { label: string; danger?: boolean; run: () => void };
+let rowMenu: HTMLElement | null = null;
+let rowMenuOwner: HTMLElement | null = null;
+
+function closeRowMenu(): void {
+  rowMenu?.remove();
+  rowMenu = null;
+  rowMenuOwner?.classList.remove("menu-open");
+  rowMenuOwner = null;
+}
+
+function openRowMenu(anchor: HTMLElement, owner: HTMLElement, items: RowMenuItem[]): void {
+  closeRowMenu();
+  const menu = document.createElement("div");
+  menu.className = "row-menu";
+  for (const it of items) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "row-menu-item" + (it.danger ? " danger" : "");
+    b.textContent = it.label;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeRowMenu();
+      it.run();
+    });
+    menu.appendChild(b);
+  }
+  document.body.appendChild(menu);
+  rowMenu = menu;
+  rowMenuOwner = owner;
+  owner.classList.add("menu-open");
+  // Right-align under the button, then flip up / pull inside the viewport so a
+  // row near the bottom of the list doesn't push the menu off screen.
+  const r = anchor.getBoundingClientRect();
+  const w = menu.offsetWidth;
+  const h = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8)) + "px";
+  menu.style.top = (r.bottom + 4 + h > window.innerHeight ? Math.max(8, r.top - 4 - h) : r.bottom + 4) + "px";
+}
+
+document.addEventListener("click", (e) => {
+  if (rowMenu && !(e.target as HTMLElement).closest(".row-menu")) closeRowMenu();
+});
+// Capture, so Escape dismisses the menu instead of reaching the composer and
+// stopping the run behind it.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && rowMenu) {
+    e.preventDefault();
+    e.stopPropagation();
+    closeRowMenu();
+  }
+}, true);
+window.addEventListener("resize", closeRowMenu);
+sessList.addEventListener("scroll", closeRowMenu);
+
 function renderSessions(): void {
+  closeRowMenu();
   sessList.innerHTML = "";
   projects.forEach((p) => {
     const open = openProjs.has(p.id);
@@ -1348,27 +1407,43 @@ function renderSessions(): void {
     const lab = document.createElement("span");
     lab.className = "sess-label";
     lab.textContent = (open ? "▾ " : "▸ ") + (p.name || p.id);
-    const pren = document.createElement("button");
-    pren.className = "sess-act";
-    pren.textContent = "✎";
-    pren.title = "Rename project";
-    const pdel = document.createElement("button");
-    pdel.className = "sess-act";
-    pdel.textContent = "×";
-    pdel.title = "Delete project (chats are kept)";
-    row.append(lab, pren, pdel);
-    pren.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openRenameModal(p.id, p.name || p.id, p.workspace || "");
-    });
-    pdel.addEventListener("click", (e) => {
+    const padd = document.createElement("button");
+    padd.className = "sess-act add";
+    padd.textContent = "+";
+    padd.title = "New chat in this project";
+    const pmore = document.createElement("button");
+    pmore.className = "sess-act more";
+    pmore.textContent = "⋯";
+    pmore.title = "More";
+    row.append(lab, padd, pmore);
+    padd.addEventListener("click", (e) => {
       e.stopPropagation();
       void (async () => {
-        if (!(await confirmModal("Delete project \"" + p.name + "\"? Its chats are kept and move to the remaining folder."))) return;
-        await api.projectRemove(p.id);
+        openProjs.add(p.id);
+        const meta = await api.newSession("", undefined, currentModel, currentProviderId, p.id);
         await refreshSessions();
-        if (currentSession) await loadSession(currentSession);
+        if (meta.id) await loadSession(meta.id);
       })();
+    });
+    pmore.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openRowMenu(pmore, row, [
+        { label: "Rename", run: () => openRenameModal(p.id, p.name || p.id, p.workspace || "") },
+        // Chats orphaned by any other deletion fall back to the scratch project,
+        // so it gets no Close entry at all rather than one that quietly fails.
+        ...(p.scratch
+          ? []
+          : [{
+              label: "Close",
+              danger: true,
+              run: () => void (async () => {
+                if (!(await confirmModal("Close project \"" + p.name + "\"? Its chats are kept and move to the remaining folder."))) return;
+                await api.projectRemove(p.id);
+                await refreshSessions();
+                if (currentSession) await loadSession(currentSession);
+              })(),
+            }]),
+      ]);
     });
     row.addEventListener("click", () => {
       void (async () => {
@@ -1403,43 +1478,35 @@ function renderSessions(): void {
         label.title = s.detached
           ? `Open: ${s.name}\nRuns in ${s.workspace} — not this project's folder (its original project was deleted).`
           : "Open: " + s.name;
-        const ren = document.createElement("button");
-        ren.className = "sess-act";
-        ren.textContent = "✎";
-        ren.title = "Rename chat";
-        const fork = document.createElement("button");
-        fork.className = "sess-act";
-        fork.textContent = "⧉";
-        fork.title = "Fork";
-        const del = document.createElement("button");
-        del.className = "sess-act";
-        del.textContent = "×";
-        del.title = "Delete";
-        c.append(dot, label, ren, fork, del);
-        ren.addEventListener("click", (e) => {
-          e.stopPropagation();
-          openChatRename(s.id, s.name);
-        });
+        const more = document.createElement("button");
+        more.className = "sess-act more";
+        more.textContent = "⋯";
+        more.title = "More";
+        c.append(dot, label, more);
         label.addEventListener("click", () => void loadSession(s.id));
-        fork.addEventListener("click", (e) => {
+        more.addEventListener("click", (e) => {
           e.stopPropagation();
-          void (async () => { await api.forkSession(s.id); await refreshSessions(); })();
-        });
-        del.addEventListener("click", (e) => {
-          e.stopPropagation();
-          void (async () => {
-            if (!(await confirmModal("Delete chat \"" + s.name + "\"?"))) return;
-            const wasCurrent = s.id === currentSession;
-            await api.deleteSession(s.id);
-            chatUI.delete(s.id);
-            delete chatState[s.id];
-            await refreshSessions();
-            if (wasCurrent && currentSession) await loadSession(currentSession);
-            else if (wasCurrent) {
-              renderHistory([]);
-              applyChatUI();
-            }
-          })();
+          openRowMenu(more, c, [
+            { label: "Rename", run: () => openChatRename(s.id, s.name) },
+            { label: "Fork", run: () => void (async () => { await api.forkSession(s.id); await refreshSessions(); })() },
+            {
+              label: "Close",
+              danger: true,
+              run: () => void (async () => {
+                if (!(await confirmModal("Close chat \"" + s.name + "\"? Its history is deleted."))) return;
+                const wasCurrent = s.id === currentSession;
+                await api.deleteSession(s.id);
+                chatUI.delete(s.id);
+                delete chatState[s.id];
+                await refreshSessions();
+                if (wasCurrent && currentSession) await loadSession(currentSession);
+                else if (wasCurrent) {
+                  renderHistory([]);
+                  applyChatUI();
+                }
+              })(),
+            },
+          ]);
         });
         sessList.appendChild(c);
       });
@@ -1508,7 +1575,7 @@ async function updateWorkspaceLabel(): Promise<void> {
     ? `One-off work, outside any project. Scratch folder: ${ws}`
     : ok
       ? ws
-      : `Folder not found: ${ws} — open the project's ✎ to pick another`;
+      : `Folder not found: ${ws} — open the project's ⋯ menu and rename it to pick another`;
 }
 
 async function loadSession(id: string): Promise<void> {
@@ -1590,13 +1657,9 @@ pinBtn.addEventListener("click", () => {
   else closeSessions();
 });
 sidebar.addEventListener("mouseleave", () => {
-  if (!pinned) closeSessions();
-});
-document.getElementById("sess-new")!.addEventListener("click", async () => {
-  const meta = await api.newSession("", undefined, currentModel, currentProviderId);
-  await refreshSessions();
-  if (meta.id) await loadSession(meta.id);
-  closeSessions();
+  // Reaching for a row's `⋯` menu means leaving the sidebar, which used to
+  // slam it shut under the menu that was just opened.
+  if (!pinned && !rowMenu) closeSessions();
 });
 projAdd.addEventListener("click", () => openProjModal());
 

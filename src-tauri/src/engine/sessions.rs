@@ -422,7 +422,14 @@ impl SessionStore {
     /// reported as detached rather than as members of that fallback project.
     /// At least one project always remains. Nothing on disk is touched: the
     /// project's folder is the user's, not ours.
+    ///
+    /// The scratch project is exempt: it is the guaranteed home for work that
+    /// belongs to no repository, and chats orphaned by any other deletion land
+    /// there, so removing it would leave nowhere for them to go.
     pub fn project_remove(&mut self, id: &str) -> bool {
+        if self.projects.iter().any(|p| p.id == id && is_scratch(&p.workspace)) {
+            return false;
+        }
         if self.projects.len() <= 1 {
             return false;
         }
@@ -646,6 +653,22 @@ mod tests {
         st.migrate();
         assert_eq!(st.projects[0].name, DEFAULT_PROJECT);
         assert_eq!(st.projects[0].workspace, scratch_workspace());
+    }
+
+    /// Chats orphaned by deleting a project fall back to the scratch bucket, so
+    /// it has to outlive every other project.
+    #[test]
+    fn the_scratch_project_cannot_be_removed_but_others_can() {
+        let mut st = store(
+            vec![project("p1", "Default", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![],
+        );
+        st.migrate();
+
+        assert!(!st.project_remove("p1"), "the scratch project must survive delete");
+        assert!(st.projects.iter().any(|p| p.id == "p1"));
+        assert!(st.project_remove("p2"), "ordinary projects are still removable");
+        assert_eq!(st.projects.len(), 1);
     }
 
     #[test]

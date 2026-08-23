@@ -130,7 +130,7 @@ export async function listProjects(): Promise<{ projects: ProjectMeta[]; current
 }
 
 export async function newProject(name?: string, workspace?: string): Promise<ProjectMeta> {
-  if (!inTauri) return { id: "", name: name || "Project", workspace: workspace || "", created: 0 };
+  if (!inTauri) return { id: "", name: name || "Project", workspace: workspace || "", created: 0, scratch: false };
   return invoke("new_project", { name, workspace });
 }
 
@@ -183,9 +183,10 @@ export async function runningSessions(): Promise<string[]> {
   return invoke<string[]>("running_sessions");
 }
 
-export async function newSession(name?: string, workspace?: string, model?: string, provider?: string): Promise<SessionMetaItem> {
+/// `project` puts the chat in a specific folder instead of the current one.
+export async function newSession(name?: string, workspace?: string, model?: string, provider?: string, project?: string): Promise<SessionMetaItem> {
   if (!inTauri) return { id: "", name: name || "Chat", created: 0 };
-  return invoke("new_session", { name, workspace, model, provider });
+  return invoke("new_session", { name, workspace, model, provider, project });
 }
 
 export async function deleteSession(id: string): Promise<void> {
