@@ -216,6 +216,40 @@ export async function clearSession(sid?: string): Promise<void> {
   await invoke("clear_session", { sid: sid || null });
 }
 
+/// The window's close button is intercepted in Rust; this fires so the UI can
+/// confirm. Nothing shuts down until `confirmClose` is called.
+export function onCloseRequested(cb: (running: string[]) => void): Unlisten {
+  if (!inTauri) return () => undefined;
+  let un: Unlisten = () => undefined;
+  void (async () => {
+    const evt = await import("@tauri-apps/api/event");
+    un = await evt.listen<{ running?: string[] }>("e:close_requested", (e) => cb(e.payload?.running || []));
+    // Only now can the prompt actually be drawn, so only now may the backend
+    // start intercepting the close button.
+    await uiReady();
+  })();
+  return () => un();
+}
+
+export async function confirmClose(): Promise<void> {
+  if (!inTauri) return;
+  await invoke("confirm_close");
+}
+
+/// The user chose to stay, so the next close attempt prompts again.
+export async function closeDismissed(): Promise<void> {
+  if (!inTauri) return;
+  await invoke("close_dismissed").catch(() => undefined);
+}
+
+/// Tell the backend the close handler is live. Until this lands the close
+/// button behaves normally, so a frontend that fails to boot can't lock the
+/// user into an app they cannot quit.
+export async function uiReady(): Promise<void> {
+  if (!inTauri) return;
+  await invoke("ui_ready").catch(() => undefined);
+}
+
 export function onEngineEvent(cb: (ev: EngineEvents) => void): Unlisten {
   if (!inTauri) return () => undefined;
   const un: Unlisten[] = [];

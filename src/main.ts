@@ -221,16 +221,35 @@ function setText(t: Turn): void {
 /// The collapsible "Thinking" panel for a turn, created on demand. Uses the
 /// stylesheet's `.think` rules instead of the three copies of inline CSS this
 /// used to carry around.
-function thinkBody(t: Turn, open = true): HTMLElement {
+///
+/// Always starts collapsed, including while reasoning is still streaming: an
+/// open panel shoves the actual answer off screen for as long as the model
+/// thinks. The summary carries a one-line preview so a collapsed panel still
+/// shows movement.
+function thinkBody(t: Turn): HTMLElement {
   if (!t.thinkEl) {
     const d = document.createElement("details");
     d.className = "think live";
-    d.open = open;
-    d.innerHTML = `<summary>Thinking</summary><div class="think-body"></div>`;
+    d.innerHTML = `<summary>Thinking<span class="think-preview"></span></summary><div class="think-body"></div>`;
     t.body.insertBefore(d, t.textEl);
     t.thinkEl = d;
   }
   return t.thinkEl.querySelector(".think-body") as HTMLElement;
+}
+
+/// Mirror the tail of the reasoning into the collapsed summary, and keep an
+/// expanded panel pinned to the newest text — but only when the user is already
+/// at the bottom, so scrolling back to read isn't yanked away.
+function thinkTouch(t: Turn): void {
+  const body = thinkBody(t);
+  const prev = t.thinkEl?.querySelector(".think-preview") as HTMLElement | null;
+  if (prev) {
+    const line = body.textContent!.replace(/\s+/g, " ").trimEnd();
+    prev.textContent = line.length > 160 ? "…" + line.slice(-160) : line;
+  }
+  if (body.scrollHeight - body.scrollTop - body.clientHeight < 40) {
+    body.scrollTop = body.scrollHeight;
+  }
 }
 
 function addToolCard(t: Turn, id: string, name: string, args: string): void {
@@ -983,6 +1002,7 @@ api.onEngineEvent((ev) => {
         let t = lastTurn();
         if (!t || !t.hasCaret) t = addAssistantTurn();
         thinkBody(t).textContent += ev.text;
+        thinkTouch(t);
         scrollBottom();
         break;
       }
@@ -1239,7 +1259,8 @@ function addStaticAssistant(content: string, reasoning = ""): Turn {
   const t: Turn = { el, body: bodyEl, textEl, raw: content, hasCaret: false, tools: new Map() };
   if (reasoning) {
     // Persisted thinking starts collapsed; live reasoning appends into it.
-    thinkBody(t, false).textContent = reasoning;
+    thinkBody(t).textContent = reasoning;
+    thinkTouch(t);
     t.thinkEl?.classList.remove("live");
   }
   turns.push(t);
@@ -1461,7 +1482,10 @@ async function loadSession(id: string): Promise<void> {
   } else if (s.liveText || s.liveReason) {
     // Re-attach the in-flight message so switching away mid-run loses nothing.
     const t = addAssistantTurn();
-    if (s.liveReason) thinkBody(t).textContent = s.liveReason;
+    if (s.liveReason) {
+      thinkBody(t).textContent = s.liveReason;
+      thinkTouch(t);
+    }
     t.raw = s.liveText;
     setText(t);
     scrollBottom();
@@ -2054,19 +2078,61 @@ function notify(msg: string, kind = "info"): void {
   setTimeout(() => t.remove(), 3000);
 }
 
-function confirmModal(msg: string): Promise<boolean> {
+function confirmModal(msg: string, title = "Confirm", yesLabel = "Yes", noLabel = "No"): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     ov.className = "overlay";
-    ov.innerHTML = `<div class="modal"><h3>Plugin</h3><p class="note"></p><div class="modal-actions"><button id="cm-no">No</button><button id="cm-yes" class="primary">Yes</button></div></div>`;
+    ov.innerHTML = `<div class="modal"><h3></h3><p class="note"></p><div class="modal-actions"><button id="cm-no"></button><button id="cm-yes" class="primary"></button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = title;
     (ov.querySelector(".note") as HTMLElement).textContent = msg;
+    const yes = ov.querySelector("#cm-yes") as HTMLButtonElement;
+    const no = ov.querySelector("#cm-no") as HTMLButtonElement;
+    yes.textContent = yesLabel;
+    no.textContent = noLabel;
+    const done = (v: boolean): void => {
+      document.removeEventListener("keydown", onKey, true);
+      ov.remove();
+      resolve(v);
+    };
+    // Capture, so Escape closes this dialog instead of reaching the composer's
+    // "Escape stops the run" binding underneath.
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); done(false); }
+      else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); done(true); }
+    };
+    document.addEventListener("keydown", onKey, true);
     document.body.appendChild(ov);
     ov.classList.add("open");
-    ov.querySelector("#cm-yes")!.addEventListener("click", () => { ov.remove(); resolve(true); });
-    ov.querySelector("#cm-no")!.addEventListener("click", () => { ov.remove(); resolve(false); });
-    ov.addEventListener("click", (e) => { if (e.target === ov) { ov.remove(); resolve(false); } });
+    yes.focus();
+    yes.addEventListener("click", () => done(true));
+    no.addEventListener("click", () => done(false));
+    ov.addEventListener("click", (e) => { if (e.target === ov) done(false); });
   });
 }
+
+/// The window's close button is intercepted in Rust so quitting always asks
+/// first — closing mid-run loses the work in flight and used to leave that
+/// chat's history in a state the provider rejects outright.
+let closePrompt = false;
+api.onCloseRequested((running) => {
+  if (closePrompt) return;
+  closePrompt = true;
+  void (async () => {
+    try {
+      const names = running.map(sessionName);
+      const msg = names.length
+        ? `${names.length === 1 ? "“" + names[0] + "” is" : names.length + " chats are"} still running. Quitting now interrupts ${names.length === 1 ? "it" : "them"} and loses the work in flight.`
+        : "Quit e?";
+      if (await confirmModal(msg, names.length ? "Quit while running?" : "Quit e", "Quit", "Stay")) {
+        await api.confirmClose();
+      } else {
+        await api.closeDismissed();
+      }
+    } finally {
+      closePrompt = false;
+    }
+  })();
+});
 
 function buildPluginApi(): PluginAPIHost {
   return {
@@ -2081,7 +2147,7 @@ function buildPluginApi(): PluginAPIHost {
     registerCommand(name, fn, desc) {
       pluginCommands[name] = { run: fn, desc: desc || "plugin command" };
     },
-    ui: { notify, confirm: confirmModal },
+    ui: { notify, confirm: (msg: string) => confirmModal(msg, "Plugin") },
   };
 }
 
