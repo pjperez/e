@@ -94,32 +94,66 @@ configured in Settings and defaults to where you launched `e`.
 `e` ships pointed at your **AI Gateway** by default — same base URL,
 bearer auth, and models Pi uses. The key is never in the repo: set
 `E_API_KEY`, or put it in the local (git-ignored) `~/.e/config.json`.
-Portable overrides: `E_BASE_URL`, `E_MODEL`, `E_WORKSPACE`. Settings live in
-`~/.e/config.json`:
+Portable overrides: `E_BASE_URL`, `E_MODEL`, `E_WORKSPACE` (they apply to the
+provider the current model belongs to). Settings live in `~/.e/config.json`:
 
 ```jsonc
 {
-  "base_url": "https://provider.example/v1",
-  "api_key": "",             // your gateway key here, or set E_API_KEY
-  "model": "opencode-go/deepseek-v4-flash",
   "temperature": 0.7,
   "system": "You are e, a fast, capable agent…",
   "workspace": "C:/src/work",
-  "models": [
-    "zai-coding/glm-5.2",
-    "openrouter/deepseek/deepseek-v4-flash-0731",
-    "opencode-go/deepseek-v4-flash",
-    "opencode-go/deepseek-v4-pro",
-    "openai/gpt-5.6-luna",
-    "command-code/inclusionai/ling-3.0-flash-free"
+  "model": "opencode-go/deepseek-v4-flash",  // the picked model…
+  "provider_id": "aigateway",                // …and who serves it
+  "providers": [
+    {
+      "id": "aigateway",
+      "name": "AI Gateway",
+      "base_url": "https://provider.example/v1",
+      "api_key": "",              // your gateway key here, or set E_API_KEY
+      "enabled": true,            // off hides its models but keeps the key
+      "context_window": null,     // per-provider override; null = global
+      "models": [
+        "zai-coding/glm-5.2",
+        "opencode-go/deepseek-v4-flash",
+        "openai/gpt-5.6-luna"
+      ],
+      "disabled_models": ["zai-coding/glm-5.2"]  // hidden from the picker
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "",
+      "enabled": true,
+      "models": ["qwen3-coder:30b"],
+      "disabled_models": []
+    }
   ]
 }
 ```
 
-The `models` list powers the model picker in **Settings** — type to filter or
-pick any of the ported models. Any OpenAI-compatible base URL works: point
-`base_url` at `http://localhost:11434/v1` for Ollama or your own gateway and set
-a matching `model`.
+`base_url`, `api_key` and `models` are also written at the top level, but they
+are **derived** — the connection `e` actually uses is always the one belonging
+to the provider that serves the selected model.
+
+### Providers and models
+
+Keep as many providers as you like. **Settings (⚙) decides what is available**,
+not what is active:
+
+- Tick a provider to enable it, untick to hide all of its models — the API key
+  stays, so turning it back on is one click.
+- Open a provider (✎) to tick individual models, filter them, `All` / `None`
+  them, `Refresh` from `<base>/models`, or add a model id by hand for gateways
+  that don't list everything they serve.
+- `disabled_models` is an opt-out list, so a `Refresh` surfaces newly added
+  models instead of silently hiding them.
+
+**Picking is separate:** click the model name in the title bar and you get every
+enabled model from every enabled provider in one list, grouped by provider.
+Choosing a model chooses its provider too — base URL, key and context window all
+follow it, per chat. Two providers can even serve the same model id; a chat
+stays on the one it was picked from.
 
 ## Project layout
 

@@ -21,6 +21,12 @@ pub struct SessionMeta {
     pub project: String,
     #[serde(default)]
     pub model: String,
+    /// Provider that serves `model`. Models can be picked from any enabled
+    /// provider, so the chat has to remember which connection it chose or the
+    /// next run would send its model to whatever provider happened to be
+    /// active globally.
+    #[serde(default)]
+    pub provider: String,
     #[serde(default)]
     pub state: String,
 }
@@ -101,7 +107,7 @@ impl SessionStore {
             st.save_index();
         }
         if st.sessions.is_empty() {
-            st.create("Chat 1", "", "");
+            st.create("Chat 1", "", "", "");
         }
         st
     }
@@ -185,11 +191,21 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
-    pub fn set_model(&mut self, id: &str, model: &str) {
+    pub fn set_model(&mut self, id: &str, model: &str, provider: &str) {
         if let Some(s) = self.sessions.iter_mut().find(|x| x.id == id) {
             s.model = model.to_string();
+            s.provider = provider.to_string();
             self.save_index();
         }
+    }
+
+    /// Provider this chat picked its model from; empty means "resolve it".
+    pub fn provider(&self, id: &str) -> String {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.provider.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_state(&mut self, id: &str, state: &str) {
@@ -300,8 +316,7 @@ impl SessionStore {
     }
 
     // ---- sessions ----
-    pub fn create(&mut self, name: &str, workspace: &str, model: &str) -> SessionMeta {
-        let id = format!("s{}", now_ms());
+    pub fn create(&mut self, name: &str, workspace: &str, model: &str, provider: &str) -> SessionMeta {        let id = format!("s{}", now_ms());
         let ws = if workspace.trim().is_empty() {
             self.current_project_workspace()
         } else {
@@ -319,6 +334,7 @@ impl SessionStore {
             workspace: ws,
             project: self.current_project.clone(),
             model: model.trim().to_string(),
+            provider: provider.trim().to_string(),
             state: String::new(),
         };
         self.set_history(&id, Vec::new());
@@ -402,6 +418,7 @@ impl SessionStore {
             workspace: src.workspace,
             project: src.project,
             model: src.model,
+            provider: src.provider,
             state: src.state,
         };
         self.set_history(&meta.id, history);

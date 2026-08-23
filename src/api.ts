@@ -1,6 +1,25 @@
 // e — bridge to the Rust backend via Tauri.
 
-export type ProviderItem = { id: string; name: string; base_url: string; api_key: string; models: string[]; context_window?: number | null };
+export type ProviderItem = {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  models: string[];
+  context_window?: number | null;
+  /** Off keeps the provider (and its key) but hides all of its models. */
+  enabled: boolean;
+  /** Opt-out list, so a /models refresh surfaces new models by default. */
+  disabled_models: string[];
+};
+
+/** One entry of the flat, cross-provider catalogue the model picker shows. */
+export type ModelChoice = {
+  model: string;
+  provider_id: string;
+  provider_name: string;
+  context_window: number;
+};
 
 export type Config = {
   base_url: string;
@@ -14,6 +33,8 @@ export type Config = {
   models: string[];
   /** Usable context window in tokens for the active model. */
   context_window: number;
+  /** Provider that serves `model`; the backend re-derives the connection. */
+  provider_id: string;
   providers: ProviderItem[];
 };
 
@@ -48,13 +69,19 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 export async function getConfig(): Promise<Config> {
-  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, models: [], context_window: 1_000_000, providers: [] };
+  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, models: [], context_window: 1_000_000, provider_id: "", providers: [] };
   return invoke<Config>("get_config");
 }
 
 export async function saveConfig(cfg: Config): Promise<void> {
   if (!inTauri) return;
   await invoke("save_config", { config: cfg });
+}
+
+/// Every model on offer across every enabled provider, tagged with its owner.
+export async function listModels(): Promise<ModelChoice[]> {
+  if (!inTauri) return [];
+  return invoke<ModelChoice[]>("list_models");
 }
 
 
@@ -145,9 +172,9 @@ export async function runningSessions(): Promise<string[]> {
   return invoke<string[]>("running_sessions");
 }
 
-export async function newSession(name?: string, workspace?: string, model?: string): Promise<SessionMetaItem> {
+export async function newSession(name?: string, workspace?: string, model?: string, provider?: string): Promise<SessionMetaItem> {
   if (!inTauri) return { id: "", name: name || "Chat", created: 0 };
-  return invoke("new_session", { name, workspace, model });
+  return invoke("new_session", { name, workspace, model, provider });
 }
 
 export async function deleteSession(id: string): Promise<void> {
@@ -172,10 +199,10 @@ export async function compactSession(id: string): Promise<CompactResult> {
   return invoke("compact_session", { id });
 }
 
-/// Usable context window (tokens) for the active provider/model.
-export async function contextBudget(): Promise<number> {
+/// Usable context window (tokens) for a chat's model, or the global one.
+export async function contextBudget(sid?: string): Promise<number> {
   if (!inTauri) return 1_000_000;
-  return invoke<number>("context_budget");
+  return invoke<number>("context_budget", { sid: sid || null });
 }
 
 export async function switchSession(id: string): Promise<boolean> {
@@ -183,14 +210,14 @@ export async function switchSession(id: string): Promise<boolean> {
   return invoke("switch_session", { id });
 }
 
-export async function getSession(id: string): Promise<{ messages: { role: string; content: string; reasoning?: string; error?: string }[]; model: string; running: boolean; context_estimate: number }> {
-  if (!inTauri) return { messages: [], model: "", running: false, context_estimate: 0 };
+export async function getSession(id: string): Promise<{ messages: { role: string; content: string; reasoning?: string; error?: string }[]; model: string; provider: string; running: boolean; context_estimate: number }> {
+  if (!inTauri) return { messages: [], model: "", provider: "", running: false, context_estimate: 0 };
   return invoke("get_session", { id });
 }
 
-export async function setSessionModel(id: string, model: string): Promise<void> {
+export async function setSessionModel(id: string, model: string, provider?: string): Promise<void> {
   if (!inTauri) return;
-  await invoke("set_session_model", { id, model });
+  await invoke("set_session_model", { id, model, provider: provider || null });
 }
 
 export async function getStatus

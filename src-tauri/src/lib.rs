@@ -144,11 +144,38 @@ fn get_config(state: tauri::State<AppState>) -> Config {
 
 #[tauri::command]
 fn save_config(state: tauri::State<AppState>, config: Config) -> Result<(), String> {
+    let mut config = config;
+    // The connection is derived here, never dictated by the client: it must
+    // always be whichever provider serves the selected model. Seed from the
+    // live one first so a config that resolves to nothing (every provider
+    // deleted) keeps a usable base URL instead of silently blanking it.
+    {
+        let cur = state.config();
+        if config.base_url.trim().is_empty() {
+            config.base_url = cur.base_url;
+        }
+        if config.api_key.trim().is_empty() {
+            config.api_key = cur.api_key;
+        }
+        if config.model.trim().is_empty() {
+            config.model = cur.model;
+            config.provider_id = cur.provider_id;
+        }
+    }
+    config.normalize();
     if let Ok(mut c) = state.config.lock() {
         *c = config.clone();
     }
     config.save();
     Ok(())
+}
+
+/// Every model on offer, across every enabled provider, tagged with the
+/// provider it comes from. One flat catalogue means the picker is the single
+/// place a model (and therefore a connection) is chosen.
+#[tauri::command]
+fn list_models(state: tauri::State<AppState>) -> Vec<engine::agent::ModelChoice> {
+    state.config().model_catalog()
 }
 
 #[tauri::command]
@@ -219,8 +246,12 @@ fn switch_project(state: tauri::State<AppState>, id: String) -> Result<bool, Str
 }
 
 #[tauri::command]
-fn set_session_model(state: tauri::State<AppState>, id: String, model: String) -> Result<(), String> {
-    state.store.lock().map_err(|_| "lock")?.set_model(&id, &model);
+fn set_session_model(state: tauri::State<AppState>, id: String, model: String, provider: Option<String>) -> Result<(), String> {
+    // Resolve here rather than trusting the caller: the chat has to record a
+    // provider that really serves this model, or its next run would be sent to
+    // whichever provider happened to be active globally.
+    let provider = state.config().resolve_provider_id(&model, &provider.unwrap_or_default());
+    state.store.lock().map_err(|_| "lock")?.set_model(&id, &model, &provider);
     Ok(())
 }
 
@@ -375,9 +406,17 @@ fn running_sessions(state: tauri::State<AppState>) -> Vec<String> {
 }
 
 #[tauri::command]
-fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>) -> Result<serde_json::Value, String> {
+fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>) -> Result<serde_json::Value, String> {
+    // Resolve the provider up front so a chat started on a model from a
+    // non-default provider keeps that connection on its first run.
+    let model = model.unwrap_or_default();
+    let provider = if model.is_empty() {
+        String::new()
+    } else {
+        state.config().resolve_provider_id(&model, &provider.unwrap_or_default())
+    };
     let mut st = state.store.lock().map_err(|_| "lock")?;
-    let meta = st.create(&name.unwrap_or_default(), &workspace.unwrap_or_default(), &model.unwrap_or_default());
+    let meta = st.create(&name.unwrap_or_default(), &workspace.unwrap_or_default(), &model, &provider);
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }
 
@@ -418,7 +457,17 @@ async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Resul
         return Ok(serde_json::json!({ "messages": hist.len(), "compacted": false }));
     }
 
-    let client_cfg = state.config();
+    let mut client_cfg = state.config();
+    // Summarise with the chat's own model, on its own provider — compacting a
+    // chat must not silently bill (or fail against) a different connection.
+    let (sess_model, sess_prov) = state
+        .store
+        .lock()
+        .map(|st| (st.model(&id), st.provider(&id)))
+        .unwrap_or_default();
+    if !sess_model.is_empty() {
+        client_cfg.use_model(&sess_model, &sess_prov);
+    }
     let split = engine::keep_split(&hist, client_cfg.active_context_window());
     if split == 0 {
         return Ok(serde_json::json!({ "messages": hist.len(), "compacted": false }));
@@ -475,11 +524,25 @@ async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Resul
     Ok(serde_json::json!({ "messages": n + kept, "compacted": true, "dropped": split.saturating_sub(n) }))
 }
 
-/// Usable context window (tokens) for the active provider/model. The frontend
-/// budgets compaction against this instead of guessing.
+/// Usable context window (tokens) for a chat's model. Optional `sid` so the
+/// budget follows the chat's own model/provider rather than the global one.
 #[tauri::command]
-fn context_budget(state: tauri::State<AppState>) -> u64 {
-    state.config().active_context_window()
+fn context_budget(state: tauri::State<AppState>, sid: Option<String>) -> u64 {
+    let cfg = state.config();
+    let sid = sid.unwrap_or_default();
+    if sid.is_empty() {
+        return cfg.active_context_window();
+    }
+    let (model, prov) = state
+        .store
+        .lock()
+        .map(|st| (st.model(&sid), st.provider(&sid)))
+        .unwrap_or_default();
+    if model.is_empty() {
+        cfg.active_context_window()
+    } else {
+        cfg.context_window_for(&model, &prov)
+    }
 }
 
 #[tauri::command]
@@ -492,6 +555,7 @@ fn switch_session(state: tauri::State<AppState>, id: String) -> Result<bool, Str
 fn get_session(state: tauri::State<AppState>, id: String) -> Result<serde_json::Value, String> {
     let st = state.store.lock().map_err(|_| "lock")?;
     let model = st.model(&id);
+    let provider = st.provider(&id);
     let h = st.get_history(&id);
     let list: Vec<serde_json::Value> = h
         .iter()
@@ -531,6 +595,7 @@ fn get_session(state: tauri::State<AppState>, id: String) -> Result<serde_json::
     Ok(serde_json::json!({
         "messages": list,
         "model": model,
+        "provider": provider,
         "running": state.is_running(&id),
         // Lets the UI reason about context pressure before the first run of
         // this app session reports real usage. Counts tool traffic, which the
@@ -604,8 +669,13 @@ async fn send_text(
     let cancelled = state.begin_run(&session).ok_or("this chat is already running")?;
 
     let mut config = state.config();
-    let (history, session_ws, session_model) = match state.store.lock() {
-        Ok(st) => (st.get_history(&session), st.workspace(&session), st.model(&session)),
+    let (history, session_ws, session_model, session_prov) = match state.store.lock() {
+        Ok(st) => (
+            st.get_history(&session),
+            st.workspace(&session),
+            st.model(&session),
+            st.provider(&session),
+        ),
         Err(_) => {
             state.end_run(&session);
             return Err("internal lock".into());
@@ -615,7 +685,9 @@ async fn send_text(
         config.workspace = session_ws;
     }
     if !session_model.is_empty() {
-        config.model = session_model;
+        // Follow the model to its provider: a chat can be on a model from any
+        // enabled provider, so its base URL and key have to move with it.
+        config.use_model(&session_model, &session_prov);
     }
 
     if let Ok(mut st) = state.store.lock() {
@@ -787,6 +859,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config,
+            list_models,
             get_status,
             send_text,
             cancel_run,
