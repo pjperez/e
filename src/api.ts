@@ -68,7 +68,7 @@ export async function readAttachment(path: string): Promise<{ path: string; cont
   return invoke("read_attachment", { path });
 }
 
-export type ProjectMeta = { id: string; name: string; workspace: string; created: number };
+export type ProjectMeta = { id: string; name: string; workspace: string; created: number; locked?: boolean };
 
 export type PluginToolDef = { name: string; description: string; parameters?: unknown };
 
@@ -103,7 +103,7 @@ export async function listProjects(): Promise<{ projects: ProjectMeta[]; current
 }
 
 export async function newProject(name?: string, workspace?: string): Promise<ProjectMeta> {
-  if (!inTauri) return { id: "", name: name || "Project", workspace: workspace || "", created: 0 };
+  if (!inTauri) return { id: "", name: name || "Project", workspace: workspace || "", created: 0, locked: false };
   return invoke("new_project", { name, workspace });
 }
 
@@ -145,9 +145,10 @@ export async function runningSessions(): Promise<string[]> {
   return invoke<string[]>("running_sessions");
 }
 
-export async function newSession(name?: string, workspace?: string, model?: string): Promise<SessionMetaItem> {
+/// `project` puts the chat in a specific folder instead of the current one.
+export async function newSession(name?: string, workspace?: string, model?: string, project?: string): Promise<SessionMetaItem> {
   if (!inTauri) return { id: "", name: name || "Chat", created: 0 };
-  return invoke("new_session", { name, workspace, model });
+  return invoke("new_session", { name, workspace, model, project });
 }
 
 export async function deleteSession(id: string): Promise<void> {
