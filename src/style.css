@@ -286,6 +286,16 @@ footer#composer-wrap { padding: 0 16px 16px; }
 }
 .summary.err { color: var(--err); border-color: var(--err); }
 
+/* Compaction divider: present but unobtrusive — the user should notice it
+   happened without it competing with the conversation. */
+.compacted {
+  display: flex; align-items: center; gap: 10px;
+  margin: 18px 0; color: var(--text-faint);
+  font-size: 11px; font-family: var(--mono); letter-spacing: 0.04em;
+}
+.compacted-rule { flex: 1; height: 1px; background: var(--edge); }
+.compacted-label { white-space: nowrap; opacity: 0.75; }
+
 /* ---------- dropdowns: model picker + sessions ---------- */
 .picker { position: relative; -webkit-app-region: no-drag; }
 .picker-menu {

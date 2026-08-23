@@ -342,12 +342,18 @@ impl SessionStore {
         false
     }
 
-    /// Keep system + the most recent messages so the window stays small.
+    /// Non-summarising fallback: keep system + the most recent messages. Only a
+    /// safety net for when the model-backed `compact_session` is unavailable.
     pub fn compact(&self, id: &str) -> usize {
         let h = self.get_history(id);
-        if h.len() > 14 {
+        let non_system = h.iter().filter(|m| m.role != "system").count();
+        if non_system > crate::engine::KEEP_RECENT + crate::engine::MIN_COMPACT_GAIN {
+            let split = crate::engine::keep_split(&h, crate::engine::agent::default_context_window());
+            if split == 0 {
+                return h.len();
+            }
             let system: Vec<Msg> = h.iter().filter(|m| m.role == "system").cloned().collect();
-            let kept = h[h.len().saturating_sub(12)..].to_vec();
+            let kept = h[split..].to_vec();
             let mut out = system;
             out.extend(kept);
             let n = out.len(); self.set_history(id, out); n

@@ -1,6 +1,6 @@
 // e — bridge to the Rust backend via Tauri.
 
-export type ProviderItem = { id: string; name: string; base_url: string; api_key: string; models: string[] };
+export type ProviderItem = { id: string; name: string; base_url: string; api_key: string; models: string[]; context_window?: number | null };
 
 export type Config = {
   base_url: string;
@@ -12,6 +12,8 @@ export type Config = {
   /** Auto-approve risky tools (shell, write_file) instead of prompting. */
   yolo: boolean;
   models: string[];
+  /** Usable context window in tokens for the active model. */
+  context_window: number;
   providers: ProviderItem[];
 };
 
@@ -25,7 +27,7 @@ export type EngineEvents =
   | { type: "plugin_tool_call"; sid: string; name: string; arguments: string }
   | { type: "done"; stopped: boolean; sid: string }
   | { type: "activity"; sid: string; phase: string; tool: string | null; step: number }
-  | { type: "summary"; sid: string; steps: number; tools: number; stopped: boolean; error: string | null; tokensIn: number; tokensOut: number; cost: number | null }
+  | { type: "summary"; sid: string; steps: number; tools: number; stopped: boolean; error: string | null; tokensIn: number; tokensOut: number; contextTokens: number; cost: number | null }
   | { type: "error"; message: string; sid: string }
   | { type: "approval_request"; id: string; sid: string; tool: string; preview: string }
   | { type: "approval_close"; id: string; sid: string }
@@ -46,7 +48,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 export async function getConfig(): Promise<Config> {
-  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, models: [], providers: [] };
+  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, models: [], context_window: 1_000_000, providers: [] };
   return invoke<Config>("get_config");
 }
 
@@ -163,9 +165,17 @@ export async function renameSession(id: string, name: string): Promise<boolean> 
   return invoke("rename_session", { id, name });
 }
 
-export async function compactSession(id: string): Promise<number> {
-  if (!inTauri) return 0;
+export type CompactResult = { messages: number; compacted: boolean; dropped?: number };
+
+export async function compactSession(id: string): Promise<CompactResult> {
+  if (!inTauri) return { messages: 0, compacted: false };
   return invoke("compact_session", { id });
+}
+
+/// Usable context window (tokens) for the active provider/model.
+export async function contextBudget(): Promise<number> {
+  if (!inTauri) return 1_000_000;
+  return invoke<number>("context_budget");
 }
 
 export async function switchSession(id: string): Promise<boolean> {
@@ -173,8 +183,8 @@ export async function switchSession(id: string): Promise<boolean> {
   return invoke("switch_session", { id });
 }
 
-export async function getSession(id: string): Promise<{ messages: { role: string; content: string; reasoning?: string }[]; model: string; running: boolean }> {
-  if (!inTauri) return { messages: [], model: "", running: false };
+export async function getSession(id: string): Promise<{ messages: { role: string; content: string; reasoning?: string }[]; model: string; running: boolean; context_estimate: number }> {
+  if (!inTauri) return { messages: [], model: "", running: false, context_estimate: 0 };
   return invoke("get_session", { id });
 }
 

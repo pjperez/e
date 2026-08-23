@@ -5,7 +5,7 @@ use engine::approval;
 use engine::plugins;
 use engine::skills::SkillStore;
 use engine::tools::ToolRegistry;
-use engine::{Emitter, Part, RunSummary, ToolCall};
+use engine::{Emitter, Part, RunSummary, ToolCall, COMPACTION_MARKER, KEEP_RECENT, MIN_COMPACT_GAIN};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,6 +104,7 @@ impl Emitter for AppEmitter {
                 "stopped": s.stopped,
                 "tokensIn": s.tokens_in,
                 "tokensOut": s.tokens_out,
+                "contextTokens": s.context_tokens,
                 "cost": s.cost,
                 "error": s.error,
             }),
@@ -322,6 +323,7 @@ fn search_sessions(state: tauri::State<AppState>, query: String) -> Result<serde
                 continue;
             }
             let text = m.plain_text_parts();
+            let text = text.strip_prefix(engine::COMPACTION_MARKER).map(str::to_string).unwrap_or(text);
             let lower = text.to_lowercase();
             if let Some(pos) = lower.find(&q) {
                 results.push(serde_json::json!({
@@ -394,18 +396,27 @@ fn rename_session(state: tauri::State<AppState>, id: String, name: String) -> Re
 }
 
 #[tauri::command]
-async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Result<usize, String> {
+async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
     use engine::Msg;
     // Rewriting history under a live run would race with the agent's own saves.
     if state.is_running(&id) {
         return Err("chat is running".into());
     }
     let hist: Vec<engine::Msg> = state.store.lock().map(|st| st.get_history(&id)).unwrap_or_default();
-    if hist.len() <= 14 {
-        return Ok(hist.len());
+    let non_system = hist.iter().filter(|m| m.role != "system").count();
+    // Nothing worth compacting: keeping the tail already covers the whole
+    // conversation, so summarising would burn a request and lose fidelity.
+    if non_system <= KEEP_RECENT + MIN_COMPACT_GAIN {
+        return Ok(serde_json::json!({ "messages": hist.len(), "compacted": false }));
     }
-    let keep = hist[hist.len().saturating_sub(12)..].to_vec();
-    let old = &hist[..hist.len().saturating_sub(12)];
+
+    let client_cfg = state.config();
+    let split = engine::keep_split(&hist, client_cfg.active_context_window());
+    if split == 0 {
+        return Ok(serde_json::json!({ "messages": hist.len(), "compacted": false }));
+    }
+    let keep = hist[split..].to_vec();
+    let old = &hist[..split];
     let old_text: String = old
         .iter()
         .map(|m| {
@@ -417,7 +428,6 @@ async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Resul
         })
         .collect();
 
-    let client_cfg = state.config();
     let provider = engine::provider::ChatProvider::new(
         client_cfg.base_url,
         client_cfg.api_key,
@@ -441,14 +451,27 @@ async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Resul
         // Don't destroy history when summarization failed.
         return Err("could not summarize".into());
     }
+    // A run may have started while we were waiting on the provider; writing now
+    // would clobber the messages it has since appended.
+    if state.is_running(&id) {
+        return Err("chat is running".into());
+    }
     let mut new_hist: Vec<engine::Msg> = hist.iter().filter(|m| m.role == "system").cloned().collect();
-    new_hist.push(Msg::text("user", format!("[Summarized earlier conversation]\n\n{summary}")));
+    new_hist.push(Msg::text("user", format!("{COMPACTION_MARKER}{summary}")));
     let n = new_hist.len();
+    let kept = keep.len();
     new_hist.extend(keep);
     if let Ok(st) = state.store.lock() {
         st.set_history(&id, new_hist);
     }
-    Ok(n)
+    Ok(serde_json::json!({ "messages": n + kept, "compacted": true, "dropped": split.saturating_sub(n) }))
+}
+
+/// Usable context window (tokens) for the active provider/model. The frontend
+/// budgets compaction against this instead of guessing.
+#[tauri::command]
+fn context_budget(state: tauri::State<AppState>) -> u64 {
+    state.config().active_context_window()
 }
 
 #[tauri::command]
@@ -466,7 +489,10 @@ fn get_session(state: tauri::State<AppState>, id: String) -> Result<serde_json::
         .iter()
         .filter(|m| m.role != "system")
         .map(|m| {
-            let role = if m.role == "assistant" {
+            let compacted = m.compaction_summary();
+            let role = if compacted.is_some() {
+                "compaction"
+            } else if m.role == "assistant" {
                 "assistant"
             } else if m.role == "tool" {
                 "tool"
@@ -479,13 +505,22 @@ fn get_session(state: tauri::State<AppState>, id: String) -> Result<serde_json::
                 .filter_map(|p| if let Part::Reasoning(r) = p { Some(r.clone()) } else { None })
                 .collect::<Vec<_>>()
                 .join("\n");
-            serde_json::json!({ "role": role, "content": m.plain_text_parts(), "reasoning": reasoning })
+            let content = compacted.unwrap_or_else(|| m.plain_text_parts());
+            serde_json::json!({ "role": role, "content": content, "reasoning": reasoning })
         })
         .filter(|v| {
             !v["content"].as_str().unwrap_or("").is_empty() || !v["reasoning"].as_str().unwrap_or("").is_empty()
         })
         .collect();
-    Ok(serde_json::json!({ "messages": list, "model": model, "running": state.is_running(&id) }))
+    Ok(serde_json::json!({
+        "messages": list,
+        "model": model,
+        "running": state.is_running(&id),
+        // Lets the UI reason about context pressure before the first run of
+        // this app session reports real usage. Counts tool traffic, which the
+        // message list above deliberately omits.
+        "context_estimate": h.iter().map(engine::est_tokens).sum::<usize>(),
+    }))
 }
 
 #[tauri::command]
@@ -702,6 +737,7 @@ pub fn run() {
             switch_session,
             rename_session,
             compact_session,
+            context_budget,
             get_session,
             set_session_model,
             list_plugins,

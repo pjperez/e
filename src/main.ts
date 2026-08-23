@@ -67,12 +67,20 @@ type ChatUI = {
   baseOut: number;
   liveIn: number;
   liveOut: number;
+  /**
+   * Prompt tokens of the last provider call — the *actual* size of the context
+   * window. Distinct from `baseIn`, which is a lifetime sum across every run
+   * and every step and so grows far faster than the context does.
+   */
+  ctxIn: number;
   money: number;
   costKnown: boolean;
   approval: Approval | null;
   errored: boolean;
   /** True while a send_text call is in flight and the backend hasn't registered the run yet. */
   sending: boolean;
+  /** True while history is being summarised, so the UI can say so. */
+  compacting: boolean;
 };
 
 const chatUI = new Map<string, ChatUI>();
@@ -83,8 +91,8 @@ function ui(sid: string): ChatUI {
     s = {
       running: false, queued: "", startedAt: 0, activityText: "", activityStep: "",
       liveText: "", liveReason: "",
-      baseIn: 0, baseOut: 0, liveIn: 0, liveOut: 0, money: 0, costKnown: false,
-      approval: null, errored: false, sending: false,
+      baseIn: 0, baseOut: 0, liveIn: 0, liveOut: 0, ctxIn: 0, money: 0, costKnown: false,
+      approval: null, errored: false, sending: false, compacting: false,
     };
     chatUI.set(sid, s);
   }
@@ -93,12 +101,29 @@ function ui(sid: string): ChatUI {
 const cur = (): ChatUI => ui(currentSession);
 const isRunning = (): boolean => !!currentSession && cur().running;
 
+/** Usable context window for the active model; refreshed from the backend. */
+let ctxWindow = 1_000_000;
+/** Compact once the live context passes this share of the window. */
+const COMPACT_AT = 0.85;
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return Math.round(n / 1_000) + "k";
+  return String(n);
+}
+
 function sbUpdate(): void {
   const s = cur();
   const inT = Math.round(s.baseIn + s.liveIn);
   const outT = Math.round(s.baseOut + s.liveOut);
+  // Context usage is the live window (last prompt + what we're about to add),
+  // never the lifetime token total.
+  const ctx = Math.round(s.ctxIn + s.liveIn);
+  const pct = ctxWindow > 0 ? Math.min(100, (ctx * 100) / ctxWindow) : 0;
   sbArrows.textContent = "↑" + inT.toLocaleString() + " ↓" + outT.toLocaleString();
-  sbCtx.textContent = "CH " + inT.toLocaleString() + "/1.0M · " + Math.min(100, (inT * 100) / 1_000_000).toFixed(1) + "%";
+  sbCtx.textContent = s.compacting
+    ? "compacting…"
+    : "CH " + fmtTokens(ctx) + "/" + fmtTokens(ctxWindow) + " · " + pct.toFixed(1) + "%";
   sbCost.textContent = s.costKnown ? "$" + s.money.toFixed(3) : "$-";
 }
 function activeProviderName(cfg: api.Config): string {
@@ -142,6 +167,17 @@ type Turn = {
 
 let turns: Turn[] = [];
 const lastTurn = (): Turn | undefined => turns[turns.length - 1];
+
+/// A quiet divider standing in for history that was summarised away. The
+/// summary text itself is deliberately not shown — compaction is plumbing, not
+/// conversation.
+function compactionMark(): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "compacted";
+  el.innerHTML = `<span class="compacted-rule"></span><span class="compacted-label">context compacted</span><span class="compacted-rule"></span>`;
+  el.title = "Earlier messages were summarised to free up context";
+  return el;
+}
 
 function addUserTurn(text: string): void {
   const el = document.createElement("div");
@@ -469,6 +505,8 @@ let availableModels: string[] = [];
 let providers: ProviderItem[] = [];
 let currentWs = "";
 let activeProviderId = "";
+/** Global fallback context window, used when a provider has no override. */
+let defaultCtxWindow = 1_000_000;
 let currentModels: string[] = [];
 let currentModel = "";
 
@@ -724,6 +762,47 @@ async function doSend(): Promise<void> {
   await startRun(sid, text);
 }
 
+/// Summarise old history when the *live context* is close to the model's
+/// window. Deliberately a no-op most of the time: the old check compared a
+/// lifetime token counter against a fixed number, so it fired constantly on
+/// long-lived chats whose actual context was nowhere near full.
+async function maybeCompact(sid: string): Promise<void> {
+  const s = ui(sid);
+  const used = s.ctxIn + s.liveIn;
+  if (!ctxWindow || used < ctxWindow * COMPACT_AT) return;
+
+  s.compacting = true;
+  s.activityText = "compacting context…";
+  if (sid === currentSession) {
+    sbUpdate();
+    renderActivity();
+  }
+  try {
+    const r = await api.compactSession(sid);
+    if (r.compacted) {
+      // The next run reports the real size; treat the window as reset until then.
+      s.ctxIn = 0;
+      // Re-rendering history here would drop the user turn that startRun has
+      // already put on screen but not yet persisted, so splice the marker in
+      // ahead of it instead.
+      if (sid === currentSession) {
+        const pending = turns[turns.length - 1];
+        if (pending) conv.insertBefore(compactionMark(), pending.el);
+        else conv.appendChild(compactionMark());
+      }
+    }
+  } catch {
+    // Compaction is best-effort: a failed summary must never block the send.
+  } finally {
+    s.compacting = false;
+    s.activityText = "thinking…";
+    if (sid === currentSession) {
+      sbUpdate();
+      renderActivity();
+    }
+  }
+}
+
 /// Start a run against an explicit chat. Safe to call for a chat that is not
 /// on screen (that's how a queued message is flushed).
 async function startRun(sid: string, text: string): Promise<void> {
@@ -764,9 +843,7 @@ async function startRun(sid: string, text: string): Promise<void> {
     const urls = onScreen ? attachments.map((a) => a.url).filter(Boolean) : [];
     s.liveIn = Math.floor((text.length + ctx.length) / 4);
     if (sid === currentSession) sbUpdate();
-    if (s.baseIn + s.liveIn > 850_000) {
-      await api.compactSession(sid).catch(() => 0);
-    }
+    await maybeCompact(sid);
     await api.sendText(sid, ctx ? text + "\n\n## Referenced files\n" + ctx : text, urls);
     if (onScreen) {
       attachments = [];
@@ -845,6 +922,7 @@ api.onEngineEvent((ev) => {
     case "summary":
       chat.baseIn += ev.tokensIn || 0;
       chat.baseOut += ev.tokensOut || 0;
+      if (ev.contextTokens) chat.ctxIn = ev.contextTokens;
       chat.liveIn = 0;
       chat.liveOut = 0;
       if (typeof ev.cost === "number" && !isNaN(ev.cost)) {
@@ -995,6 +1073,8 @@ async function selectModel(m: string): Promise<void> {
     modelPill.textContent = m;
     sbModel.textContent = m;
     if (currentSession) await api.setSessionModel(currentSession, m);
+    ctxWindow = await api.contextBudget().catch(() => ctxWindow);
+    sbUpdate();
   } catch (e) {
     statusText.textContent = "save failed";
     console.error(e);
@@ -1171,11 +1251,20 @@ function updateChatBanner(): void {
   if (el) el.textContent = ((p ? p.name : "Chats") + " / " + (sess ? sess.name : "New task"));
 }
 
+/// Seed context size for a chat we have never run in this app session. The
+/// provider's real count replaces this after the first run; without it a large
+/// restored history would sail past the window before we ever measured it.
+function seedContextEstimate(sid: string, estimate: number): void {
+  const s = ui(sid);
+  if (!s.ctxIn) s.ctxIn = estimate || 0;
+}
+
 function renderHistory(messages: { role: string; content: string; reasoning?: string }[]): void {
   conv.innerHTML = "";
   turns = [];
   for (const m of messages) {
-    if (m.role === "user" && m.content) addUserTurn(m.content);
+    if (m.role === "compaction") conv.appendChild(compactionMark());
+    else if (m.role === "user" && m.content) addUserTurn(m.content);
     else if (m.role === "assistant" && (m.content || m.reasoning)) addStaticAssistant(m.content, m.reasoning || "");
   }
   updateEmpty();
@@ -1339,6 +1428,7 @@ async function loadSession(id: string): Promise<void> {
     sbModel.textContent = g.model;
   }
   renderHistory(g.messages);
+  seedContextEstimate(id, g.context_estimate);
 
   // Trust the backend about whether this chat is actually running; the UI's own
   // flag can be stale if a run finished while we were looking elsewhere.
@@ -1604,6 +1694,7 @@ overlay.innerHTML = `
       <div class="field"><label>API key</label><input id="cfg-key" type="password" spellcheck="false"/></div>
       <div class="field"><label>Model</label><input id="cfg-model" list="model-list" spellcheck="false"/><datalist id="model-list"></datalist></div>
       <div class="prov-row"><button id="cfg-refresh" type="button" title="Fetch /models">Refresh</button><button id="cfg-delprov" type="button">Delete</button></div>
+      <label class="lbl">Context window (tokens)</label><input id="cfg-ctxwin" type="number" step="1000" min="0" placeholder="1000000"/>
     </div>
     <div class="prov-row"><button id="cfg-addprov" type="button">+ New provider</button></div>
     <details class="field bhr">
@@ -1638,6 +1729,7 @@ function loadProviderToForm(p?: ProviderItem): void {
   (overlay.querySelector("#cfg-pname") as HTMLInputElement).value = p.name || p.id;
   (overlay.querySelector("#cfg-base") as HTMLInputElement).value = p.base_url;
   (overlay.querySelector("#cfg-key") as HTMLInputElement).value = p.api_key;
+  (overlay.querySelector("#cfg-ctxwin") as HTMLInputElement).value = String(p.context_window || defaultCtxWindow);
   availableModels = p.models || [];
   currentModel = availableModels.includes(currentModel) ? currentModel : availableModels[0] || "";
   populateModelList();
@@ -1699,7 +1791,7 @@ function renderProviderSelect(): void {
 
 (overlay.querySelector("#cfg-addprov") as HTMLButtonElement).addEventListener("click", async () => {
   const n = providers.length + 1;
-  const p: ProviderItem = { id: "p" + Date.now().toString(36), name: "Provider " + n, base_url: "", api_key: "", models: [] };
+  const p: ProviderItem = { id: "p" + Date.now().toString(36), name: "Provider " + n, base_url: "", api_key: "", models: [], context_window: null };
   providers.push(p);
   activeProviderId = p.id;
   renderProviderSelect();
@@ -1722,9 +1814,15 @@ async function openSettings(): Promise<void> {
   providers = cfg.providers || [];
   availableModels = cfg.models || [];
   currentModel = cfg.model || "";
-  activeProviderId = cfg.providers?.[0]?.id || "";
+  // Align the edit target with the connection actually in use, so saving
+  // without switching providers can't write the field values onto a different
+  // provider than the one the form was populated from.
+  const activeProv = cfg.providers?.find((p) => p.base_url === cfg.base_url) || cfg.providers?.[0];
+  activeProviderId = activeProv?.id || "";
   currentWs = cfg.workspace;
   (overlay.querySelector("#cfg-temp") as HTMLInputElement).value = String(cfg.temperature);
+  defaultCtxWindow = cfg.context_window || 1_000_000;
+  (overlay.querySelector("#cfg-ctxwin") as HTMLInputElement).value = String(activeProv?.context_window || defaultCtxWindow);
   (overlay.querySelector("#cfg-sys") as HTMLTextAreaElement).value = cfg.system;
   (overlay.querySelector("#cfg-yolo") as HTMLInputElement).checked = !!cfg.yolo;
   renderProviderSelect();
@@ -1747,6 +1845,8 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
   const temperature = parseFloat((overlay.querySelector("#cfg-temp") as HTMLInputElement).value) || 1;
   const system = (overlay.querySelector("#cfg-sys") as HTMLTextAreaElement).value;
   const yolo = (overlay.querySelector("#cfg-yolo") as HTMLInputElement).checked;
+  const ctxWin = parseInt((overlay.querySelector("#cfg-ctxwin") as HTMLInputElement).value, 10);
+  active.context_window = ctxWin > 0 ? ctxWin : null;
   const cfg: Config = {
     base_url: active.base_url,
     api_key: active.api_key,
@@ -1756,9 +1856,12 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
     temperature,
     yolo,
     models: availableModels,
+    context_window: defaultCtxWindow,
     providers,
   };
   await api.saveConfig(cfg);
+  ctxWindow = await api.contextBudget().catch(() => ctxWindow);
+  sbUpdate();
   setYoloIndicator(yolo);
   currentModel = model;
   currentModels = availableModels;
@@ -1788,6 +1891,8 @@ async function init(): Promise<void> {
 
   try {
     const cfg = await api.getConfig();
+    defaultCtxWindow = cfg.context_window || 1_000_000;
+    ctxWindow = await api.contextBudget().catch(() => defaultCtxWindow);
     modelPill.textContent = cfg.model || "configure model";
     currentModel = cfg.model || "";
     currentModels = cfg.models || [];
@@ -1799,6 +1904,7 @@ async function init(): Promise<void> {
     if (currentSession) {
       const g = await api.getSession(currentSession);
       renderHistory(g.messages);
+      seedContextEstimate(currentSession, g.context_estimate);
       ui(currentSession).running = !!g.running;
       if (g.model) {
         currentModel = g.model;
@@ -1821,7 +1927,7 @@ async function init(): Promise<void> {
 function resetSB(sid = currentSession): void {
   if (!sid) return;
   const s = ui(sid);
-  s.baseIn = s.baseOut = s.liveIn = s.liveOut = s.money = 0;
+  s.baseIn = s.baseOut = s.liveIn = s.liveOut = s.ctxIn = s.money = 0;
   s.costKnown = false;
   s.errored = false;
   if (sid === currentSession) sbUpdate();

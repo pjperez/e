@@ -33,7 +33,7 @@ impl Emitter for RpcEmitter {
     fn summary(&self, s: &RunSummary) {
         emit_line(
             "summary",
-            json!({ "steps": s.steps, "tools": s.tool_calls, "stopped": s.stopped, "tokensIn": s.tokens_in, "tokensOut": s.tokens_out, "cost": s.cost, "error": s.error }),
+            json!({ "steps": s.steps, "tools": s.tool_calls, "stopped": s.stopped, "tokensIn": s.tokens_in, "tokensOut": s.tokens_out, "contextTokens": s.context_tokens, "cost": s.cost, "error": s.error }),
         );
     }
     fn message_end(&self) { emit_line("message_end", json!({})); }

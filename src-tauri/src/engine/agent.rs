@@ -18,9 +18,21 @@ pub struct Config {
     pub yolo: bool,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Usable context window (tokens) for the active model. Compaction is
+    /// triggered off this, so getting it right per provider/model matters.
+    #[serde(default = "default_context_window")]
+    pub context_window: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderItem>,
 }
+
+pub fn default_context_window() -> u64 {
+    1_000_000
+}
+
+/// Fraction of the context window at which we compact. Deliberately high: the
+/// point is to avoid overflowing, not to keep the window small.
+pub const COMPACT_AT: f64 = 0.85;
 
 /// A saved provider configuration; the active connection is the flat
 /// base_url/api_key/model/models fields above.
@@ -31,6 +43,10 @@ pub struct ProviderItem {
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<String>,
+    /// Context window for this provider's models; falls back to the global
+    /// default when unset (older config files won't have it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 impl Config {
@@ -45,11 +61,13 @@ impl Config {
             system: "You are e, a fast, capable coding agent running in a local harness with a workspace and tools: shell (run commands), read_file, write_file, list_dir.\nTool use policy: use a tool ONLY when it genuinely helps (inspect/read files, run or verify commands, modify the workspace, or when the user asks you to act). For conversational or directly-answerable requests, answer directly yourself and NEVER make a tool call.".to_string(),
             workspace: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
             yolo: false,
+            context_window: default_context_window(),
             providers: vec![ProviderItem {
                 id: "aigateway".into(),
                 name: "AI Gateway".into(),
                 base_url: "https://provider.example/v1".into(),
                 api_key: String::new(),
+                context_window: None,
                 models: vec![
                     "zai-coding/glm-5.2".into(),
                     "openrouter/deepseek/deepseek-v4-flash-0731".into(),
@@ -115,6 +133,22 @@ impl Config {
         base
     }
 
+    /// Context window to budget against: the active provider's override when it
+    /// has one, otherwise the global setting.
+    pub fn active_context_window(&self) -> u64 {
+        let win = self
+            .providers
+            .iter()
+            .find(|p| p.base_url == self.base_url)
+            .and_then(|p| p.context_window)
+            .unwrap_or(self.context_window);
+        if win == 0 {
+            default_context_window()
+        } else {
+            win
+        }
+    }
+
     pub fn save(&self) {
         let home = dirs::home_dir().unwrap_or_default().join(".e");
         if std::fs::create_dir_all(&home).is_ok() {
@@ -170,6 +204,9 @@ fn merge(base: &mut Config, c: Config) {
     if !c.providers.is_empty() {
         base.providers = c.providers;
     }
+    if c.context_window > 0 {
+        base.context_window = c.context_window;
+    }
     // Copied unconditionally: the "skip empty values" rule used above cannot
     // express a bool the user deliberately turned off.
     base.yolo = c.yolo;
@@ -205,6 +242,8 @@ pub struct RunStats {
     pub stopped: bool,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Prompt tokens of the most recent provider call — the live context size.
+    pub context_tokens: u64,
     pub cost: Option<f64>,
     pub error: Option<String>,
 }
@@ -217,6 +256,7 @@ impl RunStats {
             stopped: self.stopped,
             tokens_in: self.tokens_in,
             tokens_out: self.tokens_out,
+            context_tokens: self.context_tokens,
             cost: self.cost,
             error: self.error.clone(),
         }
@@ -308,7 +348,7 @@ impl Agent {
         self.history.push(Msg { role: "user".into(), parts });
         self.persist();
 
-        let mut stats = RunStats { steps: 0, tool_calls: 0, stopped: false, tokens_in: 0, tokens_out: 0, cost: None, error: None };
+        let mut stats = RunStats { steps: 0, tool_calls: 0, stopped: false, tokens_in: 0, tokens_out: 0, context_tokens: 0, cost: None, error: None };
 
         loop {
             if cancelled.load(Ordering::SeqCst) {
@@ -350,6 +390,11 @@ impl Agent {
             stats.steps += 1;
             stats.tokens_in += completion.usage.0;
             stats.tokens_out += completion.usage.1;
+            // Overwrite, don't accumulate: this is the size of the window we
+            // just sent, which is what context-pressure decisions need.
+            if completion.usage.0 > 0 {
+                stats.context_tokens = completion.usage.0;
+            }
             if let Some(c) = completion.cost {
                 stats.cost = Some(stats.cost.unwrap_or(0.0) + c);
             }
