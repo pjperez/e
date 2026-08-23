@@ -126,12 +126,13 @@ function sbUpdate(): void {
     : "CH " + fmtTokens(ctx) + "/" + fmtTokens(ctxWindow) + " · " + pct.toFixed(1) + "%";
   sbCost.textContent = s.costKnown ? "$" + s.money.toFixed(3) : "$-";
 }
-function activeProviderName(cfg: api.Config): string {
-  if (cfg.providers && cfg.providers.length) {
-    const p = cfg.providers.find((x) => x.base_url === cfg.base_url) || cfg.providers[0];
-    return p.name || p.id;
-  }
-  return hostOf(cfg.base_url);
+/** Name of the provider serving the current model, for the status bar. */
+function providerLabel(): string {
+  const hit = catalog.find((c) => c.provider_id === currentProviderId);
+  if (hit) return hit.provider_name;
+  const p = providers.find((x) => x.id === currentProviderId) || providers[0];
+  if (p) return p.name || p.id;
+  return "none";
 }
 
 const setBusy = (b: boolean) => {
@@ -526,14 +527,19 @@ function setError(msg: string): void {
 }
 
 // ---------- send / events ----------
-let availableModels: string[] = [];
+/** Last-saved provider list; Settings edits a copy so Cancel really cancels. */
 let providers: ProviderItem[] = [];
 let currentWs = "";
-let activeProviderId = "";
+/** Provider open in the Settings editor. Purely an editing cursor — there is
+ *  no "active provider" to choose any more; picking a model picks one. */
+let editingProviderId = "";
 /** Global fallback context window, used when a provider has no override. */
 let defaultCtxWindow = 1_000_000;
-let currentModels: string[] = [];
+/** Every model on offer across all enabled providers — what the picker shows. */
+let catalog: api.ModelChoice[] = [];
 let currentModel = "";
+/** Provider serving the current model; the same id can exist in several. */
+let currentProviderId = "";
 
 // ---------- queued-message chip ----------
 // A message typed while a chat is busy belongs to *that* chat and is shown
@@ -1059,49 +1065,69 @@ api.onEngineEvent((ev) => {
   }
 });
 
-// ---------- model picker (dropdown + autocomplete) ----------
+// ---------- model picker (every enabled model, grouped by provider) ----------
 const pickerMenu = document.getElementById("picker-menu") as HTMLElement;
 const pickerInput = document.getElementById("picker-input") as HTMLInputElement;
 const pickerList = document.getElementById("picker-list") as HTMLElement;
 
 function renderPicker(): void {
   const q = pickerInput.value.trim().toLowerCase();
-  const list = q ? currentModels.filter((m) => m.toLowerCase().includes(q)) : currentModels;
+  // Matching the provider name too means "openai" finds that provider's whole
+  // shelf, not just models that happen to spell it out in their id.
+  const list = q
+    ? catalog.filter((c) => c.model.toLowerCase().includes(q) || c.provider_name.toLowerCase().includes(q))
+    : catalog;
   pickerList.innerHTML = "";
   if (!list.length) {
     const e = document.createElement("div");
     e.className = "picker-empty";
-    e.textContent = "No matching models";
+    e.textContent = catalog.length
+      ? "No matching models"
+      : "No models enabled — turn a provider on in Settings (⚙)";
     pickerList.appendChild(e);
     return;
   }
-  list.forEach((m) => {
+  let group = "";
+  list.forEach((c) => {
+    if (c.provider_id !== group) {
+      group = c.provider_id;
+      const h = document.createElement("div");
+      h.className = "picker-group";
+      h.textContent = c.provider_name;
+      pickerList.appendChild(h);
+    }
     const it = document.createElement("div");
-    it.className = "picker-item" + (m === currentModel ? " active" : "");
-    it.textContent = m;
-    it.addEventListener("click", () => void selectModel(m));
+    const active = c.model === currentModel && c.provider_id === currentProviderId;
+    it.className = "picker-item" + (active ? " active" : "");
+    it.textContent = c.model;
+    it.addEventListener("click", () => void selectModel(c));
     pickerList.appendChild(it);
   });
 }
 function openPicker(): void {
+  pickerInput.value = "";
   renderPicker();
   pickerMenu.hidden = false;
-  pickerInput.value = "";
   pickerInput.focus();
 }
 function closePicker(): void {
   pickerMenu.hidden = true;
 }
-async function selectModel(m: string): Promise<void> {
+async function selectModel(c: api.ModelChoice): Promise<void> {
   try {
     const cfg = await api.getConfig();
-    cfg.model = m;
+    cfg.model = c.model;
+    // Carry the provider: the same model id can be served by more than one, so
+    // the backend must not have to guess which connection was meant.
+    cfg.provider_id = c.provider_id;
     await api.saveConfig(cfg);
-    currentModel = m;
-    modelPill.textContent = m;
-    sbModel.textContent = m;
-    if (currentSession) await api.setSessionModel(currentSession, m);
-    ctxWindow = await api.contextBudget().catch(() => ctxWindow);
+    currentModel = c.model;
+    currentProviderId = c.provider_id;
+    modelPill.textContent = c.model;
+    sbModel.textContent = c.model;
+    sbProv.textContent = "[" + c.provider_name + "]";
+    if (currentSession) await api.setSessionModel(currentSession, c.model, c.provider_id);
+    ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
     sbUpdate();
   } catch (e) {
     statusText.textContent = "save failed";
@@ -1389,7 +1415,7 @@ function renderSessions(): void {
       e.stopPropagation();
       void (async () => {
         openProjs.add(p.id);
-        const meta = await api.newSession("", undefined, currentModel, p.id);
+        const meta = await api.newSession("", undefined, currentModel, currentProviderId, p.id);
         await refreshSessions();
         if (meta.id) await loadSession(meta.id);
       })();
@@ -1562,11 +1588,7 @@ async function loadSession(id: string): Promise<void> {
   await api.switchSession(id);
   currentSession = id;
   const g = await api.getSession(id);
-  if (g.model) {
-    currentModel = g.model;
-    modelPill.textContent = g.model;
-    sbModel.textContent = g.model;
-  }
+  await applySessionModel(g.model, g.provider);
   renderHistory(g.messages);
   seedContextEstimate(id, g.context_estimate);
 
@@ -1820,22 +1842,42 @@ document.getElementById("btn-clear")!.addEventListener("click", (e) => {
   openSessions();
 });
 
-// ---------- settings (provider-centric) ----------
+// ---------- settings (a shelf of providers, not one "active" one) ----------
+// Settings decides what is *available*: which providers are on, and which of
+// their models are on. Which one a chat runs is picked from the model pill,
+// so there is nothing here to mistake for "the active provider".
 const overlay = document.createElement("div");
 overlay.className = "overlay";
 overlay.innerHTML = `
   <div class="modal">
     <h3>Settings</h3>
-    <div class="field"><label>Providers</label><div id="provlist"></div></div>
+    <div class="field">
+      <label>Providers</label>
+      <p class="note prov-help">Every enabled model from every enabled provider shows up together in the model picker — click the model name in the title bar to switch.</p>
+      <div id="provlist"></div>
+      <div class="prov-row"><button id="cfg-addprov" type="button">+ New provider</button></div>
+    </div>
     <div id="prov-edit" class="prov-edit" hidden>
       <div class="field"><label>Name</label><input id="cfg-pname" spellcheck="false"/></div>
-      <div class="field"><label>API base URL</label><input id="cfg-base" spellcheck="false"/></div>
+      <div class="field"><label>API base URL</label><input id="cfg-base" spellcheck="false" placeholder="https://host/v1"/></div>
       <div class="field"><label>API key</label><input id="cfg-key" type="password" spellcheck="false"/></div>
-      <div class="field"><label>Model</label><input id="cfg-model" list="model-list" spellcheck="false"/><datalist id="model-list"></datalist></div>
-      <div class="prov-row"><button id="cfg-refresh" type="button" title="Fetch /models">Refresh</button><button id="cfg-delprov" type="button">Delete</button></div>
-      <label class="lbl">Context window (tokens)</label><input id="cfg-ctxwin" type="number" step="1000" min="0" placeholder="1000000"/>
+      <div class="field"><label>Context window (tokens)</label><input id="cfg-ctxwin" type="number" step="1000" min="0" placeholder="1000000"/></div>
+      <div class="field">
+        <label>Models <span id="cfg-mcount" class="prov-count"></span></label>
+        <div class="model-tools">
+          <input id="cfg-mfilter" placeholder="Filter…" spellcheck="false"/>
+          <button id="cfg-refresh" type="button" title="Fetch &lt;base&gt;/models">Refresh</button>
+          <button id="cfg-mall" type="button" title="Enable every model">All</button>
+          <button id="cfg-mnone" type="button" title="Disable every model">None</button>
+        </div>
+        <div id="cfg-models" class="model-list"></div>
+        <div class="model-tools">
+          <input id="cfg-madd" placeholder="Add a model id by hand…" spellcheck="false"/>
+          <button id="cfg-maddbtn" type="button">Add</button>
+        </div>
+      </div>
+      <div class="prov-row"><button id="cfg-delprov" type="button">Delete provider</button></div>
     </div>
-    <div class="prov-row"><button id="cfg-addprov" type="button">+ New provider</button></div>
     <details class="field bhr">
       <summary>Behavior</summary>
             <label class="lbl">Temperature</label><input id="cfg-temp" type="number" step="0.1" min="0" max="2"/>
@@ -1850,77 +1892,186 @@ overlay.innerHTML = `
   </div>`;
 document.body.appendChild(overlay);
 
-function populateModelList(): void {
-  const dl = overlay.querySelector("#model-list") as HTMLDataListElement;
-  dl.innerHTML = "";
-  availableModels.forEach((m) => {
-    const o = document.createElement("option");
-    o.value = m;
-    dl.appendChild(o);
+/** Settings works on a copy, so Cancel discards edits instead of half-applying. */
+let draft: ProviderItem[] = [];
+
+const el = <T extends HTMLElement>(sel: string): T => overlay.querySelector(sel) as T;
+const editing = (): ProviderItem | undefined => draft.find((p) => p.id === editingProviderId);
+
+function modelOn(p: ProviderItem, m: string): boolean {
+  return !(p.disabled_models || []).includes(m);
+}
+
+function setModelOn(p: ProviderItem, m: string, on: boolean): void {
+  const off = new Set(p.disabled_models || []);
+  if (on) off.delete(m);
+  else off.add(m);
+  p.disabled_models = [...off];
+}
+
+/** Read the open editor's text fields back into the draft. Called before any
+ *  re-render or provider switch so typing is never silently thrown away. */
+function commitProviderForm(): void {
+  const p = editing();
+  if (!p) return;
+  p.name = el<HTMLInputElement>("#cfg-pname").value.trim() || p.id;
+  p.base_url = el<HTMLInputElement>("#cfg-base").value.trim();
+  p.api_key = el<HTMLInputElement>("#cfg-key").value.trim();
+  const win = parseInt(el<HTMLInputElement>("#cfg-ctxwin").value, 10);
+  p.context_window = win > 0 ? win : null;
+}
+
+function renderModelList(): void {
+  const p = editing();
+  const box = el<HTMLElement>("#cfg-models");
+  const count = el<HTMLElement>("#cfg-mcount");
+  box.innerHTML = "";
+  if (!p) return;
+  const on = p.models.filter((m) => modelOn(p, m)).length;
+  count.textContent = p.models.length ? `${on}/${p.models.length} on` : "none yet — Refresh or add one";
+  const q = el<HTMLInputElement>("#cfg-mfilter").value.trim().toLowerCase();
+  const list = q ? p.models.filter((m) => m.toLowerCase().includes(q)) : p.models;
+  if (!list.length) {
+    const e = document.createElement("div");
+    e.className = "picker-empty";
+    e.textContent = p.models.length ? "No matching models" : "No models — hit Refresh, or add one by hand";
+    box.appendChild(e);
+    return;
+  }
+  list.forEach((m) => {
+    const row = document.createElement("label");
+    row.className = "model-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = modelOn(p, m);
+    const name = document.createElement("span");
+    name.className = "model-name";
+    name.textContent = m;
+    const drop = document.createElement("button");
+    drop.className = "sess-act";
+    drop.type = "button";
+    drop.textContent = "×";
+    drop.title = "Remove from the list";
+    cb.addEventListener("change", () => {
+      setModelOn(p, m, cb.checked);
+      renderModelList();
+      renderProviderList();
+    });
+    drop.addEventListener("click", (e) => {
+      e.preventDefault();
+      p.models = p.models.filter((x) => x !== m);
+      p.disabled_models = (p.disabled_models || []).filter((x) => x !== m);
+      renderModelList();
+      renderProviderList();
+    });
+    row.append(cb, name, drop);
+    box.appendChild(row);
   });
-  const mi = overlay.querySelector("#cfg-model") as HTMLInputElement;
-  mi.value = currentModel && availableModels.includes(currentModel) ? currentModel : availableModels[0] || "";
 }
 
 function loadProviderToForm(p?: ProviderItem): void {
   if (!p) return;
-  activeProviderId = p.id;
-  (overlay.querySelector("#cfg-pname") as HTMLInputElement).value = p.name || p.id;
-  (overlay.querySelector("#cfg-base") as HTMLInputElement).value = p.base_url;
-  (overlay.querySelector("#cfg-key") as HTMLInputElement).value = p.api_key;
-  (overlay.querySelector("#cfg-ctxwin") as HTMLInputElement).value = String(p.context_window || defaultCtxWindow);
-  availableModels = p.models || [];
-  currentModel = availableModels.includes(currentModel) ? currentModel : availableModels[0] || "";
-  populateModelList();
-  const pane = overlay.querySelector("#prov-edit") as HTMLElement;
-  if (pane) pane.hidden = false;
+  editingProviderId = p.id;
+  el<HTMLInputElement>("#cfg-pname").value = p.name || p.id;
+  el<HTMLInputElement>("#cfg-base").value = p.base_url;
+  el<HTMLInputElement>("#cfg-key").value = p.api_key;
+  el<HTMLInputElement>("#cfg-ctxwin").value = p.context_window ? String(p.context_window) : "";
+  el<HTMLInputElement>("#cfg-ctxwin").placeholder = String(defaultCtxWindow);
+  el<HTMLInputElement>("#cfg-mfilter").value = "";
+  el<HTMLInputElement>("#cfg-madd").value = "";
+  renderModelList();
+  el<HTMLElement>("#prov-edit").hidden = false;
 }
 
-function renderProviderSelect(): void {
-  const box = overlay.querySelector("#provlist") as HTMLElement;
+function closeProviderForm(): void {
+  editingProviderId = "";
+  el<HTMLElement>("#prov-edit").hidden = true;
+  renderProviderList();
+}
+
+function renderProviderList(): void {
+  const box = el<HTMLElement>("#provlist");
   box.innerHTML = "";
-  providers.forEach((p) => {
+  if (!draft.length) {
+    const e = document.createElement("div");
+    e.className = "picker-empty";
+    e.textContent = "No providers yet";
+    box.appendChild(e);
+    return;
+  }
+  draft.forEach((p) => {
     const row = document.createElement("div");
-    row.className = "prov-item" + (p.id === activeProviderId ? " active" : "");
+    row.className = "prov-item" + (p.id === editingProviderId ? " editing" : "") + (p.enabled ? "" : " off");
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.checked = p.enabled;
+    toggle.title = p.enabled ? "Disable this provider" : "Enable this provider";
     const lab = document.createElement("span");
     lab.className = "prov-name";
-    lab.textContent = (p.name || p.id) + "  ·  " + hostOf(p.base_url);
+    lab.textContent = (p.name || p.id) + (p.base_url ? "  ·  " + hostOf(p.base_url) : "  ·  no URL");
+    const count = document.createElement("span");
+    count.className = "prov-count";
+    const on = p.models.filter((m) => modelOn(p, m)).length;
+    count.textContent = p.models.length ? `${on}/${p.models.length}` : "0";
+    count.title = "Models enabled";
     const edit = document.createElement("button");
     edit.className = "sess-act";
+    edit.type = "button";
     edit.textContent = "✎";
     edit.title = "Edit provider";
     const del = document.createElement("button");
     del.className = "sess-act";
+    del.type = "button";
     del.textContent = "×";
     del.title = "Delete provider";
-    row.append(lab, edit, del);
+    row.append(toggle, lab, count, edit, del);
+    toggle.addEventListener("change", () => {
+      p.enabled = toggle.checked;
+      renderProviderList();
+    });
+    lab.addEventListener("click", () => {
+      commitProviderForm();
+      if (p.id === editingProviderId) closeProviderForm();
+      else {
+        loadProviderToForm(p);
+        renderProviderList();
+      }
+    });
     edit.addEventListener("click", () => {
-      activeProviderId = p.id;
+      commitProviderForm();
       loadProviderToForm(p);
+      renderProviderList();
     });
     del.addEventListener("click", async () => {
-      if (!(await confirmModal("Delete provider \"" + p.name + "\"?"))) return;
-      const i = providers.findIndex((x) => x.id === p.id);
-      if (i >= 0) providers.splice(i, 1);
-      if (activeProviderId === p.id) activeProviderId = providers[0]?.id || "";
-      renderProviderSelect();
-      if (providers.length) loadProviderToForm(providers.find((x) => x.id === activeProviderId) || providers[0]);
-      else (overlay.querySelector("#prov-edit") as HTMLElement).hidden = true;
+      if (!(await confirmModal('Delete provider "' + (p.name || p.id) + '"?'))) return;
+      draft = draft.filter((x) => x.id !== p.id);
+      if (editingProviderId === p.id) editingProviderId = "";
+      renderProviderList();
+      el<HTMLElement>("#prov-edit").hidden = !editing();
     });
     box.appendChild(row);
   });
 }
 
-(overlay.querySelector("#cfg-refresh") as HTMLButtonElement).addEventListener("click", async () => {
-  const p = providers.find((x) => x.id === activeProviderId);
+el<HTMLInputElement>("#cfg-mfilter").addEventListener("input", renderModelList);
+
+el<HTMLButtonElement>("#cfg-refresh").addEventListener("click", async () => {
+  commitProviderForm();
+  const p = editing();
   if (!p) return;
+  if (!p.base_url) {
+    statusText.textContent = "set a base URL first";
+    return;
+  }
   statusText.textContent = "refreshing…";
   try {
     const list = await api.refreshModels(p.base_url, p.api_key);
+    // Keep what the user turned off, drop entries the provider no longer
+    // serves — a stale opt-out would silently hide a re-added model.
+    p.disabled_models = (p.disabled_models || []).filter((m) => list.includes(m));
     p.models = list;
-    availableModels = list;
-    currentModel = list[0] || currentModel;
-    populateModelList();
+    renderModelList();
+    renderProviderList();
     statusText.textContent = list.length + " models";
   } catch (e) {
     statusText.textContent = "refresh failed";
@@ -1928,43 +2079,86 @@ function renderProviderSelect(): void {
   }
 });
 
-(overlay.querySelector("#cfg-addprov") as HTMLButtonElement).addEventListener("click", async () => {
-  const n = providers.length + 1;
-  const p: ProviderItem = { id: "p" + Date.now().toString(36), name: "Provider " + n, base_url: "", api_key: "", models: [], context_window: null };
-  providers.push(p);
-  activeProviderId = p.id;
-  renderProviderSelect();
-  loadProviderToForm(p);
-  (overlay.querySelector("#cfg-pname") as HTMLInputElement).focus();
+function addModelByHand(): void {
+  const p = editing();
+  const input = el<HTMLInputElement>("#cfg-madd");
+  const m = input.value.trim();
+  if (!p || !m) return;
+  // Not every gateway lists everything it serves, so a model can be named by
+  // hand instead of only through /models.
+  if (!p.models.includes(m)) p.models.push(m);
+  p.disabled_models = (p.disabled_models || []).filter((x) => x !== m);
+  input.value = "";
+  renderModelList();
+  renderProviderList();
+}
+el<HTMLButtonElement>("#cfg-maddbtn").addEventListener("click", addModelByHand);
+el<HTMLInputElement>("#cfg-madd").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    addModelByHand();
+  }
 });
 
-(overlay.querySelector("#cfg-delprov") as HTMLButtonElement).addEventListener("click", async () => {
-  if (!(await confirmModal("Delete this provider?"))) return;
-  const i = providers.findIndex((x) => x.id === activeProviderId);
-  if (i >= 0) providers.splice(i, 1);
-  activeProviderId = providers[0]?.id || "";
-  renderProviderSelect();
-  if (providers.length) loadProviderToForm(providers.find((x) => x.id === activeProviderId) || providers[0]);
-  else (overlay.querySelector("#prov-edit") as HTMLElement).hidden = true;
+el<HTMLButtonElement>("#cfg-mall").addEventListener("click", () => {
+  const p = editing();
+  if (!p) return;
+  p.disabled_models = [];
+  renderModelList();
+  renderProviderList();
+});
+el<HTMLButtonElement>("#cfg-mnone").addEventListener("click", () => {
+  const p = editing();
+  if (!p) return;
+  p.disabled_models = [...p.models];
+  renderModelList();
+  renderProviderList();
+});
+
+el<HTMLButtonElement>("#cfg-addprov").addEventListener("click", () => {
+  commitProviderForm();
+  const p: ProviderItem = {
+    id: "p" + Date.now().toString(36),
+    name: "Provider " + (draft.length + 1),
+    base_url: "",
+    api_key: "",
+    models: [],
+    context_window: null,
+    enabled: true,
+    disabled_models: [],
+  };
+  draft.push(p);
+  loadProviderToForm(p);
+  renderProviderList();
+  el<HTMLInputElement>("#cfg-pname").focus();
+});
+
+el<HTMLButtonElement>("#cfg-delprov").addEventListener("click", async () => {
+  const p = editing();
+  if (!p) return;
+  if (!(await confirmModal('Delete provider "' + (p.name || p.id) + '"?'))) return;
+  draft = draft.filter((x) => x.id !== p.id);
+  editingProviderId = "";
+  el<HTMLElement>("#prov-edit").hidden = true;
+  renderProviderList();
 });
 
 async function openSettings(): Promise<void> {
   const cfg = await api.getConfig();
   providers = cfg.providers || [];
-  availableModels = cfg.models || [];
-  currentModel = cfg.model || "";
-  // Align the edit target with the connection actually in use, so saving
-  // without switching providers can't write the field values onto a different
-  // provider than the one the form was populated from.
-  const activeProv = cfg.providers?.find((p) => p.base_url === cfg.base_url) || cfg.providers?.[0];
-  activeProviderId = activeProv?.id || "";
+  draft = providers.map((p) => ({
+    ...p,
+    models: [...(p.models || [])],
+    disabled_models: [...(p.disabled_models || [])],
+  }));
   currentWs = cfg.workspace;
-  (overlay.querySelector("#cfg-temp") as HTMLInputElement).value = String(cfg.temperature);
   defaultCtxWindow = cfg.context_window || 1_000_000;
-  (overlay.querySelector("#cfg-ctxwin") as HTMLInputElement).value = String(activeProv?.context_window || defaultCtxWindow);
-  (overlay.querySelector("#cfg-sys") as HTMLTextAreaElement).value = cfg.system;
-  (overlay.querySelector("#cfg-yolo") as HTMLInputElement).checked = !!cfg.yolo;
-  renderProviderSelect();
+  editingProviderId = "";
+  el<HTMLElement>("#prov-edit").hidden = true;
+  el<HTMLInputElement>("#cfg-temp").value = String(cfg.temperature);
+  el<HTMLTextAreaElement>("#cfg-sys").value = cfg.system;
+  el<HTMLInputElement>("#cfg-yolo").checked = !!cfg.yolo;
+  renderProviderList();
   overlay.classList.add("open");
 }
 
@@ -1973,46 +2167,79 @@ function closeSettings(): void {
 }
 overlay.querySelector("#cfg-cancel")!.addEventListener("click", closeSettings);
 overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
-  const active = providers.find((p) => p.id === activeProviderId) || providers[0];
-  if (!active) return;
-  active.name = (overlay.querySelector("#cfg-pname") as HTMLInputElement).value.trim() || active.id;
-  active.base_url = (overlay.querySelector("#cfg-base") as HTMLInputElement).value.trim();
-  active.api_key = (overlay.querySelector("#cfg-key") as HTMLInputElement).value.trim();
-  active.models = availableModels;
-  const model = (overlay.querySelector("#cfg-model") as HTMLInputElement).value.trim() || availableModels[0] || "";
+  commitProviderForm();
   const workspace = currentWs;
-  const temperature = parseFloat((overlay.querySelector("#cfg-temp") as HTMLInputElement).value) || 1;
-  const system = (overlay.querySelector("#cfg-sys") as HTMLTextAreaElement).value;
-  const yolo = (overlay.querySelector("#cfg-yolo") as HTMLInputElement).checked;
-  const ctxWin = parseInt((overlay.querySelector("#cfg-ctxwin") as HTMLInputElement).value, 10);
-  active.context_window = ctxWin > 0 ? ctxWin : null;
+  const temperature = parseFloat(el<HTMLInputElement>("#cfg-temp").value) || 1;
+  const system = el<HTMLTextAreaElement>("#cfg-sys").value;
+  const yolo = el<HTMLInputElement>("#cfg-yolo").checked;
   const cfg: Config = {
-    base_url: active.base_url,
-    api_key: active.api_key,
-    model,
+    // Settings decides what is *available*; the picker decides what is in use.
+    // Leaving the connection and the selection empty tells the backend to keep
+    // its own — saving Settings must never move a chat to another model.
+    base_url: "",
+    api_key: "",
+    model: "",
+    provider_id: "",
     workspace,
     system,
     temperature,
     yolo,
-    models: availableModels,
+    models: [],
     context_window: defaultCtxWindow,
-    providers,
+    providers: draft,
   };
   await api.saveConfig(cfg);
-  ctxWindow = await api.contextBudget().catch(() => ctxWindow);
-  sbUpdate();
+  providers = draft;
+  await syncModelState();
   setYoloIndicator(yolo);
-  currentModel = model;
-  currentModels = availableModels;
-  modelPill.textContent = model || "(none)";
-  sbModel.textContent = model || "?";
-  sbProv.textContent = "[" + activeProviderName(cfg) + "]";
   closeSettings();
 });
 overlay.addEventListener("click", (e) => {
   if (e.target === overlay) closeSettings();
 });
 document.getElementById("btn-settings")!.addEventListener("click", () => void openSettings());
+
+/// Pull the catalogue and the resolved selection back from the backend. It is
+/// the arbiter: turning a provider or model off can move the selection, and
+/// the UI must show where it actually landed rather than what was clicked.
+async function syncModelState(): Promise<void> {
+  catalog = await api.listModels().catch(() => [] as api.ModelChoice[]);
+  const cfg = await api.getConfig();
+  providers = cfg.providers || providers;
+  // Leave a chat on its own model while that model is still on offer. Only
+  // when it has been turned off (or removed) does the chat move — and then it
+  // moves for real, so its next run doesn't hit a model nothing serves.
+  const stillOffered = catalog.some(
+    (c) => c.model === currentModel && c.provider_id === currentProviderId,
+  );
+  if (!stillOffered) {
+    currentModel = cfg.model || "";
+    currentProviderId = cfg.provider_id || "";
+    if (currentSession && currentModel) {
+      await api.setSessionModel(currentSession, currentModel, currentProviderId);
+    }
+  }
+  modelPill.textContent = currentModel || "no model";
+  sbModel.textContent = currentModel || "?";
+  sbProv.textContent = "[" + providerLabel() + "]";
+  ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
+  sbUpdate();
+}
+
+/// Point the UI at the model a chat is on. A chat can sit on a model from any
+/// provider, so the provider label and the context budget move with it.
+async function applySessionModel(model: string, provider: string): Promise<void> {
+  if (model) {
+    currentModel = model;
+    currentProviderId =
+      provider || catalog.find((c) => c.model === model)?.provider_id || currentProviderId;
+  }
+  modelPill.textContent = currentModel || "no model";
+  sbModel.textContent = currentModel || "?";
+  sbProv.textContent = "[" + providerLabel() + "]";
+  ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
+  sbUpdate();
+}
 
 
 // ---------- init ----------
@@ -2031,12 +2258,7 @@ async function init(): Promise<void> {
   try {
     const cfg = await api.getConfig();
     defaultCtxWindow = cfg.context_window || 1_000_000;
-    ctxWindow = await api.contextBudget().catch(() => defaultCtxWindow);
-    modelPill.textContent = cfg.model || "configure model";
-    currentModel = cfg.model || "";
-    currentModels = cfg.models || [];
-    sbModel.textContent = cfg.model || "?";
-    sbProv.textContent = "[" + activeProviderName(cfg) + "]";
+    await syncModelState();
     setYoloIndicator(!!cfg.yolo);
     await refreshSessions();
     if (pinned) openSessions();
@@ -2045,11 +2267,7 @@ async function init(): Promise<void> {
       renderHistory(g.messages);
       seedContextEstimate(currentSession, g.context_estimate);
       ui(currentSession).running = !!g.running;
-      if (g.model) {
-        currentModel = g.model;
-        modelPill.textContent = g.model;
-        sbModel.textContent = g.model;
-      }
+      await applySessionModel(g.model, g.provider);
     }
     updateChatTitle();
     updateChatBanner();
@@ -2091,7 +2309,7 @@ pm.querySelector("#pm-go")!.addEventListener("click", async () => {
   const dir = await pickFolder();
   if (!dir) return;
   await api.newProject("", dir);
-  const meta = await api.newSession("Chat 1", dir, currentModel);
+  const meta = await api.newSession("Chat 1", dir, currentModel, currentProviderId);
   pm.classList.remove("open");
   await refreshSessions();
   if (meta.id) await loadSession(meta.id);

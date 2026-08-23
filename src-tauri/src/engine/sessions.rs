@@ -32,6 +32,12 @@ pub struct SessionMeta {
     pub project: String,
     #[serde(default)]
     pub model: String,
+    /// Provider that serves `model`. Models can be picked from any enabled
+    /// provider, so the chat has to remember which connection it chose or the
+    /// next run would send its model to whatever provider happened to be
+    /// active globally.
+    #[serde(default)]
+    pub provider: String,
     #[serde(default)]
     pub state: String,
 }
@@ -113,7 +119,7 @@ impl SessionStore {
         }
         st.migrate();
         if st.sessions.is_empty() {
-            st.create("Chat 1", "", "");
+            st.create("Chat 1", "", "", "");
         }
         st
     }
@@ -296,11 +302,21 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
-    pub fn set_model(&mut self, id: &str, model: &str) {
+    pub fn set_model(&mut self, id: &str, model: &str, provider: &str) {
         if let Some(s) = self.sessions.iter_mut().find(|x| x.id == id) {
             s.model = model.to_string();
+            s.provider = provider.to_string();
             self.save_index();
         }
+    }
+
+    /// Provider this chat picked its model from; empty means "resolve it".
+    pub fn provider(&self, id: &str) -> String {
+        self.sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.provider.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_state(&mut self, id: &str, state: &str) {
@@ -450,7 +466,7 @@ impl SessionStore {
     /// Create a chat in the current project. It copies the project's folder up
     /// front so the chat is pinned to it: an unresolved workspace would be
     /// filled in later from global config, i.e. from the wrong project.
-    pub fn create(&mut self, name: &str, workspace: &str, model: &str) -> SessionMeta {
+    pub fn create(&mut self, name: &str, workspace: &str, model: &str, provider: &str) -> SessionMeta {
         let id = format!("s{}", now_ms());
         let ws = if workspace.trim().is_empty() {
             let p = self.current_project_workspace();
@@ -470,6 +486,7 @@ impl SessionStore {
             workspace: ws,
             project: self.current_project.clone(),
             model: model.trim().to_string(),
+            provider: provider.trim().to_string(),
             state: String::new(),
         };
         self.set_history(&id, Vec::new());
@@ -573,6 +590,7 @@ impl SessionStore {
             workspace: src.workspace,
             project: src.project,
             model: src.model,
+            provider: src.provider,
             state: src.state,
         };
         self.set_history(&meta.id, history);
@@ -624,6 +642,7 @@ mod tests {
             workspace: workspace.into(),
             project: project.into(),
             model: String::new(),
+            provider: String::new(),
             state: String::new(),
         }
     }
@@ -774,7 +793,7 @@ mod tests {
     fn a_new_chat_inherits_the_current_projects_folder() {
         let mut st = store(vec![project("p2", "mascot", "C:/src/mascot")], vec![]);
         st.current_project = "p2".into();
-        let meta = st.create("", "", "");
+        let meta = st.create("", "", "", "");
         assert_eq!(meta.project, "p2");
         assert_eq!(st.resolved_workspace(&meta.id), "C:/src/mascot");
     }
