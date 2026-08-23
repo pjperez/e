@@ -222,6 +222,18 @@ fn parse_bool(v: &str) -> Option<bool> {
     }
 }
 
+/// What the agent should believe about where it is working.
+///
+/// Built per run from the chat's own project, so a chat is never told about a
+/// folder that belongs to a different one.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectContext {
+    pub name: String,
+    /// True for the scratch "Tasks" area: one-off work with no project behind
+    /// it. The agent must not assume a codebase in that case.
+    pub scratch: bool,
+}
+
 /// The agent: holds provider, tools, config and the running conversation.
 pub struct Agent {
     pub provider: ChatProvider,
@@ -231,6 +243,8 @@ pub struct Agent {
     pub config: Config,
     /// The session this agent is running for; used to route approval prompts.
     pub session: String,
+    /// The project this chat belongs to; drives the system prompt.
+    pub project: ProjectContext,
     history: Vec<Msg>,
     /// Optional hook to persist history as it grows (called per step).
     pub save: Option<Box<dyn Fn(&[Msg]) + Send + Sync>>,
@@ -282,6 +296,7 @@ impl Agent {
             tools,
             config,
             session: String::new(),
+            project: ProjectContext::default(),
             history: Vec::new(),
             save: None,
         }
@@ -313,23 +328,47 @@ impl Agent {
         ToolContext { workspace: std::path::PathBuf::from(&self.config.workspace) }
     }
 
-    fn ensure_system(&mut self) {
-        if self.history.iter().any(|m| m.role == "system") {
-            return;
+    /// Where this chat is working, spelled out for the model. Being explicit
+    /// about "no project" matters as much as naming one: told only a bare path,
+    /// a model happily assumes the last project it heard about.
+    fn project_block(&self) -> String {
+        let ws = self.config.workspace.trim();
+        let name = self.project.name.trim();
+        if self.project.scratch {
+            format!(
+                "PROJECT: none. This chat lives in \"{}\", the area for one-off work that does not belong to any project.\n\
+                 Working folder (tools run here; relative paths resolve here): {ws}\n\
+                 That folder is an empty scratch directory, not a codebase. There is no project, repository or existing code here: do not assume you are continuing any previous work, and do not guess at a project. If the request needs one, ask which folder to use or work from an absolute path the user gives you.",
+                if name.is_empty() { "Tasks" } else { name }
+            )
+        } else {
+            format!(
+                "PROJECT: {}\n\
+                 Working folder (tools run here; relative paths resolve here): {ws}\n\
+                 This chat is scoped to that project and only that project. Look in this folder to learn what it is instead of assuming — never work against a different project, repository or folder.",
+                if name.is_empty() { "(unnamed)" } else { name }
+            )
         }
-        let hint = format!(
-            "{}  Workspace (tools run here + relative paths resolve here): {}",
-            platform_hint(),
-            self.config.workspace
-        );
+    }
+
+    /// Put platform + project context at the top of the conversation, replacing
+    /// any earlier copy.
+    ///
+    /// Rebuilt every turn on purpose: the system message is persisted with the
+    /// history, so a chat whose project folder was repointed (or which was
+    /// written before this context existed) would otherwise keep quoting the
+    /// old, wrong location forever.
+    fn sync_system(&mut self) {
+        let hint = format!("{}\n\n{}", platform_hint(), self.project_block());
         let body = if self.config.system.trim().is_empty() {
             hint
         } else {
-            format!("{}
-
-{}", hint, self.config.system.trim())
+            format!("{}\n\n{}", hint, self.config.system.trim())
         };
-        self.history.insert(0, Msg::text("system", body));
+        match self.history.iter().position(|m| m.role == "system") {
+            Some(i) => self.history[i] = Msg::text("system", body),
+            None => self.history.insert(0, Msg::text("system", body)),
+        }
     }
 
     /// Run one full turn: take a user message, then loop calling the model and
@@ -338,7 +377,7 @@ impl Agent {
     where
         F: Emitter,
     {
-        self.ensure_system();
+        self.sync_system();
         let mut parts: Vec<Part> = vec![Part::Text(user_text.to_string())];
         for url in images {
             if !url.is_empty() {
@@ -491,4 +530,77 @@ fn tool_preview(tc: &crate::engine::ToolCall) -> String {
         s.push('…');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(workspace: &str, project: ProjectContext) -> Agent {
+        let mut cfg = Config::from_env();
+        cfg.workspace = workspace.to_string();
+        cfg.system = "House rules.".into();
+        let mut a = Agent::new(cfg);
+        a.project = project;
+        a
+    }
+
+    fn system_of(a: &Agent) -> String {
+        a.history()
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.plain_text_parts())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_project_chat_is_told_which_project_it_is_in() {
+        let mut a = agent(
+            "C:/src/mascot",
+            ProjectContext { name: "mascot".into(), scratch: false },
+        );
+        a.sync_system();
+        let s = system_of(&a);
+        assert!(s.contains("PROJECT: mascot"), "{s}");
+        assert!(s.contains("C:/src/mascot"), "{s}");
+        assert!(s.contains("House rules."), "{s}");
+    }
+
+    /// Without this the model is handed a bare folder path and cheerfully
+    /// assumes it is still working on the last project it heard about.
+    #[test]
+    fn a_scratch_chat_is_told_there_is_no_project() {
+        let mut a = agent(
+            "C:/Users/x/.e/tasks",
+            ProjectContext { name: "Tasks".into(), scratch: true },
+        );
+        a.sync_system();
+        let s = system_of(&a);
+        assert!(s.contains("PROJECT: none"), "{s}");
+        assert!(s.contains("Tasks"), "{s}");
+        assert!(!s.contains("mascot"), "{s}");
+    }
+
+    /// The system message is persisted with the history, so a chat written
+    /// before this context existed (or repointed at another folder) must be
+    /// corrected on the next turn instead of quoting the old path forever.
+    #[test]
+    fn a_stale_system_message_is_replaced_not_appended() {
+        let mut a = agent(
+            "C:/src/mascot",
+            ProjectContext { name: "mascot".into(), scratch: false },
+        );
+        a.set_history(vec![
+            Msg::text("system", "Workspace: C:/src/somewhere-else"),
+            Msg::text("user", "hi"),
+        ]);
+        a.sync_system();
+
+        let h = a.history();
+        assert_eq!(h.iter().filter(|m| m.role == "system").count(), 1);
+        assert_eq!(h[0].role, "system");
+        assert!(!system_of(&a).contains("somewhere-else"), "{}", system_of(&a));
+        assert!(system_of(&a).contains("C:/src/mascot"));
+        assert_eq!(h[1].plain_text_parts(), "hi");
+    }
 }

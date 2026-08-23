@@ -145,14 +145,14 @@ fn save_config(state: tauri::State<AppState>, config: Config) -> Result<(), Stri
 
 #[tauri::command]
 fn read_attachment(state: tauri::State<AppState>, path: String) -> Result<serde_json::Value, String> {
-    // Resolve relative to the active chat's workspace, falling back to the
-    // global one, so `@file` means the same thing as the tools' cwd.
+    // Resolve relative to the active chat's own project folder, so `@file`
+    // means the same thing as the tools' cwd.
     let ws = state
         .store
         .lock()
         .map(|st| {
-            let w = st.workspace(&st.current);
-            if w.is_empty() { st.current_project_workspace() } else { w }
+            let cur = st.current.clone();
+            st.resolved_workspace(&cur)
         })
         .unwrap_or_default();
     let ws = if ws.is_empty() { state.config().workspace } else { ws };
@@ -174,7 +174,7 @@ fn read_attachment(state: tauri::State<AppState>, path: String) -> Result<serde_
 #[tauri::command]
 fn list_projects(state: tauri::State<AppState>) -> serde_json::Value {
     match state.store.lock() {
-        Ok(st) => serde_json::json!({ "projects": st.project_list(), "current": st.current_project }),
+        Ok(st) => serde_json::json!({ "projects": st.project_list_json(), "current": st.current_project }),
         Err(_) => serde_json::json!({ "projects": [], "current": "" }),
     }
 }
@@ -251,7 +251,7 @@ fn project_remove(state: tauri::State<AppState>, id: String) -> Result<bool, Str
 
 #[tauri::command]
 fn workspace_snapshot(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
-    let ws = state.store.lock().map_err(|_| "lock")?.workspace(&id);
+    let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&id);
     if ws.is_empty() {
         return Ok(false);
     }
@@ -277,7 +277,7 @@ fn workspace_snapshot(state: tauri::State<AppState>, id: String) -> Result<bool,
 
 #[tauri::command]
 fn workspace_revert(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
-    let ws = state.store.lock().map_err(|_| "lock")?.workspace(&id);
+    let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&id);
     if ws.is_empty() {
         return Ok(false);
     }
@@ -596,13 +596,21 @@ async fn send_text(
     let cancelled = state.begin_run(&session).ok_or("this chat is already running")?;
 
     let mut config = state.config();
-    let (history, session_ws, session_model) = match state.store.lock() {
-        Ok(st) => (st.get_history(&session), st.workspace(&session), st.model(&session)),
+    let (history, session_ws, session_model, project) = match state.store.lock() {
+        Ok(st) => (
+            st.get_history(&session),
+            st.resolved_workspace(&session),
+            st.model(&session),
+            st.project_context(&session),
+        ),
         Err(_) => {
             state.end_run(&session);
             return Err("internal lock".into());
         }
     };
+    // The chat's own project decides where tools run. Falling back to the
+    // global setting here is what let a chat in one project (or in the
+    // project-less Tasks area) operate on an unrelated project's folder.
     if !session_ws.is_empty() {
         config.workspace = session_ws;
     }
@@ -641,6 +649,7 @@ async fn send_text(
             rt.block_on(async move {
                 let mut agent = Agent::with_tools(config, tools);
                 agent.session = run_sess.clone();
+                agent.project = project;
                 agent.set_history(history);
                 agent.save = Some(Box::new(move |msgs: &[crate::engine::Msg]| {
                     if let Ok(st) = save_handle.state::<AppState>().store.lock() {

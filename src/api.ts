@@ -68,7 +68,7 @@ export async function readAttachment(path: string): Promise<{ path: string; cont
   return invoke("read_attachment", { path });
 }
 
-export type ProjectMeta = { id: string; name: string; workspace: string; created: number };
+export type ProjectMeta = { id: string; name: string; workspace: string; created: number; scratch?: boolean };
 
 export type PluginToolDef = { name: string; description: string; parameters?: unknown };
 
