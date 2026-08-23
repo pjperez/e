@@ -22,6 +22,11 @@ pub struct Config {
     /// triggered off this, so getting it right per provider/model matters.
     #[serde(default = "default_context_window")]
     pub context_window: u64,
+    /// Which provider `model` belongs to. Stored explicitly because two
+    /// providers can share a base URL or serve the same model id, so matching
+    /// on either one cannot say which connection the user actually picked.
+    #[serde(default)]
+    pub provider_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderItem>,
 }
@@ -34,8 +39,9 @@ pub fn default_context_window() -> u64 {
 /// point is to avoid overflowing, not to keep the window small.
 pub const COMPACT_AT: f64 = 0.85;
 
-/// A saved provider configuration; the active connection is the flat
-/// base_url/api_key/model/models fields above.
+/// A saved provider configuration. Every enabled provider contributes its
+/// enabled models to one flat catalogue the user picks from; the flat
+/// base_url/api_key/model fields above are just the resulting connection.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProviderItem {
     pub id: String,
@@ -47,6 +53,48 @@ pub struct ProviderItem {
     /// default when unset (older config files won't have it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Turn the whole provider off without deleting it (and losing its key).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Models hidden from the picker. An opt-out list rather than an opt-in
+    /// one so a `/models` refresh surfaces newly added models by default
+    /// instead of silently hiding them.
+    #[serde(default)]
+    pub disabled_models: Vec<String>,
+}
+
+pub fn default_true() -> bool {
+    true
+}
+
+impl ProviderItem {
+    pub fn is_usable(&self) -> bool {
+        self.enabled && !self.base_url.trim().is_empty()
+    }
+
+    /// Models this provider offers to the picker.
+    pub fn enabled_models(&self) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|m| !self.disabled_models.iter().any(|d| d == *m))
+            .cloned()
+            .collect()
+    }
+
+    pub fn serves(&self, model: &str) -> bool {
+        self.is_usable()
+            && self.models.iter().any(|m| m == model)
+            && !self.disabled_models.iter().any(|d| d == model)
+    }
+}
+
+/// One entry in the flat, cross-provider model catalogue the picker shows.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModelChoice {
+    pub model: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub context_window: u64,
 }
 
 impl Config {
@@ -62,12 +110,15 @@ impl Config {
             workspace: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
             yolo: false,
             context_window: default_context_window(),
+            provider_id: "aigateway".into(),
             providers: vec![ProviderItem {
                 id: "aigateway".into(),
                 name: "AI Gateway".into(),
                 base_url: "https://provider.example/v1".into(),
                 api_key: String::new(),
                 context_window: None,
+                enabled: true,
+                disabled_models: Vec::new(),
                 models: vec![
                     "zai-coding/glm-5.2".into(),
                     "openrouter/deepseek/deepseek-v4-flash-0731".into(),
@@ -92,61 +143,172 @@ impl Config {
                 merge(&mut base, c);
             }
         }
-        if let Ok(k) = std::env::var("E_API_KEY") {
-            if !k.is_empty() {
-                base.api_key = k;
-            }
+        if let Some(v) = env_var("E_API_KEY") {
+            base.api_key = v;
         }
-        if let Ok(v) = std::env::var("E_BASE_URL") {
-            if !v.is_empty() {
-                base.base_url = v;
-            }
+        if let Some(v) = env_var("E_BASE_URL") {
+            base.base_url = v;
         }
-        if let Ok(v) = std::env::var("E_MODEL") {
-            if !v.is_empty() {
-                base.model = v;
-            }
+        if let Some(v) = env_var("E_MODEL") {
+            base.model = v;
         }
-        if let Ok(v) = std::env::var("E_WORKSPACE") {
-            if !v.is_empty() {
-                base.workspace = v;
-            }
+        if let Some(v) = env_var("E_WORKSPACE") {
+            base.workspace = v;
         }
         if let Ok(v) = std::env::var("E_YOLO") {
             if let Some(b) = parse_bool(&v) {
                 base.yolo = b;
             }
         }
-        // Ensure the first provider reflects the active connection so the key
-        // actually carries through (fixes Refresh / picker showing empty key).
-        if let Some(p) = base.providers.first_mut() {
-            if p.base_url.is_empty() {
+        // A config written before providers existed (or one whose list was
+        // emptied) still has to yield one provider, otherwise there is nothing
+        // to enable, disable or pick models from.
+        if base.providers.is_empty() {
+            base.providers.push(ProviderItem {
+                id: "default".into(),
+                name: host_of(&base.base_url),
+                base_url: base.base_url.clone(),
+                api_key: base.api_key.clone(),
+                models: base.models.clone(),
+                context_window: None,
+                enabled: true,
+                disabled_models: Vec::new(),
+            });
+        }
+        // Env overrides land on the provider the connection points at, not just
+        // the flat fields: the provider list is the source of truth now, so a
+        // key set only on the flat field would be dropped the moment anything
+        // re-derived the connection.
+        let active_id = base.resolve_provider_id(&base.model, &base.provider_id);
+        if let Some(p) = base.providers.iter_mut().find(|p| p.id == active_id) {
+            if p.base_url.trim().is_empty() {
                 p.base_url = base.base_url.clone();
             }
-            if p.api_key.is_empty() {
+            if p.api_key.trim().is_empty() {
                 p.api_key = base.api_key.clone();
             }
             if p.models.is_empty() {
                 p.models = base.models.clone();
             }
+            if let Some(v) = env_var("E_BASE_URL") {
+                p.base_url = v;
+            }
+            if let Some(v) = env_var("E_API_KEY") {
+                p.api_key = v;
+            }
+            if let Some(v) = env_var("E_MODEL") {
+                if !p.models.contains(&v) {
+                    p.models.push(v.clone());
+                }
+                p.disabled_models.retain(|m| *m != v);
+                p.enabled = true;
+            }
         }
+        base.use_model(&base.model.clone(), &active_id);
         base
     }
 
-    /// Context window to budget against: the active provider's override when it
-    /// has one, otherwise the global setting.
-    pub fn active_context_window(&self) -> u64 {
-        let win = self
-            .providers
+    /// Id of the provider that should serve `model`. The hint (the previously
+    /// active provider, or a chat's remembered one) wins whenever it still
+    /// offers the model, so a model several providers happen to share keeps
+    /// using the connection it was picked from.
+    pub fn resolve_provider_id(&self, model: &str, hint: &str) -> String {
+        if let Some(p) = self.providers.iter().find(|p| p.id == hint && p.serves(model)) {
+            return p.id.clone();
+        }
+        if let Some(p) = self.providers.iter().find(|p| p.serves(model)) {
+            return p.id.clone();
+        }
+        // Nothing serves it (unknown model, or every owner was disabled): fall
+        // back to the hint, then to any usable provider, so runs still have a
+        // connection instead of silently pointing at nothing.
+        if let Some(p) = self.providers.iter().find(|p| p.id == hint && p.is_usable()) {
+            return p.id.clone();
+        }
+        self.providers
             .iter()
-            .find(|p| p.base_url == self.base_url)
+            .find(|p| p.is_usable())
+            .or_else(|| self.providers.first())
+            .map(|p| p.id.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn provider(&self, id: &str) -> Option<&ProviderItem> {
+        self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// Point the connection at `model`, following it to whichever provider
+    /// owns it. This is the only way the flat base_url/api_key should change:
+    /// picking a model *is* picking a provider.
+    pub fn use_model(&mut self, model: &str, provider_hint: &str) {
+        let id = self.resolve_provider_id(model, provider_hint);
+        let Some((base_url, api_key, models)) = self
+            .provider(&id)
+            .map(|p| (p.base_url.clone(), p.api_key.clone(), p.enabled_models()))
+        else {
+            return;
+        };
+        self.provider_id = id;
+        self.base_url = base_url;
+        self.api_key = api_key;
+        let wanted = if model.trim().is_empty() { self.model.clone() } else { model.to_string() };
+        // A model that is no longer on offer (turned off, or dropped by a
+        // refresh) would just be rejected by the provider, so fall back to one
+        // it actually serves rather than failing every run.
+        self.model = if models.contains(&wanted) {
+            wanted
+        } else {
+            models.first().cloned().unwrap_or(wanted)
+        };
+        self.models = models;
+    }
+
+    /// Re-derive the connection from the provider list. Call after any edit to
+    /// providers or the selected model so base_url/api_key/models can never
+    /// drift from the provider that actually serves it.
+    pub fn normalize(&mut self) {
+        let model = self.model.clone();
+        let hint = self.provider_id.clone();
+        self.use_model(&model, &hint);
+    }
+
+    /// Every enabled model across every enabled provider — the flat catalogue
+    /// the picker offers, with the provider each entry belongs to.
+    pub fn model_catalog(&self) -> Vec<ModelChoice> {
+        let mut out = Vec::new();
+        for p in self.providers.iter().filter(|p| p.is_usable()) {
+            let win = p.context_window.filter(|w| *w > 0).unwrap_or(self.context_window);
+            for m in p.enabled_models() {
+                out.push(ModelChoice {
+                    model: m,
+                    provider_id: p.id.clone(),
+                    provider_name: if p.name.trim().is_empty() { p.id.clone() } else { p.name.clone() },
+                    context_window: if win == 0 { default_context_window() } else { win },
+                });
+            }
+        }
+        out
+    }
+
+    /// Context window to budget against for `model`: its provider's override
+    /// when it has one, otherwise the global setting.
+    pub fn context_window_for(&self, model: &str, provider_hint: &str) -> u64 {
+        let id = self.resolve_provider_id(model, provider_hint);
+        let win = self
+            .provider(&id)
             .and_then(|p| p.context_window)
+            .filter(|w| *w > 0)
             .unwrap_or(self.context_window);
         if win == 0 {
             default_context_window()
         } else {
             win
         }
+    }
+
+    /// Context window for the connection as it stands.
+    pub fn active_context_window(&self) -> u64 {
+        self.context_window_for(&self.model, &self.provider_id)
     }
 
     pub fn save(&self) {
@@ -204,6 +366,9 @@ fn merge(base: &mut Config, c: Config) {
     if !c.providers.is_empty() {
         base.providers = c.providers;
     }
+    if !c.provider_id.is_empty() {
+        base.provider_id = c.provider_id;
+    }
     if c.context_window > 0 {
         base.context_window = c.context_window;
     }
@@ -219,6 +384,24 @@ fn parse_bool(v: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+/// An env override only counts when it actually carries a value; an empty one
+/// must not blank out a configured setting.
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Host part of a base URL, used to name a provider migrated from a config
+/// that predates the provider list.
+fn host_of(url: &str) -> String {
+    let s = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = s.split('/').next().unwrap_or(s).trim();
+    if host.is_empty() {
+        "Provider".to_string()
+    } else {
+        host.to_string()
     }
 }
 
@@ -546,6 +729,132 @@ fn tool_preview(tc: &crate::engine::ToolCall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider(id: &str, models: &[&str]) -> ProviderItem {
+        ProviderItem {
+            id: id.into(),
+            name: id.to_uppercase(),
+            base_url: format!("https://{id}.test/v1"),
+            api_key: format!("key-{id}"),
+            models: models.iter().map(|m| m.to_string()).collect(),
+            context_window: None,
+            enabled: true,
+            disabled_models: Vec::new(),
+        }
+    }
+
+    fn cfg(providers: Vec<ProviderItem>) -> Config {
+        Config {
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            temperature: 0.7,
+            system: String::new(),
+            workspace: String::new(),
+            yolo: false,
+            models: Vec::new(),
+            context_window: 1_000_000,
+            provider_id: String::new(),
+            providers,
+        }
+    }
+
+    #[test]
+    fn catalog_spans_every_enabled_provider() {
+        let c = cfg(vec![provider("a", &["m1", "m2"]), provider("b", &["m3"])]);
+        let got: Vec<String> = c.model_catalog().into_iter().map(|x| x.model).collect();
+        assert_eq!(got, vec!["m1", "m2", "m3"], "all enabled providers contribute");
+    }
+
+    #[test]
+    fn disabling_a_provider_hides_its_models_but_keeps_it() {
+        let mut c = cfg(vec![provider("a", &["m1"]), provider("b", &["m3"])]);
+        c.providers[0].enabled = false;
+        let got: Vec<String> = c.model_catalog().into_iter().map(|x| x.model).collect();
+        assert_eq!(got, vec!["m3"]);
+        assert_eq!(c.providers.len(), 2, "disabling must not delete the provider or its key");
+        assert_eq!(c.providers[0].api_key, "key-a");
+    }
+
+    #[test]
+    fn disabling_one_model_leaves_the_rest_of_the_provider_on() {
+        let mut c = cfg(vec![provider("a", &["m1", "m2"])]);
+        c.providers[0].disabled_models = vec!["m1".into()];
+        let got: Vec<String> = c.model_catalog().into_iter().map(|x| x.model).collect();
+        assert_eq!(got, vec!["m2"]);
+    }
+
+    #[test]
+    fn picking_a_model_switches_the_whole_connection() {
+        let mut c = cfg(vec![provider("a", &["m1"]), provider("b", &["m3"])]);
+        c.use_model("m1", "");
+        assert_eq!((c.provider_id.as_str(), c.base_url.as_str(), c.api_key.as_str()), ("a", "https://a.test/v1", "key-a"));
+        c.use_model("m3", "");
+        assert_eq!((c.provider_id.as_str(), c.base_url.as_str(), c.api_key.as_str()), ("b", "https://b.test/v1", "key-b"));
+    }
+
+    #[test]
+    fn a_shared_model_id_stays_on_the_provider_it_was_picked_from() {
+        let c = cfg(vec![provider("a", &["shared"]), provider("b", &["shared"])]);
+        assert_eq!(c.resolve_provider_id("shared", "b"), "b", "the hint wins when it still serves the model");
+        assert_eq!(c.resolve_provider_id("shared", ""), "a", "no hint falls back to the first that serves it");
+        assert_eq!(c.resolve_provider_id("shared", "gone"), "a", "a stale hint must not strand the run");
+    }
+
+    #[test]
+    fn turning_off_the_selected_model_moves_the_selection() {
+        let mut c = cfg(vec![provider("a", &["m1", "m2"])]);
+        c.use_model("m1", "");
+        c.providers[0].disabled_models = vec!["m1".into()];
+        c.normalize();
+        assert_eq!(c.model, "m2", "a model the provider no longer offers would just be rejected");
+    }
+
+    #[test]
+    fn turning_off_a_providers_last_model_falls_through_to_another() {
+        let mut c = cfg(vec![provider("a", &["m1"]), provider("b", &["m3"])]);
+        c.use_model("m1", "");
+        c.providers[0].enabled = false;
+        c.normalize();
+        assert_eq!((c.provider_id.as_str(), c.model.as_str()), ("b", "m3"));
+    }
+
+    #[test]
+    fn context_window_follows_the_model_to_its_own_provider() {
+        let mut c = cfg(vec![provider("a", &["m1"]), provider("b", &["m3"])]);
+        c.providers[1].context_window = Some(128_000);
+        assert_eq!(c.context_window_for("m1", ""), 1_000_000, "no override falls back to the global window");
+        assert_eq!(c.context_window_for("m3", ""), 128_000, "the owning provider's override wins");
+    }
+
+    /// A config written before providers could be switched off has no
+    /// `enabled`, `disabled_models` or `provider_id`. It must still load, keep
+    /// every provider on, and land on the provider that serves its model.
+    #[test]
+    fn a_config_from_before_this_feature_still_loads() {
+        let legacy = r#"{
+            "base_url": "https://gw.test/v1",
+            "api_key": "gw-key",
+            "model": "local/qwen",
+            "temperature": 0.7,
+            "system": "hi",
+            "workspace": "/tmp",
+            "yolo": false,
+            "models": ["gw/one"],
+            "context_window": 900000,
+            "providers": [
+              { "id": "gw", "name": "Gateway", "base_url": "https://gw.test/v1", "api_key": "gw-key", "models": ["gw/one"] },
+              { "id": "local", "name": "Local", "base_url": "http://localhost:11434/v1", "api_key": "", "models": ["local/qwen"] }
+            ]
+        }"#;
+        let mut c: Config = serde_json::from_str(legacy).expect("legacy config must still parse");
+        assert!(c.providers.iter().all(|p| p.enabled), "providers default to on, never silently off");
+        assert!(c.providers.iter().all(|p| p.disabled_models.is_empty()), "no model is hidden by default");
+        assert_eq!(c.model_catalog().len(), 2, "both providers' models are on offer");
+        c.normalize();
+        assert_eq!(c.provider_id, "local", "an empty provider_id resolves from the model");
+        assert_eq!(c.base_url, "http://localhost:11434/v1", "the connection follows the model, not the stale flat field");
+    }
 
     fn agent(workspace: &str, project: ProjectContext) -> Agent {
         let mut cfg = Config::from_env();

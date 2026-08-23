@@ -344,6 +344,12 @@ footer#composer-wrap { padding: 0 16px 16px; }
 }
 .picker-item:hover, .picker-item.active { background: var(--bg-3); color: var(--text); }
 .picker-item.active::before { content: "▪"; color: var(--accent); margin-right: 6px; }
+.picker-group {
+  padding: 10px 10px 4px; font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: 0.09em; text-transform: uppercase; color: var(--text-faint);
+  position: sticky; top: 0; background: var(--bg-2);
+}
+.picker-group:first-child { padding-top: 4px; }
 .picker-empty { padding: 10px; color: var(--text-faint); font-size: 12.5px; text-align: center; }
 
 /* ---------- slash command popup (anchored above the composer) ---------- */
@@ -749,17 +755,44 @@ html[data-theme="light"] .empty-mark {
 .sess-item.sub { padding-left: 18px; }
 
 /* ---------- providers list + edit pane ---------- */
+.prov-help { margin: -2px 0 8px; }
 .prov-item {
-  display: flex; align-items: center; gap: 4px; padding: 6px 8px;
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
   border: 1px solid var(--edge); border-radius: 8px; margin-bottom: 6px;
   background: var(--bg);
 }
-.prov-item.active { border-color: var(--accent); }
-.prov-name { flex: 1; font-family: var(--mono); font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prov-item.editing { border-color: var(--accent); }
+.prov-item.off .prov-name, .prov-item.off .prov-count { color: var(--text-faint); }
+.prov-item input[type="checkbox"] { width: auto; margin: 0; flex: none; accent-color: var(--accent); cursor: pointer; }
+.prov-name { flex: 1; font-family: var(--mono); font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.prov-count { font-family: var(--mono); font-size: 11px; color: var(--text-faint); flex: none; }
 .prov-edit {
   border: 1px solid var(--edge-2); border-radius: 10px; padding: 10px 12px;
   background: var(--bg-2); margin-bottom: 12px;
 }
+.model-tools { display: flex; gap: 6px; margin-bottom: 6px; }
+.model-tools input { flex: 1; min-width: 0; }
+.model-tools button {
+  background: var(--bg-3); color: var(--text); border: 1px solid var(--edge);
+  border-radius: 9px; padding: 0 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.model-tools button:hover { border-color: var(--accent); }
+.model-list {
+  max-height: 190px; overflow-y: auto;
+  border: 1px solid var(--edge); border-radius: 9px; background: var(--bg); padding: 4px;
+}
+.model-list::-webkit-scrollbar { width: 8px; }
+.model-list::-webkit-scrollbar-thumb { background: var(--edge); border-radius: 4px; }
+/* Beats `.field label { display: block }`, which would otherwise flatten the
+   row and collapse the gap between the checkbox and the model name. */
+.model-list label.model-row {
+  display: flex; align-items: center; gap: 9px; margin: 0; padding: 5px 7px;
+  border-radius: 6px; cursor: pointer; font-size: inherit;
+}
+.model-row:hover { background: var(--bg-3); }
+.model-row input[type="checkbox"] { width: auto; margin: 0; flex: none; accent-color: var(--accent); cursor: pointer; }
+.model-name { flex: 1; font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-row input:checked ~ .model-name { color: var(--text); }
 
 /* ---------- sidebar: fully hidden when closed (no stray strip) ---------- */
 #sidebar {
