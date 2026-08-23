@@ -1,6 +1,17 @@
+use crate::engine::agent::ProjectContext;
 use crate::engine::Msg;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// The always-present project that holds one-off work belonging to no
+/// repository. It is a real folder (see `scratch_workspace`) rather than "no
+/// folder", because an unset workspace used to fall through to the global
+/// setting — which is how a chat here ended up believing it was working on
+/// whatever project was configured last.
+pub const DEFAULT_PROJECT: &str = "Tasks";
+
+/// Names earlier versions gave that same bucket. Migrated on load.
+const LEGACY_DEFAULT_NAMES: [&str; 2] = ["Default", "Chats"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectMeta {
@@ -8,10 +19,6 @@ pub struct ProjectMeta {
     pub name: String,
     pub workspace: String,
     pub created: u64,
-    /// The built-in project. It always exists and can never be deleted, so a
-    /// chat always has somewhere to live even with no folder opened.
-    #[serde(default)]
-    pub locked: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,19 +66,6 @@ fn basename_of(path: &str) -> String {
 /// Workspaces are always stored absolute. A relative path silently resolves
 /// against whatever directory the app happened to be launched from, so tools
 /// would run somewhere different (or nowhere) on the next start.
-/// Name of the built-in project. Created on first run and adopted from the
-/// older auto-created folder on upgrade.
-const TASKS_NAME: &str = "Tasks";
-
-/// Home is the built-in project's folder: general chores aren't tied to a repo,
-/// but tools still need a real directory to run in.
-fn home_workspace() -> String {
-    dirs::home_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| absolute_workspace(""))
-}
-
 fn absolute_workspace(ws: &str) -> String {
     let t = ws.trim();
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -84,6 +78,20 @@ fn absolute_workspace(ws: &str) -> String {
         cwd.join(p)
     };
     abs.to_string_lossy().to_string()
+}
+
+/// Folder backing the default "Tasks" project: a real directory that exists but
+/// is deliberately not a codebase. Chats with no project of their own run here,
+/// so they get a valid cwd without borrowing some unrelated project's folder.
+pub fn scratch_workspace() -> String {
+    let dir = dirs::home_dir().unwrap_or_default().join(".e").join("tasks");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().to_string()
+}
+
+pub fn is_scratch(ws: &str) -> bool {
+    let s = scratch_workspace();
+    !ws.trim().is_empty() && std::path::Path::new(ws.trim()) == std::path::Path::new(&s)
 }
 
 impl SessionStore {
@@ -100,25 +108,74 @@ impl SessionStore {
             current_project: String::new(),
         };
         st.load();
-        st.ensure_tasks_project();
-        // Migrate: sessions created before projects existed have an empty
-        // project -> they would never show in the sidebar. Adopt them into
-        // the first project (the built-in "Tasks" folder).
-        let fallback = st.projects.first().map(|p| p.id.clone()).unwrap_or_default();
-        let mut changed = false;
-        for s in st.sessions.iter_mut() {
-            if s.project.is_empty() && !fallback.is_empty() {
-                s.project = fallback.clone();
-                changed = true;
-            }
+        if st.projects.is_empty() {
+            st.project_create(DEFAULT_PROJECT, "");
         }
-        if changed {
-            st.save_index();
-        }
+        st.migrate();
         if st.sessions.is_empty() {
             st.create("Chat 1", "", "");
         }
         st
+    }
+
+    /// Bring an index written by an older build up to the current invariants.
+    ///
+    /// Every project must own an absolute, existing-intent folder and every chat
+    /// must know which folder it runs in. Anything left blank used to be filled
+    /// in at run time from the *global* setting, which silently pointed chats at
+    /// an unrelated project.
+    fn migrate(&mut self) {
+        let scratch = scratch_workspace();
+        let default_id = self.projects.first().map(|p| p.id.clone()).unwrap_or_default();
+        let mut changed = false;
+
+        for p in self.projects.iter_mut() {
+            let folderless = p.workspace.trim().is_empty();
+            if folderless {
+                // The auto-created bucket: give it the scratch folder and the
+                // name it goes by now, so it reads as "not a project" instead of
+                // inheriting whatever the global workspace happened to be.
+                p.workspace = scratch.clone();
+                if p.id == default_id || LEGACY_DEFAULT_NAMES.contains(&p.name.trim()) {
+                    p.name = DEFAULT_PROJECT.to_string();
+                }
+                changed = true;
+            } else {
+                // Only pin a relative path when it actually resolves to a real
+                // folder from here. Otherwise migration would bake the app's
+                // launch directory into a path that was already broken, turning
+                // "wrong sometimes" into "wrong forever" — leave it, and let the
+                // sidebar's missing-folder warning ask the user to repoint it.
+                let abs = absolute_workspace(&p.workspace);
+                if abs != p.workspace && std::path::Path::new(&abs).is_dir() {
+                    p.workspace = abs;
+                    changed = true;
+                }
+            }
+        }
+
+        for s in self.sessions.iter_mut() {
+            // Chats created before projects existed have no project, so they
+            // would never show in the sidebar; adopt them into the default one.
+            if s.project.trim().is_empty() && !default_id.is_empty() {
+                s.project = default_id.clone();
+                changed = true;
+            }
+            let ws = self
+                .projects
+                .iter()
+                .find(|p| p.id == s.project)
+                .map(|p| p.workspace.clone())
+                .unwrap_or_default();
+            if s.workspace.trim().is_empty() && !ws.is_empty() {
+                s.workspace = ws;
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.save_index();
+        }
     }
 
     fn load(&mut self) {
@@ -184,12 +241,51 @@ impl SessionStore {
         }
     }
 
-    pub fn workspace(&self, id: &str) -> String {
-        self.sessions
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.workspace.clone())
-            .unwrap_or_default()
+    /// The folder a chat really runs in: its own, else its project's, else the
+    /// scratch area. Deliberately never falls back to the global config
+    /// workspace — that fallback is what made a chat in one project run tools
+    /// against a different project's checkout.
+    pub fn resolved_workspace(&self, id: &str) -> String {
+        let sess = self.sessions.iter().find(|s| s.id == id);
+        let own = sess.map(|s| s.workspace.trim().to_string()).unwrap_or_default();
+        if !own.is_empty() {
+            return own;
+        }
+        let pid = sess
+            .map(|s| s.project.clone())
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| self.current_project.clone());
+        let pw = self.project_workspace(&pid);
+        if pw.trim().is_empty() {
+            scratch_workspace()
+        } else {
+            pw
+        }
+    }
+
+    /// What the agent is told about where it is working, so a chat opened under
+    /// a project is never left to guess (or inherit) the wrong one.
+    pub fn project_context(&self, id: &str) -> ProjectContext {
+        let sess = self.sessions.iter().find(|s| s.id == id);
+        let pid = sess
+            .map(|s| s.project.clone())
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| self.current_project.clone());
+        let proj = self.projects.iter().find(|p| p.id == pid);
+        let name = proj.map(|p| p.name.clone()).unwrap_or_default();
+        let proj_ws = proj.map(|p| p.workspace.clone()).unwrap_or_default();
+        let workspace = self.resolved_workspace(id);
+        // Chats survive the deletion of their project: they are refiled under
+        // whichever one remains but keep their own folder. Reporting the name of
+        // that fallback project would then be a plain lie, so flag the mismatch
+        // and let the prompt describe the folder instead of the label.
+        let detached = !proj_ws.trim().is_empty()
+            && std::path::Path::new(&workspace) != std::path::Path::new(proj_ws.trim());
+        ProjectContext {
+            scratch: is_scratch(&workspace),
+            detached,
+            name,
+        }
     }
 
     pub fn model(&self, id: &str) -> String {
@@ -215,56 +311,22 @@ impl SessionStore {
     }
 
     // ---- projects ----
-    /// Guarantee the built-in project: named "Tasks", rooted at the user's home
-    /// directory, always first in the list and never deletable.
-    ///
-    /// Installs made before it existed carry an auto-created "Default"/"Chats"
-    /// folder. Adopt that one instead of adding a second general folder, so the
-    /// chats already in it stay where the user left them. It is always the first
-    /// project and always carries a name the app generated rather than a folder
-    /// basename, so match on position and name — its workspace is unreliable
-    /// (older builds left it empty, newer ones filled it with the launch
-    /// directory).
-    fn ensure_tasks_project(&mut self) {
-        if self.projects.iter().any(|p| p.locked) {
-            return;
-        }
-        let home = home_workspace();
-        let adopt = matches!(
-            self.projects.first().map(|p| p.name.trim()),
-            Some("Default") | Some("Chats") | Some(TASKS_NAME)
-        );
-        if adopt {
-            let p = &mut self.projects[0];
-            p.name = TASKS_NAME.to_string();
-            p.workspace = home.clone();
-            p.locked = true;
-            let id = p.id.clone();
-            // Chats copy their project's workspace, so they have to move too or
-            // they keep running wherever the app was launched from.
-            for s in self.sessions.iter_mut().filter(|s| s.project == id) {
-                s.workspace = home.clone();
-            }
-        } else {
-            self.projects.insert(
-                0,
-                ProjectMeta {
-                    id: format!("p{}", now_ms()),
-                    name: TASKS_NAME.to_string(),
-                    workspace: home,
-                    created: now_ms(),
-                    locked: true,
-                },
-            );
-        }
-        if !self.projects.iter().any(|p| p.id == self.current_project) {
-            self.current_project = self.projects[0].id.clone();
-        }
-        self.save_index();
-    }
-
-    pub fn project_list(&self) -> Vec<ProjectMeta> {
-        self.projects.clone()
+    /// Projects for the UI, tagged with whether they are the scratch area. The
+    /// flag is derived rather than stored so it can never drift out of sync
+    /// with the folder actually on the project.
+    pub fn project_list_json(&self) -> Vec<serde_json::Value> {
+        self.projects
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "workspace": p.workspace,
+                    "created": p.created,
+                    "scratch": is_scratch(&p.workspace),
+                })
+            })
+            .collect()
     }
 
     pub fn project_workspace(&self, id: &str) -> String {
@@ -281,18 +343,25 @@ impl SessionStore {
 
     pub fn project_create(&mut self, name: &str, workspace: &str) -> ProjectMeta {
         let id = format!("p{}", now_ms());
-        let ws = absolute_workspace(workspace);
-        let nm = if name.trim().is_empty() {
-            basename_of(&ws)
+        // No folder means "not a project": use the scratch area rather than the
+        // launch directory, which changes depending on how the app was started.
+        let ws = if workspace.trim().is_empty() {
+            scratch_workspace()
         } else {
+            absolute_workspace(workspace)
+        };
+        let nm = if !name.trim().is_empty() {
             name.trim().to_string()
+        } else if is_scratch(&ws) {
+            DEFAULT_PROJECT.to_string()
+        } else {
+            basename_of(&ws)
         };
         let meta = ProjectMeta {
             id: id.clone(),
             name: nm,
             workspace: ws,
             created: now_ms(),
-            locked: false,
         };
         self.projects.push(meta.clone());
         self.current_project = id;
@@ -304,7 +373,11 @@ impl SessionStore {
     /// workspace when they are created, so they have to move too or they keep
     /// running against the old, possibly missing, directory.
     pub fn project_set_workspace(&mut self, id: &str, workspace: &str) -> bool {
-        let ws = absolute_workspace(workspace);
+        let ws = if workspace.trim().is_empty() {
+            scratch_workspace()
+        } else {
+            absolute_workspace(workspace)
+        };
         let Some(p) = self.projects.iter_mut().find(|p| p.id == id) else {
             return false;
         };
@@ -329,9 +402,16 @@ impl SessionStore {
     }
 
     /// Delete a project; its chats are moved to the first remaining project
-    /// (so nothing is lost). The built-in project can never be removed.
+    /// (so nothing is lost) and keep their own folder, which is why they end up
+    /// reported as detached rather than as members of that fallback project.
+    /// At least one project always remains. Nothing on disk is touched: the
+    /// project's folder is the user's, not ours.
+    ///
+    /// The scratch project is exempt: it is the guaranteed home for work that
+    /// belongs to no repository, and chats orphaned by any other deletion land
+    /// there, so removing it would leave nowhere for them to go.
     pub fn project_remove(&mut self, id: &str) -> bool {
-        if self.projects.iter().any(|p| p.id == id && p.locked) {
+        if self.projects.iter().any(|p| p.id == id && is_scratch(&p.workspace)) {
             return false;
         }
         if self.projects.len() <= 1 {
@@ -349,9 +429,9 @@ impl SessionStore {
                 self.current_project = fb;
             }
         }
-        if self.current == id {
-            self.current = self.sessions.first().map(|s| s.id.clone()).unwrap_or_default();
-        }
+        // The open chat needs no repair here: chats outlive their project, so
+        // whichever one was selected is still there. (This used to compare the
+        // selected *chat* id against a *project* id, which never matched.)
         self.save_index();
         true
     }
@@ -367,12 +447,16 @@ impl SessionStore {
     }
 
     // ---- sessions ----
+    /// Create a chat in the current project. It copies the project's folder up
+    /// front so the chat is pinned to it: an unresolved workspace would be
+    /// filled in later from global config, i.e. from the wrong project.
     pub fn create(&mut self, name: &str, workspace: &str, model: &str) -> SessionMeta {
         let id = format!("s{}", now_ms());
         let ws = if workspace.trim().is_empty() {
-            self.current_project_workspace()
+            let p = self.current_project_workspace();
+            if p.trim().is_empty() { scratch_workspace() } else { p }
         } else {
-            workspace.trim().to_string()
+            absolute_workspace(workspace)
         };
         let n = self.sessions.iter().filter(|s| s.project == self.current_project).count() + 1;
         let meta = SessionMeta {
@@ -395,9 +479,29 @@ impl SessionStore {
         meta
     }
 
-#[allow(dead_code)]
-    pub fn sessions_in(&self, project: &str) -> Vec<SessionMeta> {
+    /// Chats for the UI, tagged with whether they are detached. Derived from the
+    /// same `project_context` the prompt uses, so the sidebar and the agent can
+    /// never disagree about which project a chat really belongs to.
+    pub fn session_list_json(&self) -> Vec<serde_json::Value> {
         self.sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "created": s.created,
+                    "workspace": s.workspace,
+                    "project": s.project,
+                    "model": s.model,
+                    "state": s.state,
+                    "detached": self.project_context(&s.id).detached,
+                })
+            })
+            .collect()
+    }
+
+#[allow(dead_code)]
+    pub fn sessions_in(&self, project: &str) -> Vec<SessionMeta> {        self.sessions
             .iter()
             .filter(|s| s.project == project)
             .cloned()
@@ -492,116 +596,186 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// A store rooted in a throwaway directory, so tests never touch the real
-    /// `~/.e/sessions` index.
-    fn store() -> SessionStore {
-        let dir = std::env::temp_dir().join(format!(
-            "e-sessions-test-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A store backed by a throwaway directory, so `migrate` can persist without
+    /// touching the developer's real `~/.e` index.
+    fn store(projects: Vec<ProjectMeta>, sessions: Vec<SessionMeta>) -> SessionStore {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("e-sessions-test-{}-{n}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let index_file = dir.join("index.json");
         SessionStore {
+            index_file: dir.join("index.json"),
             dir,
-            index_file,
-            sessions: Vec::new(),
-            projects: Vec::new(),
+            sessions,
+            projects,
             current: String::new(),
             current_project: String::new(),
         }
     }
 
     fn project(id: &str, name: &str, workspace: &str) -> ProjectMeta {
-        ProjectMeta {
-            id: id.to_string(),
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-            created: 0,
-            locked: false,
-        }
+        ProjectMeta { id: id.into(), name: name.into(), workspace: workspace.into(), created: 0 }
     }
 
     fn session(id: &str, project: &str, workspace: &str) -> SessionMeta {
         SessionMeta {
-            id: id.to_string(),
-            name: id.to_string(),
+            id: id.into(),
+            name: id.into(),
             created: 0,
-            workspace: workspace.to_string(),
-            project: project.to_string(),
+            workspace: workspace.into(),
+            project: project.into(),
             model: String::new(),
             state: String::new(),
         }
     }
 
     #[test]
-    fn upgrade_adopts_the_old_default_folder_instead_of_duplicating_it() {
-        let mut st = store();
-        st.projects = vec![project("p1", "Default", "")];
-        st.sessions = vec![session("s1", "p1", "")];
-        st.ensure_tasks_project();
-
-        assert_eq!(st.projects.len(), 1, "must not add a second general folder");
-        assert_eq!(st.projects[0].id, "p1", "existing chats must stay in place");
-        assert_eq!(st.projects[0].name, "Tasks");
-        assert!(st.projects[0].locked);
-        assert_eq!(st.projects[0].workspace, home_workspace());
-        assert_eq!(st.sessions[0].workspace, home_workspace(), "chats follow their project's folder");
+    fn folderless_default_becomes_tasks_with_a_scratch_folder() {
+        let mut st = store(vec![project("p1", "Default", "")], vec![]);
+        st.migrate();
+        assert_eq!(st.projects[0].name, DEFAULT_PROJECT);
+        assert_eq!(st.projects[0].workspace, scratch_workspace());
     }
 
+    /// Chats orphaned by deleting a project fall back to the scratch bucket, so
+    /// it has to outlive every other project.
     #[test]
-    fn the_auto_created_folder_is_adopted_even_with_a_workspace_already_set() {
-        // Newer builds seeded it with the launch directory rather than "",
-        // which must not be mistaken for a real project.
-        let mut st = store();
-        st.projects = vec![project("p1", "Chats", "C:/some/launch/dir"), project("p2", "GenieX", "C:/src/GenieX")];
-        st.ensure_tasks_project();
+    fn the_scratch_project_cannot_be_removed_but_others_can() {
+        let mut st = store(
+            vec![project("p1", "Default", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![],
+        );
+        st.migrate();
 
-        assert_eq!(st.projects.len(), 2, "must not add a second general folder");
-        assert_eq!(st.projects[0].id, "p1");
-        assert_eq!(st.projects[0].name, "Tasks");
-        assert_eq!(st.projects[0].workspace, home_workspace());
-        assert!(st.projects[0].locked);
-    }
-
-    #[test]
-    fn a_real_project_is_never_repurposed_as_the_built_in_one() {
-        let mut st = store();
-        st.projects = vec![project("p1", "GenieX", "C:/src/GenieX")];
-        st.current_project = "p1".to_string();
-        st.ensure_tasks_project();
-
-        assert_eq!(st.projects.len(), 2);
-        assert_eq!(st.projects[0].name, "Tasks", "the built-in project sorts first");
-        assert!(st.projects[0].locked);
-        assert_eq!(st.projects[1].name, "GenieX", "a real project keeps its name");
-        assert_eq!(st.projects[1].workspace, "C:/src/GenieX", "and its folder");
-        assert_eq!(st.current_project, "p1", "a valid selection is left alone");
-    }
-
-    #[test]
-    fn ensuring_twice_does_not_stack_up_built_in_projects() {
-        let mut st = store();
-        st.ensure_tasks_project();
-        let id = st.projects[0].id.clone();
-        st.ensure_tasks_project();
-
+        assert!(!st.project_remove("p1"), "the scratch project must survive delete");
+        assert!(st.projects.iter().any(|p| p.id == "p1"));
+        assert!(st.project_remove("p2"), "ordinary projects are still removable");
         assert_eq!(st.projects.len(), 1);
-        assert_eq!(st.projects[0].id, id);
-        assert_eq!(st.current_project, id, "an empty selection falls back to the built-in project");
     }
 
     #[test]
-    fn the_built_in_project_cannot_be_removed_but_others_can() {
-        let mut st = store();
-        st.projects = vec![project("p1", "GenieX", "C:/src/GenieX")];
-        st.ensure_tasks_project();
-        let tasks = st.projects[0].id.clone();
+    fn a_real_project_named_default_is_left_alone() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "Default", "C:/src/thing")],
+            vec![],
+        );
+        st.migrate();
+        assert_eq!(st.projects[1].name, "Default");
+        assert_eq!(st.projects[1].workspace, "C:/src/thing");
+    }
 
-        assert!(!st.project_remove(&tasks), "the built-in project must survive delete");
-        assert!(st.projects.iter().any(|p| p.id == tasks));
-        assert!(st.project_remove("p1"), "ordinary projects are still removable");
-        assert_eq!(st.projects.len(), 1);
+    /// The reported bug: a chat with no folder of its own used to fall through
+    /// to the global config workspace, i.e. some unrelated project's checkout.
+    #[test]
+    fn a_chat_without_a_folder_resolves_to_its_own_project() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p1", ""), session("s2", "p2", "")],
+        );
+        st.migrate();
+        assert_eq!(st.resolved_workspace("s1"), scratch_workspace());
+        assert_eq!(st.resolved_workspace("s2"), "C:/src/mascot");
+    }
+
+    #[test]
+    fn project_context_distinguishes_scratch_from_a_real_project() {
+        let mut st = store(
+            vec![project("p1", "Default", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p1", ""), session("s2", "p2", "")],
+        );
+        st.migrate();
+
+        let tasks = st.project_context("s1");
+        assert_eq!(tasks.name, DEFAULT_PROJECT);
+        assert!(tasks.scratch);
+
+        let mascot = st.project_context("s2");
+        assert_eq!(mascot.name, "mascot");
+        assert!(!mascot.scratch);
+    }
+
+    /// A chat predating projects has neither a project nor a folder; it must end
+    /// up in the default bucket rather than disappearing from the sidebar.
+    #[test]
+    fn orphan_chats_are_adopted_by_the_default_project() {
+        let mut st = store(vec![project("p1", "Chats", "")], vec![session("s1", "", "")]);
+        st.migrate();
+        assert_eq!(st.sessions[0].project, "p1");
+        assert_eq!(st.resolved_workspace("s1"), scratch_workspace());
+    }
+
+    /// Relative folders resolve against the launch directory, so the same index
+    /// pointed somewhere different depending on how the app was started. Pin
+    /// them — but only when they really resolve, so a path that is already
+    /// broken isn't frozen against an arbitrary directory.
+    #[test]
+    fn resolvable_relative_project_folders_are_pinned_to_absolute_paths() {
+        // `cargo test` runs with the package root as cwd, so `src` exists.
+        let mut st = store(vec![project("p1", "Tasks", ""), project("p2", "rel", "src")], vec![]);
+        st.migrate();
+        assert!(std::path::Path::new(&st.projects[1].workspace).is_absolute());
+        assert!(std::path::Path::new(&st.projects[1].workspace).is_dir());
+    }
+
+    #[test]
+    fn a_broken_relative_folder_is_left_for_the_user_to_repoint() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "0xAlpha", "0xAlpha")],
+            vec![],
+        );
+        st.migrate();
+        assert_eq!(st.projects[1].workspace, "0xAlpha");
+    }
+
+    /// A chat outlives its project, keeping its own folder. Reporting it as a
+    /// member of whichever project it was refiled under would be a lie.
+    #[test]
+    fn a_chat_whose_project_was_deleted_is_reported_as_detached() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p2", "")],
+        );
+        st.migrate();
+        assert!(!st.project_context("s1").detached);
+
+        assert!(st.project_remove("p2"));
+
+        let ctx = st.project_context("s1");
+        assert_eq!(st.resolved_workspace("s1"), "C:/src/mascot", "folder must be kept");
+        assert!(ctx.detached, "refiled under {:?} but still in mascot", ctx.name);
+        assert!(!ctx.scratch);
+    }
+
+    #[test]
+    fn a_chat_sitting_in_its_own_projects_folder_is_not_detached() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p2", ""), session("s2", "p1", "")],
+        );
+        st.migrate();
+        assert!(!st.project_context("s1").detached);
+        assert!(!st.project_context("s2").detached);
+    }
+
+    /// Deleting a project must not disturb the open chat; chats survive it.
+    #[test]
+    fn deleting_a_project_keeps_the_selected_chat() {
+        let mut st = store(
+            vec![project("p1", "Tasks", ""), project("p2", "mascot", "C:/src/mascot")],
+            vec![session("s1", "p2", ""), session("s2", "p1", "")],
+        );
+        st.migrate();
+        st.current = "s1".into();
+        st.project_remove("p2");
+        assert_eq!(st.current, "s1");
+        assert_eq!(st.sessions.len(), 2, "chats are kept, not deleted");
+    }
+
+    #[test]
+    fn a_new_chat_inherits_the_current_projects_folder() {
+        let mut st = store(vec![project("p2", "mascot", "C:/src/mascot")], vec![]);
+        st.current_project = "p2".into();
+        let meta = st.create("", "", "");
+        assert_eq!(meta.project, "p2");
+        assert_eq!(st.resolved_workspace(&meta.id), "C:/src/mascot");
     }
 }
