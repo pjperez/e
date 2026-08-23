@@ -1,5 +1,6 @@
 // e — UI controller.
 import { renderMarkdown } from "./markdown";
+import { attachTurnCopy, decorateCodeBlocks, wireCopy } from "./copy";
 import * as api from "./api";
 import type { Config, ProviderItem } from "./api";
 
@@ -152,6 +153,13 @@ function clampOut(out: string, max = 6000): string {
   return out.slice(0, max) + `\n… (truncated ${out.length - max} chars)`;
 }
 
+/// Markdown and its copy buttons always go up together — a bare `innerHTML =
+/// renderMarkdown(...)` would drop the buttons on the floor.
+function renderInto(el: HTMLElement, md: string): void {
+  el.innerHTML = renderMarkdown(md);
+  decorateCodeBlocks(el);
+}
+
 // ---------- conversation rendering ----------
 type ToolBlock = { el: HTMLElement; stateEl: HTMLElement; outputEl: HTMLElement };
 type Turn = {
@@ -185,6 +193,7 @@ function addUserTurn(text: string): void {
   el.innerHTML = `<div class="role">you</div><div class="body user"></div>`;
   const body = el.querySelector(".body") as HTMLElement;
   body.textContent = text;
+  attachTurnCopy(el, "message", () => text);
   conv.appendChild(el);
   turns.push({ el, body, textEl: body, raw: text, hasCaret: false, tools: new Map() });
   scrollBottom();
@@ -198,6 +207,7 @@ function addAssistantTurn(): Turn {
   const textEl = el.querySelector(".text") as HTMLElement;
   conv.appendChild(el);
   const t: Turn = { el, body, textEl, raw: "", hasCaret: true, tools: new Map() };
+  attachTurnCopy(el, "reply", () => t.raw);
   turns.push(t);
   scrollBottom();
   return t;
@@ -311,9 +321,7 @@ function resolveTool(id: string, success: boolean, output: string): void {
       b.el.classList.add(success ? "ok" : "err");
       b.stateEl.textContent = success ? "done" : "error";
       const copyBtn = b.el.querySelector(".tool-copy") as HTMLButtonElement;
-      copyBtn.addEventListener("click", () => {
-        void navigator.clipboard.writeText(output).then(() => notify("Copied to clipboard"));
-      });
+      wireCopy(copyBtn, () => output);
       const inTxt = ((b.el.querySelector(".in") as HTMLElement).textContent || "");
       const diffy = output.split("\n").filter((l) => /^[+-]/.test(l)).length > 3;
       if (diffy || /^(git (diff|apply))/.test(inTxt.trim())) {
@@ -493,12 +501,7 @@ function errorCard(raw: string): HTMLElement {
   const copy = document.createElement("button");
   copy.className = "errcard-copy";
   copy.textContent = "copy";
-  copy.addEventListener("click", () => {
-    void navigator.clipboard.writeText(info.raw).then(
-      () => { copy.textContent = "copied"; setTimeout(() => (copy.textContent = "copy"), 1400); },
-      () => notify("Copy failed", "error"),
-    );
-  });
+  wireCopy(copy, () => info.raw);
   det.append(sum, pre, copy);
   el.appendChild(det);
   return el;
@@ -697,7 +700,8 @@ function runSlash(cmd: string): void {
   const show = (md: string) => {
     const t = addAssistantTurn();
     removeCaret(t);
-    t.textEl.innerHTML = renderMarkdown(md);
+    t.raw = md;
+    renderInto(t.textEl, md);
   };
   switch (c) {
     case "/new":
@@ -1020,7 +1024,7 @@ api.onEngineEvent((ev) => {
         if (t) {
           removeCaret(t);
           if (t.thinkEl) t.thinkEl.classList.remove("live");
-          t.textEl.innerHTML = renderMarkdown(t.raw);
+          renderInto(t.textEl, t.raw);
         }
         break;
       }
@@ -1039,7 +1043,7 @@ api.onEngineEvent((ev) => {
         const t = lastTurn();
         if (t) {
           removeCaret(t);
-          t.textEl.innerHTML = renderMarkdown(t.raw);
+          renderInto(t.textEl, t.raw);
         }
         applyChatUI();
         break;
@@ -1257,9 +1261,10 @@ function addStaticAssistant(content: string, reasoning = ""): Turn {
   el.innerHTML = `<div class="role">e</div><div class="body assistant"><div class="text"></div></div>`;
   const textEl = el.querySelector(".text") as HTMLElement;
   const bodyEl = el.querySelector(".body") as HTMLElement;
-  textEl.innerHTML = renderMarkdown(content);
+  renderInto(textEl, content);
   conv.appendChild(el);
   const t: Turn = { el, body: bodyEl, textEl, raw: content, hasCaret: false, tools: new Map() };
+  attachTurnCopy(el, "reply", () => t.raw);
   if (reasoning) {
     // Persisted thinking starts collapsed; live reasoning appends into it.
     thinkBody(t).textContent = reasoning;
