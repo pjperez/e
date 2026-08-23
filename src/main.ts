@@ -394,6 +394,12 @@ function explainError(raw: string): ErrInfo {
   if (/^workspace folder does not exist/i.test(raw)) {
     title = "Workspace folder is missing";
     hint = raw.replace(/^workspace folder does not exist:\s*/i, "Folder: ");
+  } else if (/insufficient tool messages|must be followed by tool messages|tool_call_id/i.test(raw)) {
+    // History with a tool call that never got a result — the app was closed or
+    // crashed mid-tool. Every later send replays it and fails identically, so
+    // say what happened instead of showing a raw 400.
+    title = "Interrupted tool call";
+    hint = "This chat was closed while a tool was still running, leaving its history incomplete. It has been repaired — send again.";
   } else if (/^request failed/i.test(raw)) {
     title = "Can't reach the provider";
     hint = "Check your connection and the base URL in Settings.";
@@ -937,6 +943,8 @@ api.onEngineEvent((ev) => {
       chat.approval = null;
       chatState[sid] = "error";
       sidebarDirty = true;
+      // A background chat used to fail with nothing but a dot in the sidebar.
+      if (!onScreen) notify("“" + sessionName(sid) + "” failed — " + explainError(ev.message).title, "error");
       break;
     case "done":
       chat.running = false;
@@ -1259,13 +1267,18 @@ function seedContextEstimate(sid: string, estimate: number): void {
   if (!s.ctxIn) s.ctxIn = estimate || 0;
 }
 
-function renderHistory(messages: { role: string; content: string; reasoning?: string }[]): void {
+function renderHistory(messages: { role: string; content: string; reasoning?: string; error?: string }[]): void {
   conv.innerHTML = "";
   turns = [];
   for (const m of messages) {
     if (m.role === "compaction") conv.appendChild(compactionMark());
     else if (m.role === "user" && m.content) addUserTurn(m.content);
-    else if (m.role === "assistant" && (m.content || m.reasoning)) addStaticAssistant(m.content, m.reasoning || "");
+    else if (m.role === "assistant" && (m.content || m.reasoning || m.error)) {
+      const t = addStaticAssistant(m.content, m.reasoning || "");
+      // Failures are part of the transcript, so a chat that died stays
+      // explained after a switch or restart instead of just showing a red dot.
+      if (m.error) t.body.appendChild(errorCard(m.error));
+    }
   }
   updateEmpty();
   scrollBottom();
@@ -1391,6 +1404,10 @@ async function refreshSessions(): Promise<void> {
       u.activityStep = "";
       u.approval = null;
     }
+    // A chat that died in a previous app session has its failure persisted but
+    // no in-memory flag, so adopt the stored state — otherwise a restart makes
+    // every past failure look like a clean idle chat.
+    if (!u.running && s.state === "error") u.errored = true;
     chatState[s.id] = u.running ? "busy" : u.errored ? "error" : "idle";
   }
   // Drop UI state for chats that no longer exist.

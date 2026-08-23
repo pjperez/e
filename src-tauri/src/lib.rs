@@ -506,10 +506,18 @@ fn get_session(state: tauri::State<AppState>, id: String) -> Result<serde_json::
                 .collect::<Vec<_>>()
                 .join("\n");
             let content = compacted.unwrap_or_else(|| m.plain_text_parts());
-            serde_json::json!({ "role": role, "content": content, "reasoning": reasoning })
+            let error = m
+                .parts
+                .iter()
+                .filter_map(|p| if let Part::Error(e) = p { Some(e.clone()) } else { None })
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::json!({ "role": role, "content": content, "reasoning": reasoning, "error": error })
         })
         .filter(|v| {
-            !v["content"].as_str().unwrap_or("").is_empty() || !v["reasoning"].as_str().unwrap_or("").is_empty()
+            !v["content"].as_str().unwrap_or("").is_empty()
+                || !v["reasoning"].as_str().unwrap_or("").is_empty()
+                || !v["error"].as_str().unwrap_or("").is_empty()
         })
         .collect();
     Ok(serde_json::json!({

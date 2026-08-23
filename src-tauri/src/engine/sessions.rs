@@ -143,14 +143,21 @@ impl SessionStore {
         self.dir.join(format!("{id}.json"))
     }
 
+    /// Read a chat's history, repairing it if a previous run left it in a state
+    /// providers reject (see `repair_tool_calls`). The repair is written back
+    /// so the chat is fixed once rather than re-patched on every read.
     pub fn get_history(&self, id: &str) -> Vec<Msg> {
         if id.is_empty() {
             return Vec::new();
         }
-        std::fs::read_to_string(self.file(id))
+        let mut msgs: Vec<Msg> = std::fs::read_to_string(self.file(id))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if crate::engine::repair_tool_calls(&mut msgs) > 0 {
+            self.set_history(id, msgs.clone());
+        }
+        msgs
     }
 
     pub fn set_history(&self, id: &str, msgs: Vec<Msg>) {

@@ -28,6 +28,11 @@ pub enum Part {
     ImageData(String),
     ToolCall(ToolCall),
     ToolResult { id: String, #[allow(dead_code)] name: String, content: String },
+    /// A run that failed, recorded in the transcript. Kept in history (rather
+    /// than only emitted as a live event) so the failure is still visible after
+    /// switching chats or restarting — otherwise a chat is flagged "error" with
+    /// nothing on screen explaining why.
+    Error(String),
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -70,6 +75,7 @@ pub fn est_tokens(m: &Msg) -> usize {
             Part::ImageData(_) => 4 * 1_000,
             Part::ToolCall(tc) => tc.name.len() + tc.arguments.to_string().len(),
             Part::ToolResult { content, .. } => content.len(),
+            Part::Error(_) => 0,
         })
         .sum::<usize>()
         / 4
@@ -103,6 +109,84 @@ pub fn keep_split(hist: &[Msg], context_window: u64) -> usize {
     split
 }
 
+/// Placeholder written for a tool call that never produced a result, i.e. the
+/// app was killed or crashed while the tool was still running.
+pub const INTERRUPTED_TOOL_RESULT: &str =
+    "Interrupted: e exited before this tool finished, so no result was recorded.";
+
+/// Repair a history that providers would reject outright.
+///
+/// The OpenAI contract is strict in both directions: every `tool_calls` entry
+/// on an assistant message must be answered by a `tool` message, and every
+/// `tool` message must answer a call that is still in the history. A run
+/// persists the assistant's tool-call message *before* executing the tools, so
+/// killing the app mid-tool leaves a dangling call — and from then on every
+/// single request replays it and fails with a 400, permanently. Filling the
+/// gap in (and dropping orphaned results) is what makes such a chat usable
+/// again instead of dead forever.
+///
+/// Returns the number of messages inserted or removed.
+pub fn repair_tool_calls(hist: &mut Vec<Msg>) -> usize {
+    use std::collections::HashSet;
+
+    let called: HashSet<String> = hist
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .filter_map(|p| match p {
+            Part::ToolCall(tc) => Some(tc.id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Orphaned results first, so the indices used below can't be stale.
+    let before = hist.len();
+    hist.retain(|m| {
+        m.role != "tool"
+            || m.parts.iter().all(|p| match p {
+                Part::ToolResult { id, .. } => called.contains(id),
+                _ => true,
+            })
+    });
+    let mut fixed = before - hist.len();
+
+    let answered: HashSet<String> = hist
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .filter_map(|p| match p {
+            Part::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut i = 0usize;
+    while i < hist.len() {
+        let missing: Vec<(String, String)> = hist[i]
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::ToolCall(tc) if !answered.contains(&tc.id) => Some((tc.id.clone(), tc.name.clone())),
+                _ => None,
+            })
+            .collect();
+        if missing.is_empty() {
+            i += 1;
+            continue;
+        }
+        // Slot the placeholders after whatever results this call did produce,
+        // so partially-completed batches keep their real output and ordering.
+        let mut at = i + 1;
+        while at < hist.len() && hist[at].role == "tool" {
+            at += 1;
+        }
+        for (id, name) in missing.iter().rev() {
+            hist.insert(at, Msg::tool_result(id, name, INTERRUPTED_TOOL_RESULT.to_string()));
+        }
+        fixed += missing.len();
+        i = at + missing.len();
+    }
+    fixed
+}
+
 impl Msg {
     /// The compaction summary text, if this is a compaction marker message.
     pub fn compaction_summary(&self) -> Option<String> {
@@ -121,6 +205,11 @@ impl Msg {
             role: "tool".into(),
             parts: vec![Part::ToolResult { id: id.into(), name: name.into(), content }],
         }
+    }
+    /// A failed run, recorded as an assistant turn so it survives in the
+    /// transcript. Never sent back to the provider.
+    pub fn error(message: impl Into<String>) -> Self {
+        Msg { role: "assistant".into(), parts: vec![Part::Error(message.into())] }
     }
     pub fn plain_text_parts(&self) -> String {
         self.parts
@@ -226,5 +315,66 @@ mod tests {
         let m = Msg::text("user", format!("{COMPACTION_MARKER}a summary"));
         assert_eq!(m.compaction_summary().as_deref(), Some("a summary"));
         assert_eq!(Msg::text("user", "hello").compaction_summary(), None);
+    }
+
+    fn call(id: &str) -> Msg {
+        Msg::assistant(vec![Part::ToolCall(ToolCall {
+            id: id.into(),
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        })])
+    }
+
+    fn answered_ids(hist: &[Msg]) -> Vec<String> {
+        hist.iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                Part::ToolResult { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tool_call_killed_mid_run_gets_a_placeholder_result() {
+        // Exactly what a crash during tool execution leaves behind: the
+        // assistant's call is persisted, its result never is.
+        let mut hist = vec![Msg::text("user", "go"), call("c1"), Msg::text("user", "still there?")];
+        assert_eq!(repair_tool_calls(&mut hist), 1);
+        assert_eq!(hist[2].role, "tool", "the result must directly follow its call");
+        assert_eq!(answered_ids(&hist), vec!["c1"]);
+        assert_eq!(repair_tool_calls(&mut hist), 0, "repair must be idempotent");
+    }
+
+    #[test]
+    fn partially_answered_batches_keep_their_real_results() {
+        let mut hist = vec![
+            Msg::assistant(vec![
+                Part::ToolCall(ToolCall { id: "a".into(), name: "shell".into(), arguments: serde_json::Value::Null }),
+                Part::ToolCall(ToolCall { id: "b".into(), name: "read_file".into(), arguments: serde_json::Value::Null }),
+            ]),
+            Msg::tool_result("a", "shell", "real output".into()),
+        ];
+        assert_eq!(repair_tool_calls(&mut hist), 1);
+        assert_eq!(answered_ids(&hist), vec!["a", "b"], "the real result must survive, in order");
+        assert!(hist[1].parts.iter().any(|p| matches!(p, Part::ToolResult { content, .. } if content == "real output")));
+    }
+
+    #[test]
+    fn results_whose_call_is_gone_are_dropped() {
+        // Compaction can strip the assistant turn but leave its results behind;
+        // providers reject those just as hard as a dangling call.
+        let mut hist = vec![Msg::text("user", "go"), Msg::tool_result("ghost", "shell", "out".into())];
+        assert_eq!(repair_tool_calls(&mut hist), 1);
+        assert_eq!(hist.len(), 1);
+        assert!(answered_ids(&hist).is_empty());
+    }
+
+    #[test]
+    fn a_healthy_history_is_left_alone() {
+        let mut hist = vec![Msg::text("user", "go"), call("c1"), Msg::tool_result("c1", "shell", "ok".into())];
+        let before = hist.len();
+        assert_eq!(repair_tool_calls(&mut hist), 0);
+        assert_eq!(hist.len(), before);
     }
 }

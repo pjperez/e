@@ -84,7 +84,16 @@ impl ChatProvider {
                                 }));
                             }
                             Part::ToolResult { .. } => {}
+                            // Our own record of a failed run — never replayed
+                            // back to the model.
+                            Part::Error(_) => {}
                         }
+                    }
+                    // An assistant turn with no content and no calls is either
+                    // reasoning-only or an error marker; providers reject the
+                    // empty message, so drop it rather than send it.
+                    if text.is_empty() && tcs.is_empty() {
+                        continue;
                     }
                     let mut o = json!({ "role": "assistant", "content": text });
                     if !tcs.is_empty() {

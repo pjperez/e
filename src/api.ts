@@ -132,7 +132,7 @@ export async function pathIsDir(path: string): Promise<boolean> {
   return invoke<boolean>("path_is_dir", { path }).catch(() => false);
 }
 
-export type SessionMetaItem = { id: string; name: string; created: number };
+export type SessionMetaItem = { id: string; name: string; created: number; state?: string };
 
 export async function listSessions(): Promise<{ sessions: SessionMetaItem[]; current: string; running: string[] }> {
   if (!inTauri) return { sessions: [], current: "", running: [] };
@@ -183,7 +183,7 @@ export async function switchSession(id: string): Promise<boolean> {
   return invoke("switch_session", { id });
 }
 
-export async function getSession(id: string): Promise<{ messages: { role: string; content: string; reasoning?: string }[]; model: string; running: boolean; context_estimate: number }> {
+export async function getSession(id: string): Promise<{ messages: { role: string; content: string; reasoning?: string; error?: string }[]; model: string; running: boolean; context_estimate: number }> {
   if (!inTauri) return { messages: [], model: "", running: false, context_estimate: 0 };
   return invoke("get_session", { id });
 }

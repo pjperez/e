@@ -365,6 +365,12 @@ impl Agent {
                 Ok(c) => c,
                 Err(e) => {
                     stats.error = Some(e.clone());
+                    // Record the failure in the transcript, not just as a live
+                    // event: an event-only error disappears the moment the user
+                    // switches chats or restarts, leaving a chat flagged
+                    // "error" with nothing on screen saying what went wrong.
+                    self.history.push(Msg::error(e.clone()));
+                    self.persist();
                     emit.error(&e);
                     emit.summary(&stats.to_summary());
                     emit.done(false);
