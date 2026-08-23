@@ -40,9 +40,6 @@
     <div id="app">
       <aside id="sidebar">
         <div class="sess-head"><span>Project</span><button id="sess-pin" type="button" title="Pin sidebar">&#128204;</button></div>
-        <div class="sess-newrow proj-row">
-          <button id="proj-rename" type="button" title="Rename active project">&#9998;</button>
-        </div>
         <button id="proj-add" class="full-btn" type="button">+ New project</button>
         <div class="sess-head"><span>Chats</span><button id="sess-new" type="button">+ New</button></div>
         <div class="picker-list" id="sess-list"></div>
@@ -122,6 +119,7 @@
             <span id="sb-cost" title="session cost">$0.000</span>
           </span>
           <span class="sb-right">
+            <span id="sb-yolo" hidden title="YOLO mode: risky tools run without asking">YOLO</span>
             <span id="sb-prov">(provider)</span>
             <span id="sb-model">model</span>
             <span id="sb-reason">&middot; high</span>

@@ -36,9 +36,16 @@ const sbModel = document.getElementById("sb-model") as HTMLElement;
 const sbArrows = document.getElementById("sb-arrows") as HTMLElement;
 const sbCtx = document.getElementById("sb-context") as HTMLElement;
 const sbCost = document.getElementById("sb-cost") as HTMLElement;
+const sbYolo = document.getElementById("sb-yolo") as HTMLElement;
 const actSteer = document.getElementById("act-steer") as HTMLButtonElement;
 
 function hostOf(u: string): string { try { return new URL(u).host; } catch { return u; } }
+
+/// YOLO disables the approval prompt for shell/write_file, so it gets a
+/// permanent badge rather than living only in the settings modal.
+function setYoloIndicator(on: boolean): void {
+  sbYolo.hidden = !on;
+}
 
 // ---------- per-chat run state ----------
 // Everything about "is something happening" is scoped to a chat id. These used
@@ -327,6 +334,115 @@ function updateInputState(): void {
   input.placeholder = running ? "Reply — sent when this chat finishes…" : "Ask e to do something…";
 }
 
+/// Turn a raw engine/provider error into something a human can act on.
+/// Provider failures arrive as `provider returned 429 …: {json}`, which is
+/// unreadable dumped verbatim into the transcript.
+type ErrInfo = { title: string; hint: string; code: string; tags: string[]; raw: string };
+
+function explainError(raw: string): ErrInfo {
+  const code = /returned (\d{3})/.exec(raw)?.[1] || "";
+  const brace = raw.indexOf("{");
+  let data: Record<string, unknown> | null = null;
+  if (brace >= 0) {
+    try { data = JSON.parse(raw.slice(brace)) as Record<string, unknown>; } catch { data = null; }
+  }
+  const pick = (o: unknown, k: string): unknown => (o && typeof o === "object" ? (o as Record<string, unknown>)[k] : undefined);
+  const extra = pick(data, "extra_fields");
+  const routing = pick(extra, "routing_info");
+  const provider = (pick(routing, "provider") ?? pick(extra, "provider")) as string | undefined;
+  const model = (pick(routing, "model") ?? pick(extra, "resolved_model_used")) as string | undefined;
+  const message = (pick(pick(data, "error"), "message") ?? pick(data, "message")) as string | undefined;
+
+  let title = "Run failed";
+  let hint = message || "";
+  if (/^workspace folder does not exist/i.test(raw)) {
+    title = "Workspace folder is missing";
+    hint = raw.replace(/^workspace folder does not exist:\s*/i, "Folder: ");
+  } else if (/^request failed/i.test(raw)) {
+    title = "Can't reach the provider";
+    hint = "Check your connection and the base URL in Settings.";
+  } else if (/timed out/i.test(raw)) {
+    title = "Timed out";
+    hint = hint || "The provider took too long to respond.";
+  } else if (code === "429") {
+    title = "Rate limited";
+    hint = "The provider is throttling requests — wait a few seconds and retry, or switch model.";
+  } else if (code === "401" || code === "403") {
+    title = "Authentication failed";
+    hint = "Check this provider's API key in Settings (⚙).";
+  } else if (code === "404") {
+    title = "Model not available";
+    hint = "The provider doesn't serve this model. Pick another from the model picker.";
+  } else if (code.startsWith("5")) {
+    title = "Provider error";
+    hint = hint || "The provider failed server-side. Retrying usually helps.";
+  } else if (code === "400") {
+    title = "Request rejected";
+  }
+
+  const tags = [provider, model].filter((t): t is string => !!t);
+  return { title, hint, code, tags, raw };
+}
+
+function errorCard(raw: string): HTMLElement {
+  const info = explainError(raw);
+  const el = document.createElement("div");
+  el.className = "errcard";
+
+  const head = document.createElement("div");
+  head.className = "errcard-head";
+  const ico = document.createElement("span");
+  ico.className = "errcard-ico";
+  ico.textContent = "⚠";
+  const title = document.createElement("span");
+  title.className = "errcard-title";
+  title.textContent = info.title;
+  head.append(ico, title);
+  if (info.code) {
+    const code = document.createElement("span");
+    code.className = "errcard-code";
+    code.textContent = info.code;
+    head.appendChild(code);
+  }
+  el.appendChild(head);
+
+  if (info.hint) {
+    const hint = document.createElement("p");
+    hint.className = "errcard-hint";
+    hint.textContent = info.hint;
+    el.appendChild(hint);
+  }
+  if (info.tags.length) {
+    const meta = document.createElement("div");
+    meta.className = "errcard-meta";
+    info.tags.forEach((t) => {
+      const s = document.createElement("span");
+      s.textContent = t;
+      meta.appendChild(s);
+    });
+    el.appendChild(meta);
+  }
+
+  const det = document.createElement("details");
+  det.className = "errcard-raw";
+  const sum = document.createElement("summary");
+  sum.textContent = "Details";
+  const pre = document.createElement("pre");
+  pre.textContent = info.raw;
+  const copy = document.createElement("button");
+  copy.className = "errcard-copy";
+  copy.textContent = "copy";
+  copy.addEventListener("click", () => {
+    void navigator.clipboard.writeText(info.raw).then(
+      () => { copy.textContent = "copied"; setTimeout(() => (copy.textContent = "copy"), 1400); },
+      () => notify("Copy failed", "error"),
+    );
+  });
+  det.append(sum, pre, copy);
+  el.appendChild(det);
+  return el;
+}
+
 function setError(msg: string): void {
   if (currentSession) {
     chatState[currentSession] = "error";
@@ -336,16 +452,16 @@ function setError(msg: string): void {
   statusWrap.classList.add("error");
   statusText.textContent = "error";
   hideActivity();
-  const t = addAssistantTurn();
+  // The card lives in the turn body, not in `textEl`: `done` re-renders the
+  // text from `raw`, which would otherwise wipe the message a moment later.
+  const t = lastTurn() || addAssistantTurn();
   removeCaret(t);
-  // `raw` must carry the text too: `done` re-renders the last turn from `raw`,
-  // which used to blank the error message a moment after it appeared.
-  t.raw = `⚠ ${msg}`;
-  t.textEl.innerHTML = renderMarkdown(t.raw);
+  t.body.appendChild(errorCard(msg));
   if (currentSession) cur().running = false;
   setBusy(false);
   updateInputState();
   updateEmpty();
+  scrollBottom();
 }
 
 // ---------- send / events ----------
@@ -489,12 +605,30 @@ async function expandAttachments(text: string): Promise<string> {
   return ctx;
 }
 
-const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
+const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/yolo [on|off]\` — auto-approve risky tools (shell, write_file)\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
+
+/// Single source of truth for YOLO: the settings checkbox reads the same saved
+/// config, so the two controls cannot drift apart.
+async function toggleYolo(arg: string): Promise<void> {
+  try {
+    const cfg = await api.getConfig();
+    const next = arg === "on" ? true : arg === "off" ? false : !cfg.yolo;
+    cfg.yolo = next;
+    await api.saveConfig(cfg);
+    setYoloIndicator(next);
+    notify(next ? "YOLO mode ON — shell & write_file run without asking" : "YOLO mode OFF — risky tools ask first", next ? "error" : "info");
+  } catch (e) {
+    notify(String(e), "error");
+  }
+}
 
 function runSlash(cmd: string): void {
-  const c = cmd.trim().split(/\s+/)[0];
-  if (pluginCommands[c]) {
-    pluginCommands[c]();
+  const parts = cmd.trim().split(/\s+/);
+  const c = parts[0];
+  const arg = (parts[1] || "").toLowerCase();
+  const plugin = pluginCommands[c];
+  if (plugin) {
+    plugin.run();
     return;
   }
   const show = (md: string) => {
@@ -504,17 +638,28 @@ function runSlash(cmd: string): void {
   };
   switch (c) {
     case "/new":
-      conv.innerHTML = "";
-      turns = [];
-      empty.classList.remove("hidden");
-      void api.clearSession(currentSession).catch((e) => notify(String(e), "error"));
-      if (currentSession) {
-        const s = cur();
-        s.liveText = "";
-        s.liveReason = "";
-      }
-      resetSB();
-      applyChatUI();
+      // Clear only once the backend agrees. It refuses while a run is in
+      // flight, and since slash commands now skip the queue this is reachable
+      // mid-run: wiping first would leave the live run streaming into a
+      // transcript that no longer matches the stored history.
+      void (async () => {
+        try {
+          await api.clearSession(currentSession);
+        } catch (e) {
+          notify(String(e), "error");
+          return;
+        }
+        conv.innerHTML = "";
+        turns = [];
+        empty.classList.remove("hidden");
+        if (currentSession) {
+          const s = cur();
+          s.liveText = "";
+          s.liveReason = "";
+        }
+        resetSB();
+        applyChatUI();
+      })();
       break;
     case "/model":
       closePicker();
@@ -523,6 +668,9 @@ function runSlash(cmd: string): void {
     case "/settings":
       closePicker();
       void openSettings();
+      break;
+    case "/yolo":
+      void toggleYolo(arg);
       break;
     case "/help":
       show(HELP);
@@ -540,6 +688,18 @@ function sessionName(sid: string): string {
 async function doSend(): Promise<void> {
   const text = input.value.trim();
   if (!text) return;
+
+  // Slash commands are UI actions, not model input: they need no chat and are
+  // never queued behind an in-flight run.
+  if (text.startsWith("/")) {
+    input.value = "";
+    autoGrow();
+    updateInputState();
+    closeSlash();
+    runSlash(text);
+    return;
+  }
+
   if (!currentSession) {
     notify("No chat selected", "error");
     return;
@@ -561,10 +721,6 @@ async function doSend(): Promise<void> {
   input.value = "";
   autoGrow();
   updateInputState();
-  if (text.startsWith("/")) {
-    runSlash(text);
-    return;
-  }
   await startRun(sid, text);
 }
 
@@ -851,7 +1007,9 @@ modelPill.addEventListener("click", (e) => {
   openPicker();
 });
 document.addEventListener("click", (e) => {
-  if (!pickerMenu.hidden && !(e.target as HTMLElement).closest("#picker")) closePicker();
+  const t = e.target as HTMLElement;
+  if (!pickerMenu.hidden && !t.closest("#picker")) closePicker();
+  if (!slashMenu.hidden && !t.closest("#composer")) closeSlash();
 });
 
 // ---------- image paste + run summary ----------
@@ -929,7 +1087,11 @@ function addSummaryCard(s: { steps: number; tools: number; stopped: boolean; err
   if (s.tools) bits.push(`${s.tools} tool call${s.tools === 1 ? "" : "s"}`);
   const div = document.createElement("div");
   div.className = "summary" + (s.error ? " err" : "");
-  div.textContent = s.error ? `⚠ ${s.error}` : `${s.stopped ? "stopped" : "done"} — ${bits.join(" · ")}`;
+  // The error itself is already shown as a card by the `error` event; repeating
+  // the raw provider payload here is what made failures look like a wall of JSON.
+  div.textContent = s.error
+    ? `failed — ${bits.join(" · ")}`
+    : `${s.stopped ? "stopped" : "done"} — ${bits.join(" · ")}`;
   if (!s.error && s.tools > 0) {
     const sid = currentSession;
     const rv = document.createElement("button");
@@ -955,7 +1117,6 @@ function addSummaryCard(s: { steps: number; tools: number; stopped: boolean; err
 // ---------- projects + sessions (left sidebar) ----------
 const sidebar = document.getElementById("sidebar") as HTMLElement;
 const sessList = document.getElementById("sess-list") as HTMLElement;
-const projRename = document.getElementById("proj-rename") as HTMLButtonElement;
 const projAdd = document.getElementById("proj-add") as HTMLButtonElement;
 const pinBtn = document.getElementById("sess-pin") as HTMLButtonElement;
 let projects: api.ProjectMeta[] = [];
@@ -1030,13 +1191,19 @@ function renderSessions(): void {
     const lab = document.createElement("span");
     lab.className = "sess-label";
     lab.textContent = (open ? "▾ " : "▸ ") + (p.name || p.id);
+    const pren = document.createElement("button");
+    pren.className = "sess-act";
+    pren.textContent = "✎";
+    pren.title = "Rename project";
     const pdel = document.createElement("button");
     pdel.className = "sess-act";
     pdel.textContent = "×";
     pdel.title = "Delete project (chats are kept)";
-    if (p.id !== currentProject) pdel.style.opacity = "0";
-    row.appendChild(pdel);
-    row.appendChild(lab);
+    row.append(lab, pren, pdel);
+    pren.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openRenameModal(p.id, p.name || p.id, p.workspace || "");
+    });
     pdel.addEventListener("click", (e) => {
       e.stopPropagation();
       void (async () => {
@@ -1143,8 +1310,12 @@ async function refreshSessions(): Promise<void> {
 
   renderSessions();
   const p0 = projects.find((x) => x.id === currentProject);
-  if (p0 && p0.workspace) sbWs.textContent = p0.workspace;
-  else sbWs.textContent = ".";
+  const ws = p0 && p0.workspace ? p0.workspace : "";
+  sbWs.textContent = ws || ".";
+  // Flag a missing folder here rather than letting every tool call fail on it.
+  const ok = ws ? await api.pathIsDir(ws) : true;
+  sbWs.classList.toggle("missing", !ok);
+  sbWs.title = ok ? ws : `Folder not found: ${ws} — open the project's ✎ to pick another`;
 }
 
 async function loadSession(id: string): Promise<void> {
@@ -1205,6 +1376,9 @@ function openSessions(): void {
   sidebar.classList.add("open");
 }
 function closeSessions(): void {
+  // A pinned sidebar stays put — switching chats, starting a new one or opening
+  // a project used to close it regardless of the pin.
+  if (pinned) return;
   sidebar.classList.remove("open");
 }
 
@@ -1232,14 +1406,136 @@ document.getElementById("sess-new")!.addEventListener("click", async () => {
   closeSessions();
 });
 projAdd.addEventListener("click", () => openProjModal());
-projRename.addEventListener("click", () => openRenameModal());
+
+// ---------- slash command popup ----------
+type SlashCmd = { name: string; desc: string };
+
+const BUILTIN_SLASH: SlashCmd[] = [
+  { name: "/new", desc: "new conversation" },
+  { name: "/model", desc: "switch model" },
+  { name: "/settings", desc: "open settings" },
+  { name: "/yolo", desc: "toggle auto-approval of risky tools" },
+  { name: "/help", desc: "list commands" },
+];
+
+function slashCommands(): SlashCmd[] {
+  const plugins = Object.entries(pluginCommands).map(([name, c]) => ({ name, desc: c.desc }));
+  return [...BUILTIN_SLASH, ...plugins];
+}
+
+const slashMenu = document.createElement("div");
+slashMenu.className = "picker-menu";
+slashMenu.id = "slash-menu";
+slashMenu.hidden = true;
+slashMenu.innerHTML = `<div class="picker-list" id="slash-list"></div>`;
+(document.getElementById("composer") as HTMLElement).appendChild(slashMenu);
+const slashList = slashMenu.querySelector("#slash-list") as HTMLElement;
+let slashMatches: SlashCmd[] = [];
+let slashSel = 0;
+
+function closeSlash(): void {
+  slashMenu.hidden = true;
+  slashMatches = [];
+  slashSel = 0;
+}
+
+function renderSlash(): void {
+  slashList.innerHTML = "";
+  slashMatches.forEach((c, i) => {
+    const it = document.createElement("div");
+    it.className = "picker-item" + (i === slashSel ? " active" : "");
+    const name = document.createElement("span");
+    name.className = "slash-name";
+    name.textContent = c.name;
+    const desc = document.createElement("span");
+    desc.className = "slash-desc";
+    desc.textContent = c.desc;
+    it.append(name, desc);
+    it.addEventListener("mouseenter", () => {
+      slashSel = i;
+      renderSlash();
+    });
+    it.addEventListener("click", () => pickSlash());
+    slashList.appendChild(it);
+  });
+  slashList.children[slashSel]?.scrollIntoView({ block: "nearest" });
+}
+
+/// The popup only lives while the input is a bare command token — as soon as an
+/// argument or ordinary prose is typed it gets out of the way.
+function refreshSlash(): void {
+  const m = /^\/(\S*)$/.exec(input.value);
+  if (!m) {
+    closeSlash();
+    return;
+  }
+  const q = "/" + m[1].toLowerCase();
+  slashMatches = slashCommands().filter((c) => c.name.toLowerCase().startsWith(q));
+  if (!slashMatches.length) {
+    closeSlash();
+    return;
+  }
+  slashSel = Math.min(slashSel, slashMatches.length - 1);
+  slashMenu.hidden = false;
+  renderSlash();
+}
+
+function moveSlash(delta: number): void {
+  const n = slashMatches.length;
+  slashSel = (slashSel + delta + n) % n;
+  renderSlash();
+}
+
+function completeSlash(): void {
+  const c = slashMatches[slashSel];
+  if (!c) return;
+  input.value = c.name;
+  closeSlash();
+  autoGrow();
+  updateInputState();
+}
+
+function pickSlash(): void {
+  const c = slashMatches[slashSel];
+  if (!c) return;
+  input.value = "";
+  closeSlash();
+  autoGrow();
+  updateInputState();
+  runSlash(c.name);
+}
 
 // ---------- input wiring ----------
 input.addEventListener("input", () => {
   autoGrow();
   updateInputState();
+  refreshSlash();
 });
 input.addEventListener("keydown", (e) => {
+  // The popup claims its keys first: otherwise Enter would send the raw "/text"
+  // as a message and Escape would cancel the run instead of closing the list.
+  if (!slashMenu.hidden) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      moveSlash(e.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      pickSlash();
+      return;
+    }
+    if (e.key === "Tab" || e.key === " ") {
+      e.preventDefault();
+      completeSlash();
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeSlash();
+      return;
+    }
+  }
   // Ctrl+Enter = steer: stop the current run, then send this text to the same
   // chat as soon as it winds down.
   if (e.key === "Enter" && e.ctrlKey && isRunning()) {
@@ -1314,6 +1610,7 @@ overlay.innerHTML = `
       <summary>Behavior</summary>
             <label class="lbl">Temperature</label><input id="cfg-temp" type="number" step="0.1" min="0" max="2"/>
       <label class="lbl">System prompt</label><textarea id="cfg-sys" rows="3"></textarea>
+      <label class="lbl cfg-check"><input id="cfg-yolo" type="checkbox"/> YOLO mode — run shell &amp; write_file without asking</label>
     </details>
     <p class="note">Stored in <code>~/.e/config.json</code>. &ldquo;Refresh&rdquo; fetches <code>&lt;base&gt;/models</code>.</p>
     <div class="modal-actions">
@@ -1429,6 +1726,7 @@ async function openSettings(): Promise<void> {
   currentWs = cfg.workspace;
   (overlay.querySelector("#cfg-temp") as HTMLInputElement).value = String(cfg.temperature);
   (overlay.querySelector("#cfg-sys") as HTMLTextAreaElement).value = cfg.system;
+  (overlay.querySelector("#cfg-yolo") as HTMLInputElement).checked = !!cfg.yolo;
   renderProviderSelect();
   overlay.classList.add("open");
 }
@@ -1448,6 +1746,7 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
   const workspace = currentWs;
   const temperature = parseFloat((overlay.querySelector("#cfg-temp") as HTMLInputElement).value) || 1;
   const system = (overlay.querySelector("#cfg-sys") as HTMLTextAreaElement).value;
+  const yolo = (overlay.querySelector("#cfg-yolo") as HTMLInputElement).checked;
   const cfg: Config = {
     base_url: active.base_url,
     api_key: active.api_key,
@@ -1455,10 +1754,12 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
     workspace,
     system,
     temperature,
+    yolo,
     models: availableModels,
     providers,
   };
   await api.saveConfig(cfg);
+  setYoloIndicator(yolo);
   currentModel = model;
   currentModels = availableModels;
   modelPill.textContent = model || "(none)";
@@ -1492,6 +1793,7 @@ async function init(): Promise<void> {
     currentModels = cfg.models || [];
     sbModel.textContent = cfg.model || "?";
     sbProv.textContent = "[" + activeProviderName(cfg) + "]";
+    setYoloIndicator(!!cfg.yolo);
     await refreshSessions();
     if (pinned) openSessions();
     if (currentSession) {
@@ -1555,8 +1857,13 @@ const rm = document.createElement("div");
 rm.className = "overlay";
 rm.innerHTML = `
   <div class="modal">
-    <h3>Rename project</h3>
-    <div class="field"><input id="rm-input" spellcheck="false"/></div>
+    <h3>Project</h3>
+    <div class="field"><label class="lbl">Name</label><input id="rm-input" spellcheck="false"/></div>
+    <div class="field">
+      <label class="lbl">Folder</label>
+      <div class="rm-folder"><code id="rm-ws"></code><button id="rm-pick" type="button">Choose&hellip;</button></div>
+      <p class="note rm-warn" id="rm-warn" hidden>&#9888; This folder doesn&rsquo;t exist. Tools will fail until you pick another one.</p>
+    </div>
     <div class="modal-actions">
       <button id="rm-cancel">Cancel</button>
       <button id="rm-save" class="primary">Save</button>
@@ -1564,19 +1871,40 @@ rm.innerHTML = `
   </div>`;
 document.body.appendChild(rm);
 const rmInput = rm.querySelector("#rm-input") as HTMLInputElement;
+const rmWs = rm.querySelector("#rm-ws") as HTMLElement;
+const rmWarn = rm.querySelector("#rm-warn") as HTMLElement;
+let renameProjId = "";
+let renameProjWs = "";
+let renameProjOrigWs = "";
+
+async function showRenameWorkspace(ws: string): Promise<void> {
+  renameProjWs = ws;
+  rmWs.textContent = ws || "(not set)";
+  rmWarn.hidden = ws ? await api.pathIsDir(ws) : false;
+}
+
+rm.querySelector("#rm-pick")!.addEventListener("click", () => {
+  void (async () => {
+    const dir = await pickFolder();
+    if (dir) await showRenameWorkspace(dir);
+  })();
+});
 rm.querySelector("#rm-cancel")!.addEventListener("click", () => rm.classList.remove("open"));
 rm.addEventListener("click", (e) => { if (e.target === rm) rm.classList.remove("open"); });
 rm.querySelector("#rm-save")!.addEventListener("click", async () => {
   const v = rmInput.value.trim();
-  if (v && currentProject) {
-    await api.renameProject(currentProject, v);
+  if (renameProjId) {
+    if (v) await api.renameProject(renameProjId, v);
+    if (renameProjWs && renameProjWs !== renameProjOrigWs) await api.setProjectWorkspace(renameProjId, renameProjWs);
     await refreshSessions();
   }
   rm.classList.remove("open");
 });
-function openRenameModal(): void {
-  const p = projects.find((x) => x.id === currentProject);
-  rmInput.value = p ? p.name : "";
+function openRenameModal(id: string, name: string, workspace: string): void {
+  renameProjId = id;
+  renameProjOrigWs = workspace;
+  rmInput.value = name;
+  void showRenameWorkspace(workspace);
   rm.classList.add("open");
   rmInput.focus();
 }
@@ -1585,12 +1913,12 @@ function openRenameModal(): void {
 const pluginTools: api.PluginToolDef[] = [];
 const pluginReg = new Map<string, (args: Record<string, unknown>) => unknown>();
 const pluginHandlers: { event: string; handler: (ev: api.EngineEvents) => unknown }[] = [];
-const pluginCommands: Record<string, () => void> = {};
+const pluginCommands: Record<string, { run: () => void; desc: string }> = {};
 
 interface PluginAPIHost {
   registerTool(def: api.PluginToolDef & { run: (args: Record<string, unknown>) => unknown }): void;
   on(event: string, handler: (ev: api.EngineEvents) => unknown): void;
-  registerCommand(name: string, fn: () => void): void;
+  registerCommand(name: string, fn: () => void, desc?: string): void;
   ui: { notify: (msg: string, kind?: string) => void; confirm: (msg: string) => Promise<boolean> };
 }
 
@@ -1627,8 +1955,8 @@ function buildPluginApi(): PluginAPIHost {
     on(event, handler) {
       pluginHandlers.push({ event, handler });
     },
-    registerCommand(name, fn) {
-      pluginCommands[name] = fn;
+    registerCommand(name, fn, desc) {
+      pluginCommands[name] = { run: fn, desc: desc || "plugin command" };
     },
     ui: { notify, confirm: confirmModal },
   };

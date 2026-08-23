@@ -13,6 +13,9 @@ pub struct Config {
     pub temperature: f64,
     pub system: String,
     pub workspace: String,
+    /// Auto-approve risky tools (shell, write_file) instead of prompting.
+    #[serde(default)]
+    pub yolo: bool,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -41,6 +44,7 @@ impl Config {
             temperature: 0.7,
             system: "You are e, a fast, capable coding agent running in a local harness with a workspace and tools: shell (run commands), read_file, write_file, list_dir.\nTool use policy: use a tool ONLY when it genuinely helps (inspect/read files, run or verify commands, modify the workspace, or when the user asks you to act). For conversational or directly-answerable requests, answer directly yourself and NEVER make a tool call.".to_string(),
             workspace: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+            yolo: false,
             providers: vec![ProviderItem {
                 id: "aigateway".into(),
                 name: "AI Gateway".into(),
@@ -88,6 +92,11 @@ impl Config {
         if let Ok(v) = std::env::var("E_WORKSPACE") {
             if !v.is_empty() {
                 base.workspace = v;
+            }
+        }
+        if let Ok(v) = std::env::var("E_YOLO") {
+            if let Some(b) = parse_bool(&v) {
+                base.yolo = b;
             }
         }
         // Ensure the first provider reflects the active connection so the key
@@ -160,6 +169,19 @@ fn merge(base: &mut Config, c: Config) {
     }
     if !c.providers.is_empty() {
         base.providers = c.providers;
+    }
+    // Copied unconditionally: the "skip empty values" rule used above cannot
+    // express a bool the user deliberately turned off.
+    base.yolo = c.yolo;
+}
+
+/// Lenient bool parsing for env overrides; unrecognised values leave the
+/// configured value untouched rather than silently disabling the flag.
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -367,7 +389,7 @@ impl Agent {
                     continue;
                 }
                 emit.activity("tool", Some(tc.name.as_str()), stats.steps);
-                if RISKY.contains(&tc.name.as_str()) {
+                if RISKY.contains(&tc.name.as_str()) && !self.config.yolo {
                     let preview = tool_preview(tc);
                     if !crate::engine::approval::request(&self.session, &tc.name, &preview, cancelled) {
                         let msg = if cancelled.load(Ordering::SeqCst) { "Stopped by user" } else { "Denied by user" };

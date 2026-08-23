@@ -52,6 +52,23 @@ fn basename_of(path: &str) -> String {
         .unwrap_or_else(|| "Project".to_string())
 }
 
+/// Workspaces are always stored absolute. A relative path silently resolves
+/// against whatever directory the app happened to be launched from, so tools
+/// would run somewhere different (or nowhere) on the next start.
+fn absolute_workspace(ws: &str) -> String {
+    let t = ws.trim();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let p = std::path::Path::new(t);
+    let abs = if t.is_empty() {
+        cwd
+    } else if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    abs.to_string_lossy().to_string()
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         let dir = dirs::home_dir().unwrap_or_default().join(".e/sessions");
@@ -194,7 +211,7 @@ impl SessionStore {
 
     pub fn project_create(&mut self, name: &str, workspace: &str) -> ProjectMeta {
         let id = format!("p{}", now_ms());
-        let ws = workspace.trim().to_string();
+        let ws = absolute_workspace(workspace);
         let nm = if name.trim().is_empty() {
             basename_of(&ws)
         } else {
@@ -210,6 +227,22 @@ impl SessionStore {
         self.current_project = id;
         self.save_index();
         meta
+    }
+
+    /// Repoint a project (and its chats) at another folder. Chats copy the
+    /// workspace when they are created, so they have to move too or they keep
+    /// running against the old, possibly missing, directory.
+    pub fn project_set_workspace(&mut self, id: &str, workspace: &str) -> bool {
+        let ws = absolute_workspace(workspace);
+        let Some(p) = self.projects.iter_mut().find(|p| p.id == id) else {
+            return false;
+        };
+        p.workspace = ws.clone();
+        for s in self.sessions.iter_mut().filter(|s| s.project == id) {
+            s.workspace = ws.clone();
+        }
+        self.save_index();
+        true
     }
 
     pub fn project_rename(&mut self, id: &str, name: &str) -> bool {

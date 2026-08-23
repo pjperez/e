@@ -9,6 +9,8 @@ export type Config = {
   temperature: number;
   system: string;
   workspace: string;
+  /** Auto-approve risky tools (shell, write_file) instead of prompting. */
+  yolo: boolean;
   models: string[];
   providers: ProviderItem[];
 };
@@ -44,7 +46,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 export async function getConfig(): Promise<Config> {
-  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", models: [], providers: [] };
+  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, models: [], providers: [] };
   return invoke<Config>("get_config");
 }
 
@@ -116,6 +118,16 @@ export async function projectRemove(id: string): Promise<boolean> {
 export async function renameProject(id: string, name: string): Promise<boolean> {
   if (!inTauri) return false;
   return invoke("rename_project", { id, name });
+}
+
+export async function setProjectWorkspace(id: string, workspace: string): Promise<boolean> {
+  if (!inTauri) return false;
+  return invoke("set_project_workspace", { id, workspace });
+}
+
+export async function pathIsDir(path: string): Promise<boolean> {
+  if (!inTauri) return true;
+  return invoke<boolean>("path_is_dir", { path }).catch(() => false);
 }
 
 export type SessionMetaItem = { id: string; name: string; created: number };

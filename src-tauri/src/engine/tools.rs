@@ -9,6 +9,34 @@ pub struct ToolContext {
     pub workspace: PathBuf,
 }
 
+impl ToolContext {
+    /// The directory tools actually operate in.
+    ///
+    /// A stored workspace can be empty, relative, or point at a folder that no
+    /// longer exists. Handing such a path to `Command::current_dir` fails with
+    /// an opaque OS error ("The directory name is invalid. (os error 267)"),
+    /// so resolve it up front and explain what to fix instead.
+    pub fn dir(&self) -> Result<PathBuf, String> {
+        let ws = self.workspace.as_path();
+        let abs = if ws.as_os_str().is_empty() {
+            std::env::current_dir().map_err(|e| format!("no working directory available: {e}"))?
+        } else if ws.is_absolute() {
+            ws.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| format!("no working directory available: {e}"))?
+                .join(ws)
+        };
+        if abs.is_dir() {
+            return Ok(abs);
+        }
+        Err(format!(
+            "workspace folder does not exist: {}. Pick an existing folder for this project (sidebar → + New project), or move the folder back.",
+            abs.display()
+        ))
+    }
+}
+
 pub type ToolResult = Result<String, String>;
 
 /// The extension point of `e`. Implement this trait and register the instance
@@ -194,7 +222,7 @@ impl Tool for ShellTool {
             return Err("empty command".to_string());
         }
         let (tx, rx) = mpsc::channel();
-        let cwd = ctx.workspace.clone();
+        let cwd = ctx.dir()?;
         std::thread::spawn(move || {
             let mut c = if cfg!(windows) {
                 let mut c = Command::new("cmd");
@@ -238,7 +266,7 @@ impl Tool for ShellTool {
 
 fn resolve(ctx: &ToolContext, path: &str) -> Result<PathBuf, String> {
     let p = std::path::Path::new(path);
-    Ok(if p.is_absolute() { p.to_path_buf() } else { ctx.workspace.join(p) })
+    Ok(if p.is_absolute() { p.to_path_buf() } else { ctx.dir()?.join(p) })
 }
 
 const MAX_FILE: u64 = 200_000;

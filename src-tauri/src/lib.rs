@@ -192,6 +192,18 @@ fn rename_project(state: tauri::State<AppState>, id: String, name: String) -> Re
 }
 
 #[tauri::command]
+fn set_project_workspace(state: tauri::State<AppState>, id: String, workspace: String) -> Result<bool, String> {
+    let mut st = state.store.lock().map_err(|_| "lock")?;
+    Ok(st.project_set_workspace(&id, &workspace))
+}
+
+/// Lets the UI warn about a missing project folder before a tool fails on it.
+#[tauri::command]
+fn path_is_dir(path: String) -> bool {
+    !path.trim().is_empty() && std::path::Path::new(path.trim()).is_dir()
+}
+
+#[tauri::command]
 fn switch_project(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
     let mut st = state.store.lock().map_err(|_| "lock")?;
     Ok(st.project_switch(&id))
@@ -700,6 +712,8 @@ pub fn run() {
             new_project,
             switch_project,
             rename_project,
+            set_project_workspace,
+            path_is_dir,
             approval_resolve,
             project_remove,
             workspace_snapshot,
