@@ -206,10 +206,15 @@ fn set_project_workspace(state: tauri::State<AppState>, id: String, workspace: S
     Ok(st.project_set_workspace(&id, &workspace))
 }
 
-/// Lets the UI warn about a missing project folder before a tool fails on it.
+/// Lets the UI warn about an unusable project folder before a tool fails on it.
+///
+/// A relative path counts as unusable even when it happens to resolve from
+/// here: the tools refuse it (see `ToolContext::dir`), so the sidebar has to
+/// flag it too rather than showing a folder that looks fine.
 #[tauri::command]
 fn path_is_dir(path: String) -> bool {
-    !path.trim().is_empty() && std::path::Path::new(path.trim()).is_dir()
+    let p = path.trim();
+    !p.is_empty() && std::path::Path::new(p).is_absolute() && std::path::Path::new(p).is_dir()
 }
 
 #[tauri::command]
