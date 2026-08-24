@@ -201,6 +201,9 @@ type Turn = {
   el: HTMLElement;
   body: HTMLElement;
   textEl: HTMLElement;
+  /** Whose turn this is. A user turn has `textEl === body`, so anything the
+   *  run appends to it is destroyed the moment its text is re-rendered. */
+  role: "user" | "assistant";
   raw: string;
   hasCaret: boolean;
   tools: Map<string, ToolBlock>;
@@ -210,6 +213,15 @@ type Turn = {
 
 let turns: Turn[] = [];
 const lastTurn = (): Turn | undefined => turns[turns.length - 1];
+
+/// The turn a run's own output belongs in. Never the user's bubble: a run that
+/// fails before the model says anything (a 429 on send, say) would otherwise
+/// hang its error card inside the message that triggered it, where the `done`
+/// re-render then wipes it — a failure that left nothing on screen at all.
+function outputTurn(): Turn {
+  const t = lastTurn();
+  return t && t.role === "assistant" ? t : addAssistantTurn();
+}
 
 /// A quiet divider standing in for history that was summarised away. The
 /// summary text itself is deliberately not shown — compaction is plumbing, not
@@ -230,7 +242,7 @@ function addUserTurn(text: string): void {
   body.textContent = text;
   attachTurnCopy(el, "message", () => text);
   conv.appendChild(el);
-  turns.push({ el, body, textEl: body, raw: text, hasCaret: false, tools: new Map() });
+  turns.push({ el, body, textEl: body, role: "user", raw: text, hasCaret: false, tools: new Map() });
   scrollBottom();
 }
 
@@ -241,7 +253,7 @@ function addAssistantTurn(): Turn {
   const body = el.querySelector(".body") as HTMLElement;
   const textEl = el.querySelector(".text") as HTMLElement;
   conv.appendChild(el);
-  const t: Turn = { el, body, textEl, raw: "", hasCaret: true, tools: new Map() };
+  const t: Turn = { el, body, textEl, role: "assistant", raw: "", hasCaret: true, tools: new Map() };
   attachTurnCopy(el, "reply", () => t.raw);
   turns.push(t);
   scrollBottom();
@@ -453,7 +465,10 @@ function explainError(raw: string): ErrInfo {
 
   let title = "Run failed";
   let hint = message || "";
-  if (/^workspace folder does not exist/i.test(raw)) {
+  if (/^no provider configured/i.test(raw)) {
+    title = "No provider yet";
+    hint = "Open Settings (⚙) to add an OpenAI-compatible provider — a base URL, and a key if it needs one — then pick a model from the title bar.";
+  } else if (/^workspace folder does not exist/i.test(raw)) {
     title = "Workspace folder is missing";
     hint = raw.replace(/^workspace folder does not exist:\s*/i, "Folder: ");
   } else if (/insufficient tool messages|must be followed by tool messages|tool_call_id/i.test(raw)) {
@@ -553,7 +568,7 @@ function setError(msg: string): void {
   hideActivity();
   // The card lives in the turn body, not in `textEl`: `done` re-renders the
   // text from `raw`, which would otherwise wipe the message a moment later.
-  const t = lastTurn() || addAssistantTurn();
+  const t = outputTurn();
   removeCaret(t);
   t.body.appendChild(errorCard(msg));
   if (currentSession) cur().running = false;
@@ -1107,7 +1122,7 @@ api.onEngineEvent((ev) => {
         break;
       case "message_end": {
         const t = lastTurn();
-        if (t) {
+        if (t && t.role === "assistant") {
           removeCaret(t);
           if (t.thinkEl) t.thinkEl.classList.remove("live");
           renderInto(t.textEl, t.raw);
@@ -1127,8 +1142,11 @@ api.onEngineEvent((ev) => {
         addSummaryCard(ev);
         break;
       case "done": {
+        // Only ever re-render an assistant turn: a user turn's text element
+        // *is* its body, so re-rendering one drops the error and summary cards
+        // a failed run just put there.
         const t = lastTurn();
-        if (t) {
+        if (t && t.role === "assistant") {
           removeCaret(t);
           renderInto(t.textEl, t.raw);
         }
@@ -1387,8 +1405,7 @@ input.addEventListener("paste", (e: ClipboardEvent) => {
 });
 
 function addSummaryCard(s: { steps: number; tools: number; stopped: boolean; error: string | null }): void {
-  const t = lastTurn();
-  if (!t) return;
+  const t = outputTurn();
   const bits: string[] = [`${s.steps} step${s.steps === 1 ? "" : "s"}`];
   if (s.tools) bits.push(`${s.tools} tool call${s.tools === 1 ? "" : "s"}`);
   const div = document.createElement("div");
@@ -1457,7 +1474,7 @@ function addStaticAssistant(content: string, reasoning = ""): Turn {
   const bodyEl = el.querySelector(".body") as HTMLElement;
   renderInto(textEl, content);
   conv.appendChild(el);
-  const t: Turn = { el, body: bodyEl, textEl, raw: content, hasCaret: false, tools: new Map() };
+  const t: Turn = { el, body: bodyEl, textEl, role: "assistant", raw: content, hasCaret: false, tools: new Map() };
   attachTurnCopy(el, "reply", () => t.raw);
   if (reasoning) {
     // Persisted thinking starts collapsed; live reasoning appends into it.

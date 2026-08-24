@@ -206,41 +206,20 @@ impl Config {
         let home = dirs::home_dir().unwrap_or_default().join(".e");
         let cfg_file = home.join("config.json");
         let mut base = Config {
-            base_url: "https://provider.example/v1".to_string(),
+            base_url: String::new(),
             api_key: String::new(),
-            model: "opencode-go/deepseek-v4-flash".to_string(),
+            model: String::new(),
             temperature: 0.7,
             system: "You are e, a fast, capable coding agent running in a local harness with a workspace and tools: shell (run commands), read_file, write_file, list_dir.\nTool use policy: use a tool ONLY when it genuinely helps (inspect/read files, run or verify commands, modify the workspace, or when the user asks you to act). For conversational or directly-answerable requests, answer directly yourself and NEVER make a tool call.".to_string(),
             workspace: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
             yolo: false,
             context_window: default_context_window(),
-            provider_id: "aigateway".into(),
-            providers: vec![ProviderItem {
-                id: "aigateway".into(),
-                name: "AI Gateway".into(),
-                base_url: "https://provider.example/v1".into(),
-                api_key: String::new(),
-                context_window: None,
-                model_meta: BTreeMap::new(),
-                enabled: true,
-                disabled_models: Vec::new(),
-                models: vec![
-                    "zai-coding/glm-5.2".into(),
-                    "openrouter/deepseek/deepseek-v4-flash-0731".into(),
-                    "opencode-go/deepseek-v4-flash".into(),
-                    "opencode-go/deepseek-v4-pro".into(),
-                    "openai/gpt-5.6-luna".into(),
-                    "command-code/inclusionai/ling-3.0-flash-free".into(),
-                ],
-            }],
-            models: vec![
-                "zai-coding/glm-5.2".into(),
-                "openrouter/deepseek/deepseek-v4-flash-0731".into(),
-                "opencode-go/deepseek-v4-flash".into(),
-                "opencode-go/deepseek-v4-pro".into(),
-                "openai/gpt-5.6-luna".into(),
-                "command-code/inclusionai/ling-3.0-flash-free".into(),
-            ],
+            // No provider ships with `e`: the first run sends you to Settings to
+            // add one. Baking in an endpoint would point every install at
+            // somebody else's account.
+            provider_id: String::new(),
+            providers: Vec::new(),
+            models: Vec::new(),
             disabled_plugins: Vec::new(),
         };
 
