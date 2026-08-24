@@ -6,9 +6,17 @@ use std::time::Duration;
 /// How many times a throttled or overloaded request is retried before the
 /// failure is surfaced. Retrying is only ever attempted *before* the first
 /// token has been streamed, so a retry can never duplicate visible output.
-const MAX_RETRIES: u32 = 3;
-/// First backoff step. Doubled on each subsequent attempt.
-const BACKOFF_BASE: Duration = Duration::from_secs(1);
+const MAX_RETRIES: u32 = BACKOFF_STEPS.len() as u32;
+/// What each successive wait is worth. A rate limit is usually a per-minute
+/// window, so the schedule escalates to straddle one rather than doubling from
+/// a value too small to outlast it: a quick retry catches a momentary spike,
+/// and the later steps wait the window out.
+const BACKOFF_STEPS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 /// Longest we are willing to sit on a retry. A provider asking for more than
 /// this via `Retry-After` isn't throttling us for a moment, it's shut for the
 /// hour — waiting it out silently would look like a hang, so we surface it.
@@ -174,9 +182,9 @@ impl ChatProvider {
     /// partial text produced so far is still returned.
     ///
     /// A throttled (429) or unavailable (5xx) provider is retried up to
-    /// [`MAX_RETRIES`] times with exponential backoff and jitter, and each wait
-    /// is announced through `on_retry` so the caller can tell the user what is
-    /// going on rather than showing a stall.
+    /// [`MAX_RETRIES`] times on an escalating schedule with jitter, and each
+    /// wait is announced through `on_retry` so the caller can tell the user
+    /// what is going on rather than showing a stall.
     pub async fn chat<F, G, H>(
         &self,
         msgs: &[Msg],
@@ -365,14 +373,14 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     Some(Duration::from_millis((secs * 1000.0) as u64))
 }
 
-/// Exponential backoff with equal jitter: half the window is fixed so waits
-/// still grow with each failure, half is random so several clients throttled at
-/// the same moment don't all come back in lockstep and re-trip the limit.
+/// The wait before `attempt`'s successor, taken from [`BACKOFF_STEPS`] with a
+/// little jitter added on top so several clients throttled at the same moment
+/// don't all come back on the same tick. The jitter only ever lengthens a wait,
+/// so each step is still at least the interval it advertises.
 fn backoff_delay(attempt: u32) -> Duration {
-    let steps = attempt.saturating_sub(1).min(6);
-    let window = BACKOFF_BASE.saturating_mul(1 << steps).min(BACKOFF_CAP);
-    let half = window / 2;
-    half + Duration::from_millis(jitter_ms(half.as_millis() as u64))
+    let idx = (attempt.saturating_sub(1) as usize).min(BACKOFF_STEPS.len() - 1);
+    let step = BACKOFF_STEPS[idx];
+    step + Duration::from_millis(jitter_ms(step.as_millis() as u64 / 10))
 }
 
 /// Cheap jitter in `0..=span_ms`. This only has to de-correlate retrying
@@ -641,19 +649,33 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_and_stays_inside_its_jittered_window() {
-        // Equal jitter: each wait is somewhere in [half, full] of the step, so
-        // waits still grow while no two clients land on the same instant.
-        for (attempt, step) in [(1u32, 1000u64), (2, 2000), (3, 4000)] {
+    fn backoff_follows_the_schedule_and_only_ever_rounds_up() {
+        // Jitter must never shorten a step: 1s has to mean at least 1s.
+        for (attempt, step) in [(1u32, 1000u64), (2, 15_000), (3, 30_000), (4, 60_000)] {
             let ms = backoff_delay(attempt).as_millis() as u64;
-            assert!(ms >= step / 2, "attempt {attempt} waited {ms}ms, under its floor");
-            assert!(ms <= step, "attempt {attempt} waited {ms}ms, over its ceiling");
+            assert!(ms >= step, "attempt {attempt} waited {ms}ms, under its advertised {step}ms");
+            assert!(ms <= step + step / 10, "attempt {attempt} waited {ms}ms, more than 10% over {step}ms");
         }
     }
 
     #[test]
-    fn backoff_never_exceeds_the_cap() {
-        assert!(backoff_delay(30) <= BACKOFF_CAP, "a runaway attempt count must not overflow into a huge wait");
+    fn backoff_saturates_at_the_last_step() {
+        // An attempt past the end of the table must reuse the final wait rather
+        // than index out of bounds. Compared against the schedule, not against
+        // a second sample: two calls jitter independently.
+        let step = BACKOFF_STEPS[BACKOFF_STEPS.len() - 1].as_millis() as u64;
+        let ms = backoff_delay(99).as_millis() as u64;
+        assert!(
+            ms >= step && ms <= step + step / 10,
+            "a runaway attempt count waited {ms}ms, off the final {step}ms step"
+        );
+    }
+
+    #[test]
+    fn every_scheduled_step_is_one_we_are_willing_to_wait() {
+        for step in BACKOFF_STEPS {
+            assert!(step <= BACKOFF_CAP, "{step:?} exceeds the wait we refuse from a provider");
+        }
     }
 
     #[test]

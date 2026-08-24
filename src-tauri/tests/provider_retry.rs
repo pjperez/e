@@ -94,7 +94,10 @@ fn recorder() -> (Arc<Mutex<Vec<Notice>>>, impl Fn(&RetryNotice) + Send + Sync) 
 
 #[tokio::test]
 async fn a_throttled_request_backs_off_and_then_succeeds() {
-    let (base, hits) = spawn_provider(vec![too_many(None), too_many(None), streamed("hi")]);
+    // One throttle only: the first scheduled wait is a second, and the later
+    // steps are minutes-scale by design, so the schedule itself is asserted in
+    // the unit tests rather than slept through here.
+    let (base, hits) = spawn_provider(vec![too_many(None), streamed("hi")]);
     let (log, on_retry) = recorder();
     let never = AtomicBool::new(false);
 
@@ -102,26 +105,21 @@ async fn a_throttled_request_backs_off_and_then_succeeds() {
     let got = provider(&base)
         .chat(&prompt(), &[], |_| {}, |_| {}, on_retry, &never)
         .await
-        .expect("the third attempt answers");
+        .expect("the second attempt answers");
 
     assert_eq!(got.text, "hi", "the retried request's own output is what comes back");
-    assert_eq!(hits.load(Ordering::SeqCst), 3, "two throttles should cost exactly two extra requests");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one throttle should cost exactly one extra request");
 
     let notices = log.lock().expect("lock").clone();
-    assert_eq!(notices.len(), 2, "the user has to be told about every wait, not just the first");
+    assert_eq!(notices.len(), 1, "the user has to be told about the wait");
     assert_eq!(notices[0].0, 1, "notices are 1-based on the attempt that failed");
-    assert_eq!(notices[1].0, 2);
-    assert_eq!(notices[0].1, 4, "three retries means four attempts in total");
+    assert_eq!(notices[0].1, 5, "four retries means five attempts in total");
     assert_eq!(notices[0].3, 429);
     assert_eq!(notices[0].4, "rate limited");
-
-    // Equal jitter: [half, full] of a doubling window, so waits grow but no two
-    // clients come back at the same instant.
-    assert!((500..=1000).contains(&notices[0].2), "first wait was {}ms", notices[0].2);
-    assert!((1000..=2000).contains(&notices[1].2), "second wait was {}ms", notices[1].2);
+    assert!((1000..=1100).contains(&notices[0].2), "first wait was {}ms, off schedule", notices[0].2);
 
     let waited = started.elapsed();
-    assert!(waited >= Duration::from_millis(1500), "backoff was announced but not actually served: {waited:?}");
+    assert!(waited >= Duration::from_millis(1000), "backoff was announced but not actually served: {waited:?}");
 }
 
 #[tokio::test]
@@ -136,10 +134,10 @@ async fn retries_run_out_and_the_error_says_so() {
         .await
         .expect_err("a provider that never lets up must surface the failure");
 
-    assert_eq!(hits.load(Ordering::SeqCst), 4, "one original attempt plus three retries, and no more");
-    assert_eq!(log.lock().expect("lock").len(), 3);
+    assert_eq!(hits.load(Ordering::SeqCst), 5, "one original attempt plus four retries, and no more");
+    assert_eq!(log.lock().expect("lock").len(), 4);
     assert!(err.contains("429"), "the status has to survive for the UI to explain it: {err}");
-    assert!(err.contains("after 3 retries"), "the error should own up to the retries: {err}");
+    assert!(err.contains("after 4 retries"), "the error should own up to the retries: {err}");
     assert!(err.contains("slow down"), "the provider's own words are still the most useful part: {err}");
 }
 
