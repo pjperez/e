@@ -43,8 +43,11 @@ easier to follow or safer to trust don't earn their bytes.
 - Any OpenAI-compatible provider, several at once, with automatic retry on
   rate limits.
 - Image input by pasting into the composer.
-- Skills (`SKILL.md`), TypeScript plugins, and MCP servers — all landing as
-  tools in one registry.
+- Skills (`SKILL.md`), plugins, and MCP servers — all landing as tools in one
+  registry, global or per project, reloadable without a restart.
+- Plugin capabilities enforced by the host, with a Settings → Extensions pane
+  showing what loaded, what it registered, and why anything failed.
+- Plugin guards: a `tool_call` listener can refuse a call before it runs.
 - `e-rpc`: the same engine headless over JSONL, embeddable in editors and
   scripts.
 

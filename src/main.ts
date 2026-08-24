@@ -738,7 +738,7 @@ async function expandAttachments(text: string): Promise<string> {
   return ctx;
 }
 
-const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/yolo [on|off]\` — auto-approve risky tools (shell, write_file)\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
+const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/extensions\` — plugins, skills and MCP servers\n- \`/reload\` — re-read extensions (no restart)\n- \`/yolo [on|off]\` — auto-approve risky tools (shell, write_file)\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
 
 /// Single source of truth for YOLO: the settings checkbox reads the same saved
 /// config, so the two controls cannot drift apart.
@@ -802,6 +802,13 @@ function runSlash(cmd: string): void {
     case "/settings":
       closePicker();
       void openSettings();
+      break;
+    case "/extensions":
+      closePicker();
+      void openSettings(true);
+      break;
+    case "/reload":
+      void reloadExtensions();
       break;
     case "/yolo":
       void toggleYolo(arg);
@@ -971,11 +978,7 @@ async function startRun(sid: string, text: string): Promise<void> {
 }
 
 api.onEngineEvent((ev) => {
-  pluginHandlers.forEach((h) => {
-    if (h.event === ev.type || h.event === "*") {
-      try { h.handler(ev); } catch (e) { console.error("plugin handler", e); }
-    }
-  });
+  dispatchToPlugins(ev);
 
   // Plugin tool calls carry a correlation id in `sid`, not a chat id.
   if (ev.type === "plugin_tool_call") {
@@ -994,6 +997,12 @@ api.onEngineEvent((ev) => {
         void api.pluginToolResult(ev.sid, false, String(e));
       }
     })();
+    return;
+  }
+
+  // A guard plugin gets to refuse a tool call before it runs.
+  if (ev.type === "plugin_veto_request") {
+    void answerVeto(ev);
     return;
   }
 
@@ -1848,6 +1857,8 @@ const BUILTIN_SLASH: SlashCmd[] = [
   { name: "/new", desc: "new conversation" },
   { name: "/model", desc: "switch model" },
   { name: "/settings", desc: "open settings" },
+  { name: "/extensions", desc: "plugins, skills and MCP servers" },
+  { name: "/reload", desc: "re-read plugins, skills and MCP servers" },
   { name: "/yolo", desc: "toggle auto-approval of risky tools" },
   { name: "/help", desc: "list commands" },
 ];
@@ -2066,6 +2077,12 @@ overlay.innerHTML = `
             <label class="lbl">Temperature</label><input id="cfg-temp" type="number" step="0.1" min="0" max="2"/>
       <label class="lbl">System prompt</label><textarea id="cfg-sys" rows="3"></textarea>
       <label class="lbl cfg-check"><input id="cfg-yolo" type="checkbox"/> YOLO mode — run shell &amp; write_file without asking</label>
+    </details>
+    <details class="field bhr" id="cfg-ext">
+      <summary>Extensions</summary>
+      <p class="note">Plugins, skills and MCP servers found in <code>~/.e/</code> and in this project's <code>.e/</code>. Changes apply on <b>Reload</b> — no restart.</p>
+      <div id="ext-body"></div>
+      <div class="prov-row"><button id="cfg-extreload" type="button">Reload extensions</button></div>
     </details>
     <p class="note">Stored in <code>~/.e/config.json</code>. &ldquo;Refresh&rdquo; fetches <code>&lt;base&gt;/models</code>.</p>
     <div class="modal-actions">
@@ -2383,7 +2400,7 @@ el<HTMLButtonElement>("#cfg-delprov").addEventListener("click", async () => {
   renderProviderList();
 });
 
-async function openSettings(): Promise<void> {
+async function openSettings(extensions = false): Promise<void> {
   const cfg = await api.getConfig();
   providers = cfg.providers || [];
   draft = providers.map((p) => ({
@@ -2404,7 +2421,161 @@ async function openSettings(): Promise<void> {
   el<HTMLTextAreaElement>("#cfg-sys").value = cfg.system;
   el<HTMLInputElement>("#cfg-yolo").checked = !!cfg.yolo;
   renderProviderList();
+  const ext = el<HTMLDetailsElement>("#cfg-ext");
+  ext.open = extensions;
+  void renderExtensions().then(() => {
+    if (extensions) ext.scrollIntoView({ block: "nearest" });
+  });
   overlay.classList.add("open");
+}
+
+/// Everything the app found on disk, in one place: what loaded, what did not,
+/// and why. A plugin that is broken or was refused a capability has to be
+/// visible here — that is the whole review surface.
+async function renderExtensions(): Promise<void> {
+  const body = el<HTMLElement>("#ext-body");
+  const ws = activeWorkspace();
+  const [skills, servers] = await Promise.all([
+    api.listSkills(ws || undefined).catch(() => [] as api.SkillMeta[]),
+    api.listMcpServers().catch(() => [] as api.McpStatus[]),
+  ]);
+  body.textContent = "";
+  const scope = document.createElement("p");
+  scope.className = "note";
+  scope.textContent = ws ? `This project: ${ws}` : "No project folder — global extensions only.";
+  body.appendChild(scope);
+
+  const section = (title: string, count: number, hint: string): HTMLElement => {
+    const wrap = document.createElement("div");
+    wrap.className = "ext-group";
+    const h = document.createElement("div");
+    h.className = "ext-head";
+    h.innerHTML = `<span>${title}</span><span class="prov-count">${count}</span>`;
+    wrap.appendChild(h);
+    if (!count) {
+      const p = document.createElement("p");
+      p.className = "note";
+      p.textContent = hint;
+      wrap.appendChild(p);
+    }
+    body.appendChild(wrap);
+    return wrap;
+  };
+
+  const chip = (text: string, cls = ""): HTMLElement => {
+    const s = document.createElement("span");
+    s.className = "ext-chip " + cls;
+    s.textContent = text;
+    return s;
+  };
+
+  const plugins = section("Plugins", pluginStatus.length, "Nothing in ~/.e/plugins yet — see docs/EXTENDING.md.");
+  for (const p of pluginStatus) {
+    const row = document.createElement("div");
+    row.className = "ext-row";
+    const top = document.createElement("div");
+    top.className = "ext-top";
+    // Only the box and the name toggle the plugin: a label wrapping the whole
+    // row would turn a click on a capability chip into "switch this off".
+    const toggle = document.createElement("label");
+    toggle.className = "ext-toggle";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = p.enabled;
+    box.addEventListener("change", () => {
+      void (async () => {
+        await api.setPluginEnabled(p.name, box.checked);
+        await loadPlugins();
+        await renderExtensions();
+      })();
+    });
+    const title = document.createElement("span");
+    title.className = "ext-name";
+    title.textContent = p.display + (p.version ? " " + p.version : "");
+    toggle.appendChild(box);
+    toggle.appendChild(title);
+    top.appendChild(toggle);
+    top.appendChild(chip(p.scope, "scope"));
+    for (const c of p.capabilities) top.appendChild(chip(c, "cap"));
+    if (p.tools.length) top.appendChild(chip(p.tools.length + (p.tools.length === 1 ? " tool" : " tools")));
+    if (p.commands.length) top.appendChild(chip(p.commands.join(" ")));
+    row.appendChild(top);
+
+    const detail = document.createElement("p");
+    detail.className = "note ext-note";
+    detail.textContent = p.description || p.dir;
+    row.appendChild(detail);
+
+    const problems = [p.failure, ...p.notes].filter(Boolean);
+    for (const problem of problems) {
+      const err = document.createElement("p");
+      err.className = "note ext-err";
+      err.textContent = problem;
+      row.appendChild(err);
+    }
+    if (!problems.length && p.enabled && !p.loaded) {
+      const err = document.createElement("p");
+      err.className = "note ext-err";
+      err.textContent = "not loaded yet — hit Reload extensions";
+      row.appendChild(err);
+    }
+    plugins.appendChild(row);
+  }
+
+  const skillGroup = section("Skills", skills.length, "Nothing in ~/.e/skills — a skill is a folder with a SKILL.md.");
+  for (const s of skills) {
+    const row = document.createElement("div");
+    row.className = "ext-row";
+    const top = document.createElement("div");
+    top.className = "ext-top";
+    const name = document.createElement("span");
+    name.className = "ext-name";
+    name.textContent = s.display;
+    top.appendChild(name);
+    top.appendChild(chip(s.scope, "scope"));
+    top.appendChild(chip(s.name, "cap"));
+    row.appendChild(top);
+    const detail = document.createElement("p");
+    detail.className = "note ext-note";
+    detail.textContent = s.description || s.path;
+    row.appendChild(detail);
+    skillGroup.appendChild(row);
+  }
+
+  const mcp = section("MCP servers", servers.length, "No ~/.e/mcp.json — add one to merge an MCP server's tools.");
+  for (const m of servers) {
+    const row = document.createElement("div");
+    row.className = "ext-row";
+    const top = document.createElement("div");
+    top.className = "ext-top";
+    const name = document.createElement("span");
+    name.className = "ext-name";
+    name.textContent = m.name;
+    top.appendChild(name);
+    top.appendChild(chip(m.scope, "scope"));
+    top.appendChild(chip(m.state, m.state === "error" ? "bad" : m.state === "ready" ? "ok" : ""));
+    if (m.tools.length) top.appendChild(chip(m.tools.length + (m.tools.length === 1 ? " tool" : " tools")));
+    row.appendChild(top);
+    const detail = document.createElement("p");
+    detail.className = "note ext-note";
+    detail.textContent = m.command;
+    row.appendChild(detail);
+    if (m.error) {
+      const err = document.createElement("p");
+      err.className = "note ext-err";
+      err.textContent = m.error;
+      row.appendChild(err);
+    }
+    mcp.appendChild(row);
+  }
+
+  // Servers start in the background, so a row that says "starting" is a
+  // promise to come back — otherwise Reload leaves the pane stuck on it.
+  if (servers.some((m) => m.state === "starting") && overlay.classList.contains("open")) {
+    setTimeout(() => {
+      if (overlay.classList.contains("open")) void renderExtensions();
+    }, 700);
+  }
 }
 
 function closeSettings(): void {
@@ -2443,6 +2614,12 @@ overlay.addEventListener("click", (e) => {
   if (e.target === overlay) closeSettings();
 });
 document.getElementById("btn-settings")!.addEventListener("click", () => void openSettings());
+overlay.querySelector("#cfg-extreload")!.addEventListener("click", () => {
+  void (async () => {
+    await reloadExtensions();
+    await renderExtensions();
+  })();
+});
 
 /// Pull the catalogue and the resolved selection back from the backend. It is
 /// the arbiter: turning a provider or model off can move the selection, and
@@ -2520,6 +2697,9 @@ async function init(): Promise<void> {
     updateChatTitle();
     updateChatBanner();
     applyChatUI();
+    // Plugins load once projects are known, so a project's own .e/plugins is
+    // in scope rather than only the global folder.
+    await loadPlugins();
   } catch (e) {
     statusWrap.classList.add("error");
     statusText.textContent = "unreachable";
@@ -2625,17 +2805,39 @@ function openRenameModal(id: string, name: string, workspace: string): void {
   rmInput.focus();
 }
 
-// ---------- plugins (P0/P1) ----------
+// ---------- plugins ----------
+// A plugin is a folder the user put in ~/.e/plugins (or <project>/.e/plugins):
+// a manifest and an ES module. The module runs here, in the webview, and only
+// ever sees the API its manifest asked for — a plugin that declares "events"
+// cannot quietly register a tool or reach the network.
 const pluginTools: api.PluginToolDef[] = [];
 const pluginReg = new Map<string, (args: Record<string, unknown>) => unknown>();
-const pluginHandlers: { event: string; handler: (ev: api.EngineEvents) => unknown }[] = [];
-const pluginCommands: Record<string, { run: () => void; desc: string }> = {};
+const pluginHandlers: { plugin: string; event: string; handler: (ev: api.EngineEvents) => unknown }[] = [];
+const pluginCommands: Record<string, { run: () => void; desc: string; plugin: string }> = {};
+
+/** What a plugin folder turned into: the manifest, plus what it did with it. */
+type PluginStatus = api.PluginInfo & {
+  loaded: boolean;
+  failure: string;
+  tools: string[];
+  commands: string[];
+  notes: string[];
+};
+let pluginStatus: PluginStatus[] = [];
+/// True while `loadPlugins` is running, so registrations made during the load
+/// are published once at the end instead of once each.
+let loadingPlugins = false;
 
 interface PluginAPIHost {
+  /** The plugin's own folder name. */
+  name: string;
   registerTool(def: api.PluginToolDef & { run: (args: Record<string, unknown>) => unknown }): void;
   on(event: string, handler: (ev: api.EngineEvents) => unknown): void;
   registerCommand(name: string, fn: () => void, desc?: string): void;
   ui: { notify: (msg: string, kind?: string) => void; confirm: (msg: string) => Promise<boolean> };
+  fetch: (input: string, init?: RequestInit) => Promise<Response>;
+  session: () => { id: string; name: string; workspace: string; model: string; provider: string } | null;
+  log: (...args: unknown[]) => void;
 }
 
 function notify(msg: string, kind = "info"): void {
@@ -2703,52 +2905,248 @@ api.onCloseRequested((running) => {
   })();
 });
 
-function buildPluginApi(): PluginAPIHost {
+function dispatchToPlugins(ev: api.EngineEvents): void {
+  // `tool_call` carries its arguments as a JSON string. Parsing it once here
+  // means every handler sees the same shape — including the veto path, which
+  // builds the same event — instead of each plugin re-parsing it.
+  const payload = ev.type === "tool_call" ? withParsedArgs(ev) : ev;
+  for (const h of pluginHandlers) {
+    if (h.event !== ev.type && h.event !== "*") continue;
+    try {
+      h.handler(payload);
+    } catch (e) {
+      console.error("plugin handler", h.plugin, e);
+    }
+  }
+}
+
+function withParsedArgs(ev: api.EngineEvents & { arguments?: string }): api.EngineEvents {
+  let args: Record<string, unknown> = {};
+  try { args = JSON.parse(ev.arguments || "{}"); } catch { /* leave empty */ }
+  return { ...ev, args } as api.EngineEvents;
+}
+
+/// Ask every `tool_call` handler whether this call may proceed. The engine
+/// waits five seconds at most, so a handler that hangs is treated as "allow"
+/// rather than being allowed to freeze the run.
+async function answerVeto(ev: { id: string; sid: string; tool: string; arguments: string }): Promise<void> {
+  const call = withParsedArgs({
+    type: "tool_call",
+    sid: ev.sid,
+    id: "",
+    name: ev.tool,
+    arguments: ev.arguments,
+  } as unknown as api.EngineEvents);
+  let reason: string | null = null;
+  for (const h of pluginHandlers) {
+    if (h.event !== "tool_call" && h.event !== "*") continue;
+    try {
+      const out = (await h.handler(call)) as { block?: boolean; reason?: string } | undefined;
+      if (out && out.block) {
+        reason = out.reason || `blocked by ${h.plugin}`;
+        break;
+      }
+    } catch (e) {
+      console.error("plugin veto handler", h.plugin, e);
+    }
+  }
+  await api.pluginVetoResult(ev.id, reason);
+}
+
+/// Provider APIs only accept `a-z A-Z 0-9 _ -` in a tool name, so the engine
+/// sanitises what it is given. The host applies the same rule *before*
+/// registering: otherwise the model would be told about `say_hi` while the
+/// plugin's handler was filed under `say hi`, and every call would miss.
+function toolName(raw: string): string {
+  const clean = raw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+  return clean || "tool";
+}
+
+/// Capabilities are a contract, not a suggestion: everything a plugin can
+/// reach is handed out here, and only if its manifest asked for it. A refusal
+/// is loud — a silently missing tool is the worst possible failure mode.
+function buildPluginApi(info: api.PluginInfo, status: PluginStatus): PluginAPIHost {
+  const has = (c: string): boolean => info.capabilities.includes(c);
+  const deny = (cap: string, what: string): void => {
+    const msg = `${info.name}: ${what} needs the "${cap}" capability — add it to plugin.json`;
+    status.notes.push(msg);
+    notify(msg, "error");
+  };
   return {
+    name: info.name,
     registerTool(def) {
-      pluginReg.set(def.name, def.run);
-      pluginTools.push({ name: def.name, description: def.description, parameters: def.parameters || { type: "object" } });
-      void api.setPluginTools(pluginTools);
+      if (!has("tools")) return deny("tools", `registerTool("${def.name}")`);
+      const name = toolName(def.name);
+      if (name !== def.name) {
+        status.notes.push(`tool "${def.name}" is exposed as "${name}" (a-z, 0-9, _ and - only)`);
+      }
+      pluginReg.set(name, def.run);
+      pluginTools.push({
+        name,
+        description: def.description,
+        parameters: def.parameters || { type: "object" },
+        plugin: info.name,
+      });
+      status.tools.push(name);
+      // A plugin may register late (after an await of its own). During the
+      // initial load one publish at the end covers everything; afterwards each
+      // registration has to reach the engine on its own.
+      if (!loadingPlugins) void publishPluginTools();
     },
     on(event, handler) {
-      pluginHandlers.push({ event, handler });
+      if (!has("events")) return deny("events", `on("${event}")`);
+      pluginHandlers.push({ plugin: info.name, event, handler });
+      // Same late-registration case as tools: the engine has to learn that
+      // someone is watching tool calls, or the guard would never be consulted.
+      if (!loadingPlugins && (event === "tool_call" || event === "*")) void api.setPluginVeto(true);
     },
     registerCommand(name, fn, desc) {
-      pluginCommands[name] = { run: fn, desc: desc || "plugin command" };
+      if (!has("commands")) return deny("commands", `registerCommand("${name}")`);
+      const cmd = name.startsWith("/") ? name : "/" + name;
+      if (BUILTIN_SLASH.some((c) => c.name === cmd)) {
+        const msg = `${info.name}: ${cmd} is a built-in command`;
+        status.notes.push(msg);
+        notify(msg, "error");
+        return;
+      }
+      pluginCommands[cmd] = { run: fn, desc: desc || "plugin command", plugin: info.name };
+      status.commands.push(cmd);
     },
-    ui: { notify, confirm: (msg: string) => confirmModal(msg, "Plugin") },
+    ui: {
+      notify: (msg, kind) => {
+        if (!has("ui")) return deny("ui", "ui.notify");
+        notify(`${info.display}: ${msg}`, kind);
+      },
+      confirm: async (msg) => {
+        if (!has("ui")) {
+          deny("ui", "ui.confirm");
+          return false;
+        }
+        return confirmModal(msg, info.display);
+      },
+    },
+    fetch: (input, init) => {
+      if (!has("network")) {
+        deny("network", "fetch");
+        return Promise.reject(new Error(`${info.name}: fetch needs the "network" capability`));
+      }
+      return fetch(input, init);
+    },
+    session: () => {
+      if (!has("session-read")) {
+        deny("session-read", "session()");
+        return null;
+      }
+      if (!currentSession) return null;
+      return {
+        id: currentSession,
+        name: sessionName(currentSession),
+        workspace: activeWorkspace(),
+        model: currentModel,
+        provider: currentProviderId,
+      };
+    },
+    log: (...args) => console.log(`[${info.name}]`, ...args),
   };
 }
 
-function loadPluginSource(source: string, apiObj: PluginAPIHost): void {
+/// Plugins are ES modules with a default export. They are loaded through a
+/// blob URL rather than `eval` so ordinary module syntax — helpers above the
+/// export, top-level constants — works the way the author wrote it.
+async function loadPluginModule(source: string): Promise<(host: PluginAPIHost) => unknown> {
+  const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
   try {
-    const body = source.replace(/^\s*export\s+default\s+/m, "");
-    const factory = (0, eval)("(" + body + ")");
-    if (typeof factory === "function") factory(apiObj);
-  } catch (e) {
-    console.error("plugin load error", e);
-    notify("Plugin failed to load", "error");
-  }
-}
-
-async function loadPlugins(): Promise<void> {
-  try {
-    const plugs = await api.listPlugins();
-    for (const p of plugs) {
-      try {
-        const g = await api.getPlugin(p.name);
-        loadPluginSource(g.source, buildPluginApi());
-      } catch (e) {
-        console.error("plugin", p.name, e);
-      }
+    const mod = (await import(/* @vite-ignore */ url)) as { default?: unknown };
+    if (typeof mod.default !== "function") {
+      throw new Error("no default export — a plugin is `export default function (e) { … }`");
     }
-    if (pluginTools.length) void api.setPluginTools(pluginTools);
-  } catch {
-    /* not running in tauri */
+    return mod.default as (host: PluginAPIHost) => unknown;
+  } finally {
+    URL.revokeObjectURL(url);
   }
 }
 
-void loadPlugins();
+function resetPluginRuntime(): void {
+  pluginTools.length = 0;
+  pluginReg.clear();
+  pluginHandlers.length = 0;
+  for (const k of Object.keys(pluginCommands)) delete pluginCommands[k];
+  pluginStatus = [];
+}
+
+/// Where the current chat actually runs. Project extensions live under this
+/// folder's `.e/`, so it has to be the same directory the tools use — the
+/// global default would point a project at someone else's plugins.
+function activeWorkspace(): string {
+  const chat = sessions.find((x) => x.id === currentSession);
+  if (chat && chat.detached && chat.workspace) return chat.workspace;
+  const p = projects.find((x) => x.id === currentProject);
+  return (p && p.workspace) || currentWs || "";
+}
+
+/// Discover, load and register every enabled plugin for the current project.
+/// Safe to call again: everything registered is dropped first, so a reload
+/// cannot leave a removed plugin's tools behind.
+async function loadPlugins(): Promise<void> {
+  if (!api.isTauri) return;
+  resetPluginRuntime();
+  loadingPlugins = true;
+  const ws = activeWorkspace();
+  let found: api.PluginInfo[] = [];
+  try {
+    found = await api.listPlugins(ws || undefined);
+  } catch (e) {
+    console.error("plugin discovery", e);
+    loadingPlugins = false;
+    return;
+  }
+  for (const info of found) {
+    const status: PluginStatus = { ...info, loaded: false, failure: info.error, tools: [], commands: [], notes: [] };
+    pluginStatus.push(status);
+    if (!info.enabled || info.error) continue;
+    try {
+      const g = await api.getPlugin(info.name, ws || undefined);
+      const factory = await loadPluginModule(g.source);
+      await factory(buildPluginApi(info, status));
+      status.loaded = true;
+    } catch (e) {
+      status.failure = String(e instanceof Error ? e.message : e);
+      console.error("plugin", info.name, e);
+      notify(`Plugin “${info.display}” failed to load`, "error");
+    }
+  }
+  loadingPlugins = false;
+  await publishPluginTools();
+  // The engine only pays for the veto hook when something is actually
+  // listening for tool calls.
+  await api.setPluginVeto(pluginHandlers.some((h) => h.event === "tool_call" || h.event === "*"));
+}
+
+async function publishPluginTools(): Promise<void> {
+  try {
+    const refused = await api.setPluginTools(pluginTools);
+    for (const r of refused) {
+      // Name the tool the engine dropped: the plugin looks fine from the
+      // outside, but the model would never see that tool.
+      const owner = pluginStatus.find((p) => r.startsWith(`'${p.name}'`));
+      if (owner) owner.notes.push(r);
+      notify(r, "error");
+    }
+  } catch (e) {
+    console.error("register plugin tools", e);
+  }
+}
+
+/// Re-read every extension surface: plugin folders, skills, MCP servers. This
+/// is deliberately explicit rather than automatic on project switch — MCP
+/// servers and plugin tools live in one registry shared by every chat, and
+/// pulling them out from under a run in flight would fail that run's tools.
+async function reloadExtensions(): Promise<void> {
+  const ws = activeWorkspace();
+  await api.reloadExtensions(ws || undefined);
+  await loadPlugins();
+  notify("Extensions reloaded");
+}
 // ---------- chat rename ----------
 const cr = document.createElement("div");
 cr.className = "overlay";

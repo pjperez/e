@@ -1,0 +1,7 @@
+{
+  "name": "Hello",
+  "version": "0.1.0",
+  "description": "A greeting tool, a /hi command and a tool-result listener — the whole plugin API in one file.",
+  "capabilities": ["tools", "commands", "events", "ui"],
+  "entry": "index.js"
+}

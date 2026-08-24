@@ -1,7 +1,23 @@
 # Extending e
 
-Four surfaces, in order of how often you'll reach for them: **tools**,
-**providers**, **skills**, and **plugins**.
+Five surfaces. Four of them are folders you drop somewhere and a reload away
+from running; only the first needs Rust.
+
+| surface | where | reload |
+|---------|-------|--------|
+| [Tools](#tools) | `engine/tools.rs` (Rust) | rebuild |
+| [Providers](#providers) | Settings (⚙) | live |
+| [Skills](#skills) | `~/.e/skills/<name>/SKILL.md` | live |
+| [Plugins](#plugins) | `~/.e/plugins/<name>/` | `/reload` |
+| [MCP](#mcp) | `~/.e/mcp.json` | `/reload` |
+
+Everything global (`~/.e/…`) has a project form (`<project>/.e/…`) that applies
+to that project only and shadows a global one of the same name. The project is
+the chat's own workspace, never wherever the app was launched from.
+
+**Settings (⚙) → Extensions** — or `/extensions` — lists everything the app
+found, what it registered, and why anything failed. Runnable starting points
+live in [`examples/`](../examples).
 
 ## Tools
 
@@ -16,6 +32,10 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;   // JSON Schema for `arguments`
     fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult;
+
+    // Optional: schema that depends on the project. `skills` uses it to list
+    // the skill packages this workspace actually has.
+    fn parameters_for(&self, ctx: &ToolContext) -> Value { self.parameters() }
 }
 ```
 
@@ -62,8 +82,8 @@ For a different *protocol*, implement a client returning
 
 ## Skills
 
-A skill is a folder with a `SKILL.md` — instructions injected only when
-relevant, so they cost nothing until used.
+A skill is a folder with a `SKILL.md` — instructions loaded only when the model
+asks for them, so they cost nothing until used.
 
 ```
 ~/.e/skills/<name>/SKILL.md          # global
@@ -71,30 +91,188 @@ relevant, so they cost nothing until used.
 <project>/.e/skills/<name>/SKILL.md  # project-local
 ```
 
-The front matter's `name` and `description` are listed to the model; the body is
-loaded when it calls the `skills` tool. See
-[`engine/skills.rs`](../src-tauri/src/engine/skills.rs).
+```markdown
+---
+name: Commit style
+description: How this project writes commit messages. Load before writing a commit.
+---
+
+# Commit style
+
+1. Read the staged diff before writing anything.
+…
+```
+
+The front matter's `name` and `description` are what the model sees: every
+skill the project can reach is enumerated in the `skills` tool's schema, so it
+can name one instead of guessing. Calling the tool returns the body, which is
+the only moment any of it enters the context.
+
+Skills are read fresh against the chat's own project on every request — edit a
+`SKILL.md` and the next message already has it. No reload. They are
+instructions a model may act on, not sandboxed code, so read one as you would
+read a pull request. See [`engine/skills.rs`](../src-tauri/src/engine/skills.rs).
 
 ## Plugins
 
-A plugin is a drop-in TypeScript folder that can contribute tools without
-touching Rust:
+A plugin is a folder with a manifest and one ES module, and it can contribute
+tools, slash commands, event listeners and guards without touching Rust.
 
 ```
-~/.e/plugins/<name>/            # global
-<project>/.e/plugins/<name>/    # project-local
+~/.e/plugins/hello/plugin.json       # global
+<project>/.e/plugins/hello/index.js  # project-local
 ```
 
-The manifest declares tools; calls are dispatched to the webview as
-`e:plugin_tool_call` and answered with `plugin_tool_result`. See
-[`engine/plugins.rs`](../src-tauri/src/engine/plugins.rs) and
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full model.
+```jsonc
+{
+  "name": "Hello",                 // display name; the folder name is the id
+  "version": "0.1.0",
+  "description": "What it does.",  // shown in Settings → Extensions
+  "capabilities": ["tools", "ui"], // everything it is allowed to touch
+  "entry": "index.js"              // optional, defaults to index.js
+}
+```
+
+```js
+export default function (e) {
+  e.registerTool({
+    name: "say_hi",
+    description: "Greet someone by name.",
+    parameters: { type: "object", properties: { name: { type: "string" } } },
+    async run(args) { return "hi " + (args.name || "there"); },
+  });
+}
+```
+
+### Capabilities
+
+The manifest is a request; the host hands out exactly what was asked for and
+nothing else. Calling something you did not declare fails loudly — a toast, and
+a line under the plugin in Settings → Extensions — instead of silently doing
+nothing.
+
+| capability | unlocks |
+|------------|---------|
+| `tools` | `e.registerTool` |
+| `commands` | `e.registerCommand` |
+| `events` | `e.on`, including the tool-call guard |
+| `ui` | `e.ui.notify`, `e.ui.confirm` |
+| `network` | `e.fetch` |
+| `session-read` | `e.session()` |
+
+An unknown capability stops the plugin loading, and the pane says which word it
+did not recognise — that way `"net"` never looks like a granted `"network"`.
+
+Capabilities bound the API; they are not a sandbox. A plugin is code you put in
+your own home directory and it runs in the app's WebView, so read it before you
+enable it. Untick one in Settings → Extensions and the choice persists
+(`disabled_plugins` in `~/.e/config.json`).
+
+### The `e` API
+
+```ts
+e.name                      // this plugin's folder name
+
+e.registerTool({ name, description, parameters, run })   // needs "tools"
+e.registerCommand("/name", fn, "description")            // needs "commands"
+e.on(event, handler)                                     // needs "events"
+e.ui.notify(message, kind?)                              // needs "ui"
+await e.ui.confirm(message) -> boolean                   // needs "ui"
+await e.fetch(url, init?) -> Response                    // needs "network"
+e.session() -> { id, name, workspace, model, provider }  // needs "session-read"
+e.log(...args)                                           // always
+```
+
+**Tools.** `parameters` is JSON Schema, sent to the model verbatim. `run(args)`
+may be async; return a string or anything JSON-serialisable, and throwing marks
+the call failed with the message handed to the model. A plugin tool may not
+shadow a built-in or another plugin's tool — the engine refuses it and says so
+rather than putting the same name in the schema twice. Calls have 180 seconds
+to answer.
+
+**Events.** The same stream the UI is built on; `e.on("*", …)` sees everything.
+
+| event | payload |
+|-------|---------|
+| `token` | `{ sid, text }` — streamed assistant text |
+| `reasoning` | `{ sid, text }` |
+| `tool_call` | `{ sid, id, name, arguments, args }` — `args` is `arguments` parsed |
+| `tool_result` | `{ sid, id, name, success, output }` |
+| `message_end` | `{ sid }` |
+| `activity` | `{ sid, phase, tool, step }` |
+| `retry` | `{ sid, attempt, max, delayMs, status, reason }` |
+| `summary` | `{ sid, steps, tools, stopped, tokensIn, tokensOut, contextTokens, cost, error }` |
+| `done` | `{ sid, stopped }` |
+| `error` | `{ sid, message }` |
+
+`sid` is the chat the event belongs to — a background chat streams while you
+look at another one, so use it rather than assuming "the current chat".
+
+**Guards.** A `tool_call` handler that returns `{ block: true, reason }` stops
+the call before it runs; the model is told why and carries on.
+
+```js
+e.on("tool_call", (ev) => {
+  if (ev.name === "shell" && /rm -rf \//.test(String(ev.args.command || ""))) {
+    return { block: true, reason: "refused: that would wipe the disk" };
+  }
+});
+```
+
+The engine waits five seconds at most and allows the call if no answer arrives,
+so a wedged guard cannot freeze a run. The check runs *before* the approval
+prompt, and only when at least one plugin is listening — with no listeners the
+hook costs nothing.
+
+**Loading.** The module is imported as a real ES module, so helpers, top-level
+constants and normal module syntax work; it needs a default export that is a
+function. A reload drops every tool, command and listener first, so removing a
+folder really removes its tools. Plugins run in the WebView, which is why they
+are the one surface `e --rpc` does not have. See
+[`engine/plugins.rs`](../src-tauri/src/engine/plugins.rs).
 
 ## MCP
 
 [`engine/mcp.rs`](../src-tauri/src/engine/mcp.rs) merges tools from external
-Model Context Protocol servers into the same registry, so they appear to the
-agent exactly like built-ins.
+[Model Context Protocol](https://modelcontextprotocol.io) servers into the same
+registry, so they reach the agent exactly like built-ins.
+
+```jsonc
+{
+  "servers": {
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "…" }
+    },
+    "parked": { "command": "npx", "args": ["-y", "some-server"], "disabled": true }
+  }
+}
+```
+
+| field | meaning |
+|-------|---------|
+| `command`, `args` | the process to run (stdio transport) |
+| `env` | extra environment variables for that process |
+| `cwd` | working directory; defaults to the project folder |
+| `disabled` / `enabled` | park a server without deleting its config |
+
+Tools arrive as `mcp_<server>_<tool>` — `files` + `read_file` becomes
+`mcp_files_read_file`. Servers start in parallel, so a slow one delays nothing
+else, and a request left unanswered for 60 seconds fails that tool call instead
+of hanging the run. Settings → Extensions shows each server's state, its tools,
+and the error if it did not start.
+
+Servers restart on reload, not on every project switch: they are shared by
+every chat, and pulling tools out from under a run in flight would fail it.
+Switch projects, then `/reload`.
+
+Servers are subprocesses with their own environment — they never inherit app
+state, and anything in `env` is a secret you are handing to that process.
 
 ## Headless
 
@@ -110,3 +288,21 @@ Commands are `send`, `reset` and `stop`. Events mirror the `Emitter` trait in
 `activity`, `retry`, `tool_call`, `tool_result`, `message_end`, `summary`,
 `done`, `error`. Anything you add to `Emitter` is available to the GUI and the
 RPC transport at once.
+
+MCP servers are started before the first command is answered, so headless runs
+have the same tools the GUI does.
+
+## Troubleshooting
+
+| symptom | cause |
+|---------|-------|
+| plugin missing from Settings | no `plugin.json`, or the folder is not directly under `plugins/` |
+| "unknown capability" | a typo in `capabilities`; the message lists the valid words |
+| "needs the … capability" | the plugin called something its manifest never asked for |
+| "no default export" | the entry file must `export default function (e) { … }` |
+| "already a built-in tool" | rename the tool; built-ins win |
+| tool never called | check the plugin's row in Settings → Extensions, then that the description says *when* to use it |
+| skill not offered | no `SKILL.md`, or no `description` in the front matter |
+| MCP server red | its error is on its row: usually the command is not on `PATH` |
+| changed a file, nothing happened | `/reload` (plugins, MCP). Skills need no reload |
+

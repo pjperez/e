@@ -57,6 +57,13 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> Value; // JSON Schema object for `arguments`
     fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult;
+
+    /// Schema for a specific workspace. Override when what the tool can do
+    /// depends on the project — `skills` lists the skill packages this project
+    /// actually has, so the model can name one instead of guessing.
+    fn parameters_for(&self, _ctx: &ToolContext) -> Value {
+        self.parameters()
+    }
 }
 
 /// Shared, internally synchronised tool table.
@@ -81,17 +88,36 @@ impl ToolRegistry {
         r
     }
 
-    pub fn set_plugin_tools(&self, defs: Vec<crate::engine::plugins::PluginToolDef>) {
-        let mapped = defs
-            .into_iter()
-            .map(|mut d| {
-                d.name = Self::sanitize_tool_name(&d.name);
-                d
-            })
-            .collect();
-        if let Ok(mut p) = self.plugin_tools.lock() {
-            *p = mapped;
+    /// Replace the plugin tool table, returning what had to be refused.
+    ///
+    /// A plugin tool that shadows a real one is dropped rather than accepted:
+    /// the schema sent to the model must not contain the same function name
+    /// twice, and the built-in would win at call time anyway, so the plugin's
+    /// version would look registered while never running.
+    pub fn set_plugin_tools(&self, defs: Vec<crate::engine::plugins::PluginToolDef>) -> Vec<String> {
+        let mut kept: Vec<crate::engine::plugins::PluginToolDef> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for mut d in defs {
+            let raw = d.name.clone();
+            d.name = Self::sanitize_tool_name(&d.name);
+            let owner = if d.plugin.is_empty() { "a plugin".to_string() } else { format!("'{}'", d.plugin) };
+            if self.get(&d.name).is_some() {
+                refused.push(format!("{owner}: tool '{}' is already a built-in tool", d.name));
+                continue;
+            }
+            if kept.iter().any(|k| k.name == d.name) {
+                refused.push(format!("{owner}: tool '{}' is registered twice", d.name));
+                continue;
+            }
+            if raw != d.name {
+                refused.push(format!("{owner}: tool '{raw}' was renamed to '{}' (a-z, 0-9, _ and - only)", d.name));
+            }
+            kept.push(d);
         }
+        if let Ok(mut p) = self.plugin_tools.lock() {
+            *p = kept;
+        }
+        refused
     }
 
     pub fn register(&self, t: impl Tool + 'static) {
@@ -118,6 +144,15 @@ impl ToolRegistry {
         }
     }
 
+    /// Drop every tool whose name starts with `prefix`. Reloading MCP servers
+    /// has to retire the previous generation of `mcp:<server>/…` tools, or a
+    /// server that went away would keep answering from a dead process.
+    pub fn unregister_prefix(&self, prefix: &str) {
+        if let Ok(mut map) = self.tools.lock() {
+            map.retain(|name, _| !name.starts_with(prefix));
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.lock().ok()?.get(name).cloned()
     }
@@ -133,7 +168,7 @@ impl ToolRegistry {
     }
 
     /// OpenAI `tools` schema describing every registered tool with its params.
-    pub fn openai_schema(&self) -> Vec<Value> {
+    pub fn openai_schema(&self, ctx: &ToolContext) -> Vec<Value> {
         let entries: Vec<(String, Arc<dyn Tool>)> = self
             .tools
             .lock()
@@ -142,7 +177,7 @@ impl ToolRegistry {
         let mut schema: Vec<Value> = entries
             .iter()
             .map(|(name, t)| {
-                let params = t.parameters();
+                let params = t.parameters_for(ctx);
                 let mut s = json!({
                     "type": "function",
                     "function": {
@@ -379,7 +414,7 @@ impl Tool for SkillsTool {
         "skills"
     }
     fn description(&self) -> &str {
-        "Load a skill package (SKILL.md: workflow, setup instructions, reference docs) by name and return its contents. Skills teach specialised workflows on demand."
+        "Load a skill package (SKILL.md: workflow, setup instructions, reference docs) by name and return its contents. Skills teach specialised workflows on demand — load one before doing the work it describes."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -390,14 +425,49 @@ impl Tool for SkillsTool {
             "required": ["name"]
         })
     }
-    fn run(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
+    /// The model cannot ask for a skill it has never heard of, so the schema
+    /// carries the catalogue: every skill this project can see, with the
+    /// description its author wrote.
+    fn parameters_for(&self, ctx: &ToolContext) -> Value {
+        let skills = crate::engine::skills::SkillStore::for_workspace(&ctx.workspace.to_string_lossy()).list();
+        if skills.is_empty() {
+            return self.parameters();
+        }
+        let listing = skills
+            .iter()
+            .map(|s| {
+                if s.description.is_empty() {
+                    s.name.clone()
+                } else {
+                    format!("{} — {}", s.name, s.description)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "enum": skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                    "description": format!("Skill to load. Available: {listing}")
+                }
+            },
+            "required": ["name"]
+        })
+    }
+    fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         let name = args.get("name").and_then(|x| x.as_str()).ok_or("missing 'name'")?;
-        let store = crate::engine::skills::SkillStore::new();
+        let store = crate::engine::skills::SkillStore::for_workspace(&ctx.workspace.to_string_lossy());
         match store.get(name) {
             Some(t) => Ok(t),
             None => {
-                let avail = store.list().iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
-                Err(format!("skill '{name}' not found. Available: {avail}"))
+                let avail = store.list().iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(", ");
+                if avail.is_empty() {
+                    Err(format!("skill '{name}' not found: no skills are installed. Add one at ~/.e/skills/<name>/SKILL.md"))
+                } else {
+                    Err(format!("skill '{name}' not found. Available: {avail}"))
+                }
             }
         }
     }
@@ -414,25 +484,14 @@ pub fn run_tool(reg: &ToolRegistry, ctx: &ToolContext, name: &str, args: Value) 
         };
     }
     if reg.has_plugin_tool(name) {
-        let sid = format!(
-            "pt{}_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0),
-            PLUGIN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        return match crate::engine::plugins::request(&sid, name, args) {
+        return match crate::engine::plugins::request(name, args) {
             Ok(o) => (true, o),
             Err(e) => (false, e),
         };
     }
-    (false, format!("unknown tool: {name}"))
+    let known = reg.names().join(", ");
+    (false, format!("unknown tool: {name}. Available: {known}"))
 }
-
-/// Millisecond timestamps collide when two plugin tools are called in the same
-/// tick, which used to make one call steal the other's reply.
-static PLUGIN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -466,5 +525,71 @@ mod tests {
     #[test]
     fn an_empty_workspace_is_refused_rather_than_using_the_launch_dir() {
         assert!(ctx("").dir().is_err());
+    }
+
+    fn plugin_tool(plugin: &str, name: &str) -> crate::engine::plugins::PluginToolDef {
+        crate::engine::plugins::PluginToolDef {
+            name: name.to_string(),
+            description: "test".to_string(),
+            parameters: json!({ "type": "object" }),
+            plugin: plugin.to_string(),
+        }
+    }
+
+    /// The tools array sent to the provider must not contain a name twice, and
+    /// a built-in would win at call time regardless — so the plugin's copy is
+    /// refused loudly instead of looking registered and never running.
+    #[test]
+    fn a_plugin_tool_cannot_shadow_a_built_in() {
+        let reg = ToolRegistry::new();
+        let refused = reg.set_plugin_tools(vec![plugin_tool("sneaky", "shell"), plugin_tool("ok", "say_hi")]);
+
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("shell"), "{refused:?}");
+        assert!(!reg.has_plugin_tool("shell"));
+        assert!(reg.has_plugin_tool("say_hi"));
+
+        let names: Vec<String> = reg
+            .openai_schema(&ctx("/tmp"))
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        let shells = names.iter().filter(|n| *n == "shell").count();
+        assert_eq!(shells, 1, "duplicate tool name in schema: {names:?}");
+    }
+
+    #[test]
+    fn two_plugins_registering_the_same_tool_keep_only_the_first() {
+        let reg = ToolRegistry::new();
+        let refused = reg.set_plugin_tools(vec![plugin_tool("a", "dup"), plugin_tool("b", "dup")]);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("'b'"), "{refused:?}");
+    }
+
+    /// MCP reload retires the previous generation of tools; leaving them
+    /// registered would keep routing calls into a dead subprocess.
+    #[test]
+    fn tools_can_be_retired_by_prefix() {
+        struct Fake;
+        impl Tool for Fake {
+            fn name(&self) -> &str {
+                "mcp:files/read"
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn parameters(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            fn run(&self, _ctx: &ToolContext, _args: Value) -> ToolResult {
+                Ok(String::new())
+            }
+        }
+        let reg = ToolRegistry::new();
+        reg.register(Fake);
+        assert!(reg.names().iter().any(|n| n.starts_with("mcp_")));
+        reg.unregister_prefix("mcp_");
+        assert!(!reg.names().iter().any(|n| n.starts_with("mcp_")));
+        assert!(reg.get("shell").is_some(), "built-ins must survive");
     }
 }

@@ -41,7 +41,8 @@ frontend. No Electron, no framework — the whole renderer is ~20 KB.
 - **Streaming everything.** Tokens, reasoning, tool cards, and live token and
   cost counters as the run happens.
 - **Extensible.** Add a tool by implementing one trait — see
-  [Add a tool](#add-a-tool) below.
+  [Add a tool](#add-a-tool) — or drop a folder in `~/.e/` for a plugin, a skill
+  or an MCP server, no rebuild. See [Extensions](#extensions).
 - **Yours.** Keys and settings live in `~/.e/config.json`, never in the repo.
 
 ## Install
@@ -149,12 +150,51 @@ Two things worth knowing:
 - `run()` is synchronous and runs on a worker thread. For anything long-running,
   apply your own timeout (the `shell` tool uses `mpsc::recv_timeout`).
 
+## Extensions
+
+Three drop-in folders, no rebuild and no restart — `/reload`, or Settings (⚙) →
+Extensions → **Reload extensions**:
+
+```
+~/.e/plugins/<name>/plugin.json + index.js   tools, /commands, event guards
+~/.e/skills/<name>/SKILL.md                  prompt packages, loaded on demand
+~/.e/mcp.json                                MCP servers; their tools merge in
+```
+
+Each has a project form — `<project>/.e/plugins`, `.e/skills`, `.e/mcp.json` —
+that applies to that project only and shadows a global one of the same name.
+
+```js
+// ~/.e/plugins/hello/index.js
+export default function (e) {
+  e.registerTool({
+    name: "say_hi",
+    description: "Greet someone by name.",
+    parameters: { type: "object", properties: { name: { type: "string" } } },
+    async run(args) { return "hi " + (args.name || "there"); },
+  });
+}
+```
+
+A plugin declares what it may touch — `tools`, `commands`, `events`, `ui`,
+`network`, `session-read` — and gets exactly that; anything it did not declare
+is refused out loud. A plugin listening for `tool_call` can also refuse a call
+before it runs, which is how a guard stops `git push --force` reaching the
+shell.
+
+**Settings (⚙) → Extensions**, or `/extensions`, lists everything found: scope,
+capabilities, the tools and commands each plugin registered, MCP server state,
+and why anything failed. Untick a plugin to keep it off for good.
+
+Copy-paste starting points are in [`examples/`](examples); the full reference is
+[EXTENDING.md](docs/EXTENDING.md).
+
 ## Documentation
 
 | doc | what's in it |
 |-----|--------------|
-| [EXTENDING.md](docs/EXTENDING.md) | adding tools, providers, skills, plugins; the headless RPC binary |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the core and its four extension surfaces fit together |
+| [EXTENDING.md](docs/EXTENDING.md) | adding tools, providers, skills, plugins, MCP servers; the headless RPC binary |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the core and its extension surfaces fit together |
 | [DESIGN.md](docs/DESIGN.md) | design tokens, themes, layout and typography |
 | [ROADMAP.md](docs/ROADMAP.md) | what's shipped, what's planned, what's deliberately out of scope |
 
@@ -178,17 +218,19 @@ requesting tools.
 src-tauri/src/
   main.rs            desktop entry point
   lib.rs             Tauri app, commands, event bridge
+  bin/e-rpc.rs       the same engine, headless over JSONL
   engine/
     mod.rs           message/tool-call model + Emitter trait
     provider.rs      OpenAI-compatible streaming client
     tools.rs         Tool trait, registry, built-in tools
     agent.rs         config + the agent loop
     sessions.rs      chats, projects, persistence
+    approval.rs      human approval for risky tools
     skills.rs        SKILL.md discovery
     mcp.rs           MCP client
-    plugins.rs       drop-in TypeScript plugins
+    plugins.rs       plugin discovery + the bridge to the host
 src/
-  main.ts            UI controller
+  main.ts            UI controller + plugin host
   api.ts             typed bridge to the Rust backend
   markdown.ts        tiny XSS-safe markdown renderer
   copy.ts            copy-to-clipboard buttons
@@ -236,7 +278,8 @@ only if you want to.
       "models": ["qwen3-coder:30b"],
       "disabled_models": []
     }
-  ]
+  ],
+  "disabled_plugins": ["noisy-plugin"]  // unticked in Settings → Extensions
 }
 ```
 

@@ -1,0 +1,7 @@
+{
+  "name": "Git guard",
+  "version": "0.1.0",
+  "description": "Blocks destructive git commands before they run.",
+  "capabilities": ["events"],
+  "entry": "index.js"
+}
