@@ -42,8 +42,10 @@ removing a folder removes the extension.
 does. If it exists on the `Emitter` trait in `engine/mod.rs`, a plugin can
 listen to it.
 
-**Capabilities, not trust.** Extensions are third-party code. A plugin declares
-what it needs, and anything beyond observing events is opt-in.
+**Capabilities are declared, not enforced.** A plugin manifest lists the
+capabilities it wants, and those are visible before you run anything — but
+nothing currently stops a plugin from doing more. Treat a plugin as code you
+have chosen to run.
 
 **Loaded on demand.** A skill's `SKILL.md` is read when the model asks for it; a
 plugin module loads on first use. Startup cost stays near zero.
@@ -129,10 +131,12 @@ in editors, scripts, and other agents. See [EXTENDING.md](EXTENDING.md#headless)
 
 ## Security
 
-- **Plugins are folders, not binaries.** Name, version, capabilities and the
-  module source are all reviewable before anything is enabled.
-- **Capabilities default to deny.** A plugin that asked for `events` does not
-  quietly gain network or write access.
+- **Plugins are folders, not binaries.** The manifest — name, version, requested
+  capabilities — and the module source are all plain files you can read before
+  running anything.
+- **Requested capabilities are informational today.** They are declared in the
+  manifest and can be inspected, but they are not yet enforced at runtime, so a
+  plugin is only as trustworthy as its source.
 - **Skills are instructions the model may act on.** They are prompt content, not
   sandboxed code, and deserve the same review as any prompt you would paste in.
 - **Risky tools are gated.** `shell` and `write_file` require explicit approval
