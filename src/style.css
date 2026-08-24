@@ -172,7 +172,11 @@ main#conversation::-webkit-scrollbar-thumb:hover { background: #2a303c; }
 }
 .body.assistant pre {
   background: var(--code-bg); border: 1px solid var(--edge);
-  border-radius: 10px; padding: 14px 16px; overflow-x: auto; margin: 0 0 18px;
+  border-radius: 10px; padding: 14px 16px; margin: 0 0 18px;
+  /* Wrap rather than scroll: a sideways scrollbar hides code and costs a
+     gesture to read. `overflow-x` stays as a last resort for the rare token
+     that genuinely cannot break. */
+  white-space: pre-wrap; word-break: break-word; overflow-x: auto;
 }
 .body.assistant pre code {
   font-family: var(--mono); font-size: 1em; line-height: 1.6; color: var(--text);
@@ -818,11 +822,31 @@ html[data-theme="light"] .empty-mark {
   border-right-width: 1px;
   box-shadow: 4px 0 26px rgba(255, 45, 149, 0.14);
 }
-.sess-item.proj-folder .sess-act {
+/* ---------- sidebar row actions + overflow menu ---------- */
+.sess-item .sess-act {
   opacity: 0;
   transition: opacity 0.12s;
 }
-.sess-item.proj-folder:hover .sess-act { opacity: 1; }
+.sess-item:hover .sess-act,
+.sess-item.menu-open .sess-act,
+.sess-item .sess-act:focus-visible { opacity: 1; }
+.sess-act.add, .sess-act.more { font-size: 15px; line-height: 1; }
+.sess-item.menu-open .sess-act.more { background: var(--edge); color: var(--text); }
+
+.row-menu {
+  position: fixed; z-index: 95; min-width: 148px; padding: 4px;
+  display: flex; flex-direction: column;
+  background: var(--bg-2); border: 1px solid var(--edge-2); border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+.row-menu-item {
+  appearance: none; background: transparent; border: none; text-align: left;
+  padding: 7px 10px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font); font-size: 12.5px; color: var(--text-dim);
+}
+.row-menu-item:hover { background: var(--bg-3); color: var(--text); }
+.row-menu-item.danger { color: var(--err); }
+.row-menu-item.danger:hover { background: rgba(248, 113, 113, 0.12); }
 
 /* ============ thinking block (redesigned) ============ */
 .think {
@@ -1206,3 +1230,57 @@ footer#composer-wrap {
 /* Waiting on a human, not on the model: no spinner. */
 #activity.awaiting .act-spinner { display: none; }
 #activity.awaiting { border-color: var(--warn); }
+
+/* ---------- copy affordances ----------
+   Present on hover, absent otherwise: the transcript stays clean to read, and
+   the button is exactly where the pointer already is when you want it. */
+.copy-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  flex: none;
+  background: var(--bg-2);
+  border: 1px solid var(--edge);
+  border-radius: 7px;
+  padding: 2px 8px;
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.copy-glyph { flex: none; vertical-align: -2px; }
+.copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+.copy-btn.copied { color: var(--accent-2); border-color: var(--accent-2); }
+.copy-btn.copy-failed { color: var(--err); border-color: var(--err); }
+/* A finished copy stays legible even once the pointer has moved on. */
+.copy-btn.copied, .copy-btn.copy-failed { opacity: 1; }
+.copy-btn:focus-visible {
+  opacity: 1; outline: 1px solid var(--accent); outline-offset: 1px;
+}
+
+/* Message-level copy rides in the role row, clear of the text itself. */
+.turn .role { display: flex; align-items: center; gap: 10px; }
+.turn .role .copy-btn { margin-left: auto; }
+.turn:hover .role .copy-btn, .turn:focus-within .role .copy-btn { opacity: 1; }
+
+/* Code blocks: the wrapper (not the <pre>) anchors the button, so it holds its
+   corner while the block itself stays free of overlay. */
+.codeblock { position: relative; margin: 0 0 18px; }
+.body.assistant .codeblock pre { margin: 0; }
+.codeblock > .copy-btn { position: absolute; top: 8px; right: 8px; }
+.codeblock:hover > .copy-btn { opacity: 1; }
+/* Reserve the button's corner so a long first line wraps around it instead of
+   disappearing underneath. A float costs only the first line, and reserving it
+   permanently means hovering never reflows the code. */
+.codeblock pre code::before {
+  content: ""; float: right; width: 74px; height: 1.7em;
+}
+
+.tool-copy .copy-glyph, .errcard-copy .copy-glyph { margin-right: 4px; }
+.tool-copy.copied, .errcard-copy.copied { color: var(--accent-2); }
+.tool-copy.copy-failed, .errcard-copy.copy-failed { color: var(--err); }
+
+/* No hover to reveal on a touch screen. */
+@media (hover: none) {
+  .copy-btn { opacity: 1; }
+}

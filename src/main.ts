@@ -1,5 +1,6 @@
 // e — UI controller.
 import { renderMarkdown } from "./markdown";
+import { attachTurnCopy, decorateCodeBlocks, wireCopy } from "./copy";
 import * as api from "./api";
 import type { Config, ProviderItem } from "./api";
 
@@ -153,6 +154,13 @@ function clampOut(out: string, max = 6000): string {
   return out.slice(0, max) + `\n… (truncated ${out.length - max} chars)`;
 }
 
+/// Markdown and its copy buttons always go up together — a bare `innerHTML =
+/// renderMarkdown(...)` would drop the buttons on the floor.
+function renderInto(el: HTMLElement, md: string): void {
+  el.innerHTML = renderMarkdown(md);
+  decorateCodeBlocks(el);
+}
+
 // ---------- conversation rendering ----------
 type ToolBlock = { el: HTMLElement; stateEl: HTMLElement; outputEl: HTMLElement };
 type Turn = {
@@ -186,6 +194,7 @@ function addUserTurn(text: string): void {
   el.innerHTML = `<div class="role">you</div><div class="body user"></div>`;
   const body = el.querySelector(".body") as HTMLElement;
   body.textContent = text;
+  attachTurnCopy(el, "message", () => text);
   conv.appendChild(el);
   turns.push({ el, body, textEl: body, raw: text, hasCaret: false, tools: new Map() });
   scrollBottom();
@@ -199,6 +208,7 @@ function addAssistantTurn(): Turn {
   const textEl = el.querySelector(".text") as HTMLElement;
   conv.appendChild(el);
   const t: Turn = { el, body, textEl, raw: "", hasCaret: true, tools: new Map() };
+  attachTurnCopy(el, "reply", () => t.raw);
   turns.push(t);
   scrollBottom();
   return t;
@@ -312,9 +322,7 @@ function resolveTool(id: string, success: boolean, output: string): void {
       b.el.classList.add(success ? "ok" : "err");
       b.stateEl.textContent = success ? "done" : "error";
       const copyBtn = b.el.querySelector(".tool-copy") as HTMLButtonElement;
-      copyBtn.addEventListener("click", () => {
-        void navigator.clipboard.writeText(output).then(() => notify("Copied to clipboard"));
-      });
+      wireCopy(copyBtn, () => output);
       const inTxt = ((b.el.querySelector(".in") as HTMLElement).textContent || "");
       const diffy = output.split("\n").filter((l) => /^[+-]/.test(l)).length > 3;
       if (diffy || /^(git (diff|apply))/.test(inTxt.trim())) {
@@ -494,12 +502,7 @@ function errorCard(raw: string): HTMLElement {
   const copy = document.createElement("button");
   copy.className = "errcard-copy";
   copy.textContent = "copy";
-  copy.addEventListener("click", () => {
-    void navigator.clipboard.writeText(info.raw).then(
-      () => { copy.textContent = "copied"; setTimeout(() => (copy.textContent = "copy"), 1400); },
-      () => notify("Copy failed", "error"),
-    );
-  });
+  wireCopy(copy, () => info.raw);
   det.append(sum, pre, copy);
   el.appendChild(det);
   return el;
@@ -703,7 +706,8 @@ function runSlash(cmd: string): void {
   const show = (md: string) => {
     const t = addAssistantTurn();
     removeCaret(t);
-    t.textEl.innerHTML = renderMarkdown(md);
+    t.raw = md;
+    renderInto(t.textEl, md);
   };
   switch (c) {
     case "/new":
@@ -1026,7 +1030,7 @@ api.onEngineEvent((ev) => {
         if (t) {
           removeCaret(t);
           if (t.thinkEl) t.thinkEl.classList.remove("live");
-          t.textEl.innerHTML = renderMarkdown(t.raw);
+          renderInto(t.textEl, t.raw);
         }
         break;
       }
@@ -1045,7 +1049,7 @@ api.onEngineEvent((ev) => {
         const t = lastTurn();
         if (t) {
           removeCaret(t);
-          t.textEl.innerHTML = renderMarkdown(t.raw);
+          renderInto(t.textEl, t.raw);
         }
         applyChatUI();
         break;
@@ -1283,9 +1287,10 @@ function addStaticAssistant(content: string, reasoning = ""): Turn {
   el.innerHTML = `<div class="role">e</div><div class="body assistant"><div class="text"></div></div>`;
   const textEl = el.querySelector(".text") as HTMLElement;
   const bodyEl = el.querySelector(".body") as HTMLElement;
-  textEl.innerHTML = renderMarkdown(content);
+  renderInto(textEl, content);
   conv.appendChild(el);
   const t: Turn = { el, body: bodyEl, textEl, raw: content, hasCaret: false, tools: new Map() };
+  attachTurnCopy(el, "reply", () => t.raw);
   if (reasoning) {
     // Persisted thinking starts collapsed; live reasoning appends into it.
     thinkBody(t).textContent = reasoning;
@@ -1334,7 +1339,66 @@ function renderHistory(messages: { role: string; content: string; reasoning?: st
   scrollBottom();
 }
 
+/// Row overflow menu (the `⋯` on projects and chats). Lives in `body` because
+/// the sidebar's list scrolls with `overflow` set, which would clip a menu
+/// anchored inside a row.
+type RowMenuItem = { label: string; danger?: boolean; run: () => void };
+let rowMenu: HTMLElement | null = null;
+let rowMenuOwner: HTMLElement | null = null;
+
+function closeRowMenu(): void {
+  rowMenu?.remove();
+  rowMenu = null;
+  rowMenuOwner?.classList.remove("menu-open");
+  rowMenuOwner = null;
+}
+
+function openRowMenu(anchor: HTMLElement, owner: HTMLElement, items: RowMenuItem[]): void {
+  closeRowMenu();
+  const menu = document.createElement("div");
+  menu.className = "row-menu";
+  for (const it of items) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "row-menu-item" + (it.danger ? " danger" : "");
+    b.textContent = it.label;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeRowMenu();
+      it.run();
+    });
+    menu.appendChild(b);
+  }
+  document.body.appendChild(menu);
+  rowMenu = menu;
+  rowMenuOwner = owner;
+  owner.classList.add("menu-open");
+  // Right-align under the button, then flip up / pull inside the viewport so a
+  // row near the bottom of the list doesn't push the menu off screen.
+  const r = anchor.getBoundingClientRect();
+  const w = menu.offsetWidth;
+  const h = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8)) + "px";
+  menu.style.top = (r.bottom + 4 + h > window.innerHeight ? Math.max(8, r.top - 4 - h) : r.bottom + 4) + "px";
+}
+
+document.addEventListener("click", (e) => {
+  if (rowMenu && !(e.target as HTMLElement).closest(".row-menu")) closeRowMenu();
+});
+// Capture, so Escape dismisses the menu instead of reaching the composer and
+// stopping the run behind it.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && rowMenu) {
+    e.preventDefault();
+    e.stopPropagation();
+    closeRowMenu();
+  }
+}, true);
+window.addEventListener("resize", closeRowMenu);
+sessList.addEventListener("scroll", closeRowMenu);
+
 function renderSessions(): void {
+  closeRowMenu();
   sessList.innerHTML = "";
   projects.forEach((p) => {
     const open = openProjs.has(p.id);
@@ -1343,27 +1407,43 @@ function renderSessions(): void {
     const lab = document.createElement("span");
     lab.className = "sess-label";
     lab.textContent = (open ? "▾ " : "▸ ") + (p.name || p.id);
-    const pren = document.createElement("button");
-    pren.className = "sess-act";
-    pren.textContent = "✎";
-    pren.title = "Rename project";
-    const pdel = document.createElement("button");
-    pdel.className = "sess-act";
-    pdel.textContent = "×";
-    pdel.title = "Delete project (chats are kept)";
-    row.append(lab, pren, pdel);
-    pren.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openRenameModal(p.id, p.name || p.id, p.workspace || "");
-    });
-    pdel.addEventListener("click", (e) => {
+    const padd = document.createElement("button");
+    padd.className = "sess-act add";
+    padd.textContent = "+";
+    padd.title = "New chat in this project";
+    const pmore = document.createElement("button");
+    pmore.className = "sess-act more";
+    pmore.textContent = "⋯";
+    pmore.title = "More";
+    row.append(lab, padd, pmore);
+    padd.addEventListener("click", (e) => {
       e.stopPropagation();
       void (async () => {
-        if (!(await confirmModal("Delete project \"" + p.name + "\"? Its chats are kept and move to the remaining folder."))) return;
-        await api.projectRemove(p.id);
+        openProjs.add(p.id);
+        const meta = await api.newSession("", undefined, currentModel, currentProviderId, p.id);
         await refreshSessions();
-        if (currentSession) await loadSession(currentSession);
+        if (meta.id) await loadSession(meta.id);
       })();
+    });
+    pmore.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openRowMenu(pmore, row, [
+        { label: "Rename", run: () => openRenameModal(p.id, p.name || p.id, p.workspace || "") },
+        // Chats orphaned by any other deletion fall back to the scratch project,
+        // so it gets no Close entry at all rather than one that quietly fails.
+        ...(p.scratch
+          ? []
+          : [{
+              label: "Close",
+              danger: true,
+              run: () => void (async () => {
+                if (!(await confirmModal("Close project \"" + p.name + "\"? Its chats are kept and move to the remaining folder."))) return;
+                await api.projectRemove(p.id);
+                await refreshSessions();
+                if (currentSession) await loadSession(currentSession);
+              })(),
+            }]),
+      ]);
     });
     row.addEventListener("click", () => {
       void (async () => {
@@ -1398,43 +1478,35 @@ function renderSessions(): void {
         label.title = s.detached
           ? `Open: ${s.name}\nRuns in ${s.workspace} — not this project's folder (its original project was deleted).`
           : "Open: " + s.name;
-        const ren = document.createElement("button");
-        ren.className = "sess-act";
-        ren.textContent = "✎";
-        ren.title = "Rename chat";
-        const fork = document.createElement("button");
-        fork.className = "sess-act";
-        fork.textContent = "⧉";
-        fork.title = "Fork";
-        const del = document.createElement("button");
-        del.className = "sess-act";
-        del.textContent = "×";
-        del.title = "Delete";
-        c.append(dot, label, ren, fork, del);
-        ren.addEventListener("click", (e) => {
-          e.stopPropagation();
-          openChatRename(s.id, s.name);
-        });
+        const more = document.createElement("button");
+        more.className = "sess-act more";
+        more.textContent = "⋯";
+        more.title = "More";
+        c.append(dot, label, more);
         label.addEventListener("click", () => void loadSession(s.id));
-        fork.addEventListener("click", (e) => {
+        more.addEventListener("click", (e) => {
           e.stopPropagation();
-          void (async () => { await api.forkSession(s.id); await refreshSessions(); })();
-        });
-        del.addEventListener("click", (e) => {
-          e.stopPropagation();
-          void (async () => {
-            if (!(await confirmModal("Delete chat \"" + s.name + "\"?"))) return;
-            const wasCurrent = s.id === currentSession;
-            await api.deleteSession(s.id);
-            chatUI.delete(s.id);
-            delete chatState[s.id];
-            await refreshSessions();
-            if (wasCurrent && currentSession) await loadSession(currentSession);
-            else if (wasCurrent) {
-              renderHistory([]);
-              applyChatUI();
-            }
-          })();
+          openRowMenu(more, c, [
+            { label: "Rename", run: () => openChatRename(s.id, s.name) },
+            { label: "Fork", run: () => void (async () => { await api.forkSession(s.id); await refreshSessions(); })() },
+            {
+              label: "Close",
+              danger: true,
+              run: () => void (async () => {
+                if (!(await confirmModal("Close chat \"" + s.name + "\"? Its history is deleted."))) return;
+                const wasCurrent = s.id === currentSession;
+                await api.deleteSession(s.id);
+                chatUI.delete(s.id);
+                delete chatState[s.id];
+                await refreshSessions();
+                if (wasCurrent && currentSession) await loadSession(currentSession);
+                else if (wasCurrent) {
+                  renderHistory([]);
+                  applyChatUI();
+                }
+              })(),
+            },
+          ]);
         });
         sessList.appendChild(c);
       });
@@ -1503,7 +1575,7 @@ async function updateWorkspaceLabel(): Promise<void> {
     ? `One-off work, outside any project. Scratch folder: ${ws}`
     : ok
       ? ws
-      : `Folder not found: ${ws} — open the project's ✎ to pick another`;
+      : `Folder not found: ${ws} — open the project's ⋯ menu and rename it to pick another`;
 }
 
 async function loadSession(id: string): Promise<void> {
@@ -1585,13 +1657,9 @@ pinBtn.addEventListener("click", () => {
   else closeSessions();
 });
 sidebar.addEventListener("mouseleave", () => {
-  if (!pinned) closeSessions();
-});
-document.getElementById("sess-new")!.addEventListener("click", async () => {
-  const meta = await api.newSession("", undefined, currentModel, currentProviderId);
-  await refreshSessions();
-  if (meta.id) await loadSession(meta.id);
-  closeSessions();
+  // Reaching for a row's `⋯` menu means leaving the sidebar, which used to
+  // slam it shut under the menu that was just opened.
+  if (!pinned && !rowMenu) closeSessions();
 });
 projAdd.addEventListener("click", () => openProjModal());
 

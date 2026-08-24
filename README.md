@@ -174,6 +174,7 @@ src/
   main.ts            UI controller
   api.ts             typed bridge to the Rust backend
   markdown.ts        tiny XSS-safe markdown renderer
+  copy.ts            copy-to-clipboard buttons (messages, code, tool output)
   style.css          all styling
 ```
 
