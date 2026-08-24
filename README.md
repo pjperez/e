@@ -1,5 +1,9 @@
 # e
 
+<p align="center">
+  <img src="design/brand/e-banner.svg" alt="e — agent harness" width="760">
+</p>
+
 **e** is a minimalist, fast, extensible **agent harness** with a native GUI —
 think the inner loop of an agent coding tool (converse → plan → fork tools →
 apply → repeat) without the terminal. A slim Rust core drives the agent and its
@@ -172,6 +176,45 @@ src/
   markdown.ts        tiny XSS-safe markdown renderer
   style.css          all styling
 ```
+
+## Brand
+
+<p align="center">
+  <img src="design/brand/e-construction.svg" alt="the mark's construction" width="440">
+</p>
+
+The mark is a lowercase **e** drawn on a φ grid, and it is generated, not
+drawn by hand — [`design/logo.py`](design/logo.py) emits every asset from the
+same equations.
+
+*e* and φ meet in exactly one place: the **logarithmic spiral**.
+
+```
+r(θ) = a·e^(bθ)        is golden when it grows by φ every quarter turn:
+e^(bπ/2) = φ    ⟹     b = 2·lnφ/π ≈ 0.3063489
+```
+
+The golden spiral is literally *e* raised to a golden power — φ sets the
+proportion, *e* does the growing. From that, the whole letter:
+
+| measurement | value |
+|-------------|-------|
+| x-height    | `2R` — the mark's bounding circle |
+| weight      | `R/φ³`, modulated `×φ` on the stress axis |
+| crossbar    | golden section of the counter, so eye : counter = `1 : φ` |
+| aperture    | `360/φ⁴` = 52.5° of wedge, removed at the lower right |
+| tile radius | `size/φ³`, mark inset `size/φ³` |
+
+Regenerate everything (marks, tile, banner, favicon):
+
+```bash
+python design/logo.py            # writes design/brand/* and public/e.svg
+python design/logo.py --review   # contact sheet of the alternate cuts
+npm run tauri -- icon design/brand/e-tile.svg   # platform icon set
+```
+
+`public/e.svg` is the single source of truth for the in-app mark: the title bar
+and empty state tint it with a CSS mask, so it follows the theme for free.
 
 ## Status
 

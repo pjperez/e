@@ -72,7 +72,16 @@ header#bar button, header#bar .model-pill {
   cursor: pointer;
 }
 .brand .mark:hover { background: var(--bg-3); }
-.brand .word { font-weight: 700; letter-spacing: 0.4px; font-size: 15px; }
+/* The wordmark is the logo itself, masked so it takes the current text colour
+   and follows the theme. Source of truth: public/e.svg (design/logo.py). */
+.brand .word {
+  width: 17px; height: 17px;
+  margin-left: 3px;
+  display: inline-block;
+  background: currentColor;
+  -webkit-mask: url("/e.svg") center / contain no-repeat;
+  mask: url("/e.svg") center / contain no-repeat;
+}
 
 .bar-spacer { flex: 1; }
 
@@ -210,10 +219,17 @@ main#conversation::-webkit-scrollbar-thumb:hover { background: #2a303c; }
 .empty-mark {
   width: 60px; height: 60px; border-radius: 18px;
   display: flex; align-items: center; justify-content: center;
-  font-size: 40px; font-weight: 800; color: var(--accent);
+  color: var(--accent);
   background: var(--bg-3);
   border: 1px solid var(--edge);
   margin-bottom: 18px;
+}
+.empty-mark::before {
+  content: "";
+  width: 34px; height: 34px;
+  background: currentColor;
+  -webkit-mask: url("/e.svg") center / contain no-repeat;
+  mask: url("/e.svg") center / contain no-repeat;
 }
 .empty-title { font-size: 24px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
 .empty-sub { color: var(--text-dim); margin: 0 0 22px; }
@@ -493,7 +509,7 @@ header#bar {
   border-bottom-color: var(--edge-2);
 }
 .brand .mark { filter: drop-shadow(0 0 6px rgba(255, 45, 149, 0.7)); }
-.brand .word { color: var(--text); text-shadow: 0 0 8px rgba(255, 45, 149, 0.35); }
+.brand .word { color: var(--text); filter: drop-shadow(0 0 7px rgba(255, 45, 149, 0.45)); }
 .status.busy .dot { box-shadow: var(--glow-pink); }
 .status.error .dot { box-shadow: var(--glow-red); }
 .icon-btn:hover { color: var(--accent); border-color: var(--edge-2); box-shadow: var(--glow-pink); }

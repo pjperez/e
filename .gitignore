@@ -8,3 +8,5 @@ src-tauri/target/
 # os
 .DS_Store
 Thumbs.db
+# generated design review output (regenerate: python design/logo.py --review)
+design/out/
