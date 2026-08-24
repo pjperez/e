@@ -10,3 +10,4 @@ src-tauri/target/
 Thumbs.db
 # generated design review output (regenerate: python design/logo.py --review)
 design/out/
+__pycache__/
