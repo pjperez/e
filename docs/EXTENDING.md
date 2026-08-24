@@ -65,7 +65,8 @@ Any endpoint speaking the OpenAI streaming `/chat/completions` contract works â€
 add it in Settings (âš™), no code required. `ChatProvider`
 ([`engine/provider.rs`](../src-tauri/src/engine/provider.rs)) handles SSE
 streaming, tool calls, reasoning deltas, usage/cost reporting, and retries a
-throttled provider with exponential backoff.
+throttled provider on an escalating schedule (1s, 15s, 30s, 60s) so a
+per-minute rate limit is waited out rather than expired inside.
 
 Environment variables override the active provider for one launch:
 
