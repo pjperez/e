@@ -185,6 +185,14 @@ Each row carries what that model actually costs you:
   nothing still lets you dial the model you're on. Clicking a level keeps the
   picker open — dialling effort and switching models are different intentions.
 
+Switching model mid-chat moves the budget straight away. It does **not** compact:
+if the new model's window is smaller than what the chat is already carrying, the
+status bar turns amber and history is only summarised when you send the next
+message. Picking a model by mistake is therefore undoable — pick the old one
+back and nothing has been lost. The budget is tracked per chat, so a queued run
+in a background chat is measured against its own model rather than whichever one
+happens to be on screen.
+
 ## Project layout
 
 ```

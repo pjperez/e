@@ -102,8 +102,29 @@ function ui(sid: string): ChatUI {
 const cur = (): ChatUI => ui(currentSession);
 const isRunning = (): boolean => !!currentSession && cur().running;
 
-/** Usable context window for the active model; refreshed from the backend. */
-let ctxWindow = 1_000_000;
+/** The global setting, used until a chat's own model reports something better. */
+let defaultCtxWindow = 1_000_000;
+/**
+ * Usable context window per chat. Per chat rather than one global number
+ * because a chat can sit on a model from any provider: a queued run in a
+ * background chat has to budget against *its* model, not whichever one the
+ * visible chat happens to be on.
+ */
+const ctxWindows = new Map<string, number>();
+const winOf = (sid: string): number => ctxWindows.get(sid) || defaultCtxWindow;
+
+/**
+ * Re-read a chat's context window from the backend, following its own model.
+ * Deliberately never compacts: picking a smaller model is often a misclick, and
+ * summarising history the moment it happens cannot be undone. The budget moves
+ * straight away; the history is only collapsed by the next send.
+ */
+async function refreshCtxWindow(sid: string): Promise<number> {
+  const win = await api.contextBudget(sid || undefined).catch(() => 0);
+  if (win > 0) ctxWindows.set(sid, win);
+  return winOf(sid);
+}
+
 /** Compact once the live context passes this share of the window. */
 const COMPACT_AT = 0.85;
 
@@ -116,16 +137,22 @@ function fmtTokens(n: number): string {
 
 function sbUpdate(): void {
   const s = cur();
+  const win = winOf(currentSession);
   const inT = Math.round(s.baseIn + s.liveIn);
   const outT = Math.round(s.baseOut + s.liveOut);
   // Context usage is the live window (last prompt + what we're about to add),
   // never the lifetime token total.
   const ctx = Math.round(s.ctxIn + s.liveIn);
-  const pct = ctxWindow > 0 ? Math.min(100, (ctx * 100) / ctxWindow) : 0;
+  const pct = win > 0 ? Math.min(100, (ctx * 100) / win) : 0;
   sbArrows.textContent = "↑" + inT.toLocaleString() + " ↓" + outT.toLocaleString();
   sbCtx.textContent = s.compacting
     ? "compacting…"
-    : "CH " + fmtTokens(ctx) + "/" + fmtTokens(ctxWindow) + " · " + pct.toFixed(1) + "%";
+    : "CH " + fmtTokens(ctx) + "/" + fmtTokens(win) + " · " + pct.toFixed(1) + "%";
+  // Landing over the line by switching model is a state worth showing rather
+  // than acting on, so the user can switch back before any history is lost.
+  const over = !s.compacting && win > 0 && ctx >= win * COMPACT_AT;
+  sbCtx.classList.toggle("over", over);
+  sbCtx.title = over ? "Over the compaction threshold — history is summarised on your next message" : "";
   sbCost.textContent = s.costKnown ? "$" + s.money.toFixed(3) : "$-";
 }
 /** Name of the provider serving the current model, for the status bar. */
@@ -537,8 +564,6 @@ let currentWs = "";
 /** Provider open in the Settings editor. Purely an editing cursor — there is
  *  no "active provider" to choose any more; picking a model picks one. */
 let editingProviderId = "";
-/** Global fallback context window, used when a provider has no override. */
-let defaultCtxWindow = 1_000_000;
 /** Every model on offer across all enabled providers — what the picker shows. */
 let catalog: api.ModelChoice[] = [];
 let currentModel = "";
@@ -802,10 +827,18 @@ async function doSend(): Promise<void> {
 /// window. Deliberately a no-op most of the time: the old check compared a
 /// lifetime token counter against a fixed number, so it fired constantly on
 /// long-lived chats whose actual context was nowhere near full.
+///
+/// This is the *only* place compaction is triggered, which is what makes
+/// switching to a smaller model safe: the budget on screen shrinks at once, but
+/// nothing is summarised until the user actually sends a turn to that model.
 async function maybeCompact(sid: string): Promise<void> {
   const s = ui(sid);
+  // Re-read rather than trust the cache. This chat may have been moved to a
+  // smaller model since its last run, and a queued chat is by definition not
+  // the one on screen, so the visible chat's window is the wrong budget for it.
+  const win = await refreshCtxWindow(sid);
   const used = s.ctxIn + s.liveIn;
-  if (!ctxWindow || used < ctxWindow * COMPACT_AT) return;
+  if (!win || used < win * COMPACT_AT) return;
 
   s.compacting = true;
   s.activityText = "compacting context…";
@@ -1211,7 +1244,11 @@ async function selectModel(c: api.ModelChoice, effort?: string, keepOpen = false
     sbModel.textContent = c.model;
     sbProv.textContent = "[" + c.provider_name + "]";
     if (currentSession) await api.setSessionModel(currentSession, c.model, c.provider_id);
-    ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
+    // The budget moves with the model immediately. Compaction does not: if this
+    // model's window is smaller than what the chat is already carrying, the
+    // status bar says so and the next send deals with it — a mis-picked model
+    // must be undoable by picking the right one back.
+    await refreshCtxWindow(currentSession);
     sbUpdate();
     if (keepOpen) {
       renderPicker();
@@ -2356,6 +2393,9 @@ document.getElementById("btn-settings")!.addEventListener("click", () => void op
 async function syncModelState(): Promise<void> {
   catalog = await api.listModels().catch(() => [] as api.ModelChoice[]);
   const cfg = await api.getConfig();
+  // Editing providers can move any chat's window, so no cached budget survives
+  // a sync. Each chat re-reads its own on its next render or send.
+  ctxWindows.clear();
   providers = cfg.providers || providers;
   // Leave a chat on its own model while that model is still on offer. Only
   // when it has been turned off (or removed) does the chat move — and then it
@@ -2373,7 +2413,7 @@ async function syncModelState(): Promise<void> {
   modelPill.textContent = pillText();
   sbModel.textContent = currentModel || "?";
   sbProv.textContent = "[" + providerLabel() + "]";
-  ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
+  await refreshCtxWindow(currentSession);
   sbUpdate();
 }
 
@@ -2388,7 +2428,7 @@ async function applySessionModel(model: string, provider: string): Promise<void>
   modelPill.textContent = pillText();
   sbModel.textContent = currentModel || "?";
   sbProv.textContent = "[" + providerLabel() + "]";
-  ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
+  await refreshCtxWindow(currentSession);
   sbUpdate();
 }
 

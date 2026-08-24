@@ -646,6 +646,10 @@ html[data-theme="light"] .empty-mark {
 .sb-metrics { display: flex; gap: 16px; flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; }
 #sb-arrows { color: var(--accent-2); }
 #sb-context { color: var(--text-dim); }
+/* Past the compaction threshold — usually because the chat was just moved to a
+   smaller model. Flagged, not acted on: the next send is what collapses it. */
+#sb-context.over { color: var(--warn); }
+#sb-context.over::after { content: " ⚠"; }
 #sb-cost { color: var(--text-dim); }
 .sb-right { display: flex; gap: 10px; white-space: nowrap; }
 #sb-prov { color: var(--text-dim); }
