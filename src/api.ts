@@ -1,5 +1,22 @@
 // e — bridge to the Rust backend via Tauri.
 
+/** What a provider says about one of its models, plus what the user chose.
+ *  Advertised and chosen values are separate so a /models refresh can never
+ *  overwrite a setting made by hand. */
+export type ModelMeta = {
+  /** Context window the provider advertised, in tokens. */
+  advertised_window?: number | null;
+  /** The user's own window for this model; wins over the advertised one. */
+  window_override?: number | null;
+  /** Whether the model takes a reasoning level. Absent means the provider
+   *  never said — which is not the same as "no". */
+  reasoning?: boolean | null;
+  /** The levels the provider enumerated, when it enumerated any. */
+  reasoning_efforts?: string[];
+  /** The level to ask for. Unset sends no reasoning field at all. */
+  reasoning_effort?: string | null;
+};
+
 export type ProviderItem = {
   id: string;
   name: string;
@@ -7,18 +24,36 @@ export type ProviderItem = {
   api_key: string;
   models: string[];
   context_window?: number | null;
+  /** Per-model window and reasoning capability, keyed by model id. */
+  model_meta?: Record<string, ModelMeta>;
   /** Off keeps the provider (and its key) but hides all of its models. */
   enabled: boolean;
   /** Opt-out list, so a /models refresh surfaces new models by default. */
   disabled_models: string[];
 };
 
+/** One entry of a provider's /models listing, as parsed by the backend. */
+export type ModelInfo = {
+  id: string;
+  context_window?: number | null;
+  reasoning?: boolean | null;
+  reasoning_efforts?: string[];
+};
+
+
 /** One entry of the flat, cross-provider catalogue the model picker shows. */
 export type ModelChoice = {
   model: string;
   provider_id: string;
   provider_name: string;
+  /** The window this model is budgeted against, after all fallbacks. */
   context_window: number;
+  /** False when that number is only the global default rather than a real
+   *  per-model or per-provider figure. */
+  window_known: boolean;
+  reasoning?: boolean | null;
+  reasoning_efforts: string[];
+  reasoning_effort?: string | null;
 };
 
 export type Config = {
@@ -85,9 +120,12 @@ export async function listModels(): Promise<ModelChoice[]> {
 }
 
 
-export async function refreshModels(base_url: string, api_key: string): Promise<string[]> {
-  if (!inTauri) return [];
-  return invoke<string[]>("refresh_models", { baseUrl: base_url, apiKey: api_key });
+/// Fetch a provider's model listing and fold it into that provider: ids, plus
+/// whatever it advertises about each model's window and reasoning support.
+/// Returns an updated copy — nothing is saved until Settings is saved.
+export async function refreshModels(provider: ProviderItem): Promise<ProviderItem> {
+  if (!inTauri) return provider;
+  return invoke<ProviderItem>("refresh_models", { provider });
 }
 
 export async function readAttachment(path: string): Promise<{ path: string; content: string }> {

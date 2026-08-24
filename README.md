@@ -115,12 +115,21 @@ provider the current model belongs to). Settings live in `~/.e/config.json`:
       "base_url": "https://provider.example/v1",
       "api_key": "",              // your gateway key here, or set E_API_KEY
       "enabled": true,            // off hides its models but keeps the key
-      "context_window": null,     // per-provider override; null = global
+      "context_window": null,     // shelf-wide fallback; null = global
       "models": [
         "zai-coding/glm-5.2",
         "opencode-go/deepseek-v4-flash",
         "openai/gpt-5.6-luna"
       ],
+      "model_meta": {             // per model: learned on Refresh, tuned by you
+        "openai/gpt-5.6-luna": {
+          "advertised_window": 272000,   // what /models said
+          "window_override": null,       // your number; beats the above
+          "reasoning": true,             // takes a reasoning level
+          "reasoning_efforts": ["low", "medium", "high"],
+          "reasoning_effort": "high"     // the level to ask for
+        }
+      },
       "disabled_models": ["zai-coding/glm-5.2"]  // hidden from the picker
     },
     {
@@ -150,6 +159,11 @@ not what is active:
 - Open a provider (✎) to tick individual models, filter them, `All` / `None`
   them, `Refresh` from `<base>/models`, or add a model id by hand for gateways
   that don't list everything they serve.
+- `Refresh` keeps everything the listing says about each model — its context
+  window and whether it takes a reasoning level — not just the ids. It never
+  overwrites a window you typed or a level you chose; each model row shows the
+  advertised figure as the placeholder, so typing over it is an override and
+  clearing the box hands the model back to its provider.
 - `disabled_models` is an opt-out list, so a `Refresh` surfaces newly added
   models instead of silently hiding them.
 
@@ -158,6 +172,18 @@ enabled model from every enabled provider in one list, grouped by provider.
 Choosing a model chooses its provider too — base URL, key and context window all
 follow it, per chat. Two providers can even serve the same model id; a chat
 stays on the one it was picked from.
+
+Each row carries what that model actually costs you:
+
+- **Context window** — the number compaction is budgeted against, resolved
+  per model first, then the provider's fallback, then the global one. A dashed
+  badge means nothing was advertised and the global default is being guessed.
+- **Reasoning level** — `auto · min · low · med · high`, or exactly the levels
+  the provider enumerated. `auto` sends no `reasoning_effort` field at all, so
+  models and gateways that don't take one are never sent it. A provider that
+  explicitly says a model takes no level hides the chips entirely; one that says
+  nothing still lets you dial the model you're on. Clicking a level keeps the
+  picker open — dialling effort and switching models are different intentions.
 
 ## Project layout
 

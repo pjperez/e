@@ -1,6 +1,7 @@
 use crate::engine::provider::ChatProvider;
 use crate::engine::tools::{run_tool, ToolContext, ToolRegistry};
 use crate::engine::{Completion, Emitter, Msg, Part};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -39,6 +40,46 @@ pub fn default_context_window() -> u64 {
 /// point is to avoid overflowing, not to keep the window small.
 pub const COMPACT_AT: f64 = 0.85;
 
+/// What is known about one model of one provider: what its `/models` listing
+/// advertised, plus whatever the user decided on top of that.
+///
+/// Advertised and chosen values are kept apart deliberately — a refresh
+/// overwrites what the provider says without ever touching what the user set.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelMeta {
+    /// Context window the provider advertised, in tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertised_window: Option<u64>,
+    /// The user's own window for this model. Wins over everything advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_override: Option<u64>,
+    /// Whether the provider says this model takes a reasoning level. `None`
+    /// means the listing was silent, which is not the same as "no".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// The levels the provider enumerated, when it enumerated any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
+    /// The level to actually ask for. Unset sends no reasoning field at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl ModelMeta {
+    /// The window to budget against for this model, ignoring provider-wide and
+    /// global fallbacks.
+    pub fn window(&self) -> Option<u64> {
+        self.window_override.or(self.advertised_window).filter(|w| *w > 0)
+    }
+
+    /// Whether a reasoning level may be offered for this model. Only an
+    /// explicit "no" from the provider takes the choice away; a listing that
+    /// says nothing leaves it open, since most gateways advertise nothing.
+    pub fn reasons(&self) -> bool {
+        self.reasoning != Some(false)
+    }
+}
+
 /// A saved provider configuration. Every enabled provider contributes its
 /// enabled models to one flat catalogue the user picks from; the flat
 /// base_url/api_key/model fields above are just the resulting connection.
@@ -53,6 +94,11 @@ pub struct ProviderItem {
     /// default when unset (older config files won't have it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Per-model window and reasoning capability, keyed by model id. Sorted so
+    /// a `/models` refresh produces a diffable config file rather than a
+    /// reshuffled one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_meta: BTreeMap<String, ModelMeta>,
     /// Turn the whole provider off without deleting it (and losing its key).
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -86,6 +132,47 @@ impl ProviderItem {
             && self.models.iter().any(|m| m == model)
             && !self.disabled_models.iter().any(|d| d == model)
     }
+
+    /// Window for one of this provider's models: the user's own setting first,
+    /// then what the provider advertised for that model, then the
+    /// provider-wide override. `None` leaves it to the global default.
+    pub fn window_for(&self, model: &str) -> Option<u64> {
+        self.model_meta
+            .get(model)
+            .and_then(ModelMeta::window)
+            .or_else(|| self.context_window.filter(|w| *w > 0))
+    }
+
+    /// Fold a fresh `/models` listing into what is already known. The user's
+    /// own window and chosen level survive; everything the provider advertises
+    /// is replaced, so a model that lost a capability stops claiming it.
+    pub fn absorb(&mut self, listed: Vec<crate::engine::provider::ModelInfo>) {
+        self.models = listed.iter().map(|m| m.id.clone()).collect();
+        // A stale opt-out would silently hide a model the provider re-added.
+        self.disabled_models.retain(|d| listed.iter().any(|m| m.id == *d));
+        for info in listed {
+            let meta = self.model_meta.entry(info.id).or_default();
+            meta.advertised_window = info.context_window;
+            meta.reasoning = info.reasoning;
+            meta.reasoning_efforts = info.reasoning_efforts;
+            // A level the model can no longer take must not keep being sent.
+            if !meta.reasons() {
+                meta.reasoning_effort = None;
+            }
+        }
+        self.prune_meta();
+    }
+
+    /// Forget models the provider no longer lists, so the config file doesn't
+    /// accumulate entries forever. Skipped while the list is empty: that means
+    /// "never refreshed", not "serves nothing".
+    pub fn prune_meta(&mut self) {
+        if self.models.is_empty() {
+            return;
+        }
+        let keep = self.models.clone();
+        self.model_meta.retain(|m, _| keep.contains(m));
+    }
 }
 
 /// One entry in the flat, cross-provider model catalogue the picker shows.
@@ -94,7 +181,19 @@ pub struct ModelChoice {
     pub model: String,
     pub provider_id: String,
     pub provider_name: String,
+    /// The window this model is actually budgeted against, after per-model,
+    /// per-provider and global fallbacks.
     pub context_window: u64,
+    /// False when that number is only the global default, so the picker can
+    /// show a real figure differently from a guess.
+    pub window_known: bool,
+    /// Whether the provider says this model takes a reasoning level. `None`
+    /// means it never said.
+    pub reasoning: Option<bool>,
+    /// The levels the provider enumerated, if any.
+    pub reasoning_efforts: Vec<String>,
+    /// The level currently chosen for this model.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Config {
@@ -117,6 +216,7 @@ impl Config {
                 base_url: "https://provider.example/v1".into(),
                 api_key: String::new(),
                 context_window: None,
+                model_meta: BTreeMap::new(),
                 enabled: true,
                 disabled_models: Vec::new(),
                 models: vec![
@@ -171,6 +271,7 @@ impl Config {
                 api_key: base.api_key.clone(),
                 models: base.models.clone(),
                 context_window: None,
+                model_meta: BTreeMap::new(),
                 enabled: true,
                 disabled_models: Vec::new(),
             });
@@ -267,37 +368,47 @@ impl Config {
     /// providers or the selected model so base_url/api_key/models can never
     /// drift from the provider that actually serves it.
     pub fn normalize(&mut self) {
+        for p in self.providers.iter_mut() {
+            p.prune_meta();
+        }
         let model = self.model.clone();
         let hint = self.provider_id.clone();
         self.use_model(&model, &hint);
     }
 
     /// Every enabled model across every enabled provider — the flat catalogue
-    /// the picker offers, with the provider each entry belongs to.
+    /// the picker offers, with the provider each entry belongs to and what
+    /// that provider says the model can do.
     pub fn model_catalog(&self) -> Vec<ModelChoice> {
         let mut out = Vec::new();
         for p in self.providers.iter().filter(|p| p.is_usable()) {
-            let win = p.context_window.filter(|w| *w > 0).unwrap_or(self.context_window);
             for m in p.enabled_models() {
+                let meta = p.model_meta.get(&m);
+                let known = p.window_for(&m);
+                let win = known.unwrap_or(self.context_window);
                 out.push(ModelChoice {
-                    model: m,
                     provider_id: p.id.clone(),
                     provider_name: if p.name.trim().is_empty() { p.id.clone() } else { p.name.clone() },
                     context_window: if win == 0 { default_context_window() } else { win },
+                    window_known: known.is_some(),
+                    reasoning: meta.and_then(|x| x.reasoning),
+                    reasoning_efforts: meta.map(|x| x.reasoning_efforts.clone()).unwrap_or_default(),
+                    reasoning_effort: meta.and_then(|x| x.reasoning_effort.clone()),
+                    model: m,
                 });
             }
         }
         out
     }
 
-    /// Context window to budget against for `model`: its provider's override
-    /// when it has one, otherwise the global setting.
+    /// Context window to budget against for `model`: its own advertised or
+    /// overridden window when it has one, then its provider's, then the global
+    /// setting.
     pub fn context_window_for(&self, model: &str, provider_hint: &str) -> u64 {
         let id = self.resolve_provider_id(model, provider_hint);
         let win = self
             .provider(&id)
-            .and_then(|p| p.context_window)
-            .filter(|w| *w > 0)
+            .and_then(|p| p.window_for(model))
             .unwrap_or(self.context_window);
         if win == 0 {
             default_context_window()
@@ -309,6 +420,26 @@ impl Config {
     /// Context window for the connection as it stands.
     pub fn active_context_window(&self) -> u64 {
         self.context_window_for(&self.model, &self.provider_id)
+    }
+
+    /// Reasoning level to request for `model`, or `None` to send no reasoning
+    /// field at all. A provider that explicitly said the model takes no level
+    /// overrules a stale choice rather than failing every run against it.
+    pub fn reasoning_effort_for(&self, model: &str, provider_hint: &str) -> Option<String> {
+        let id = self.resolve_provider_id(model, provider_hint);
+        let meta = self.provider(&id)?.model_meta.get(model)?;
+        if !meta.reasons() {
+            return None;
+        }
+        meta.reasoning_effort
+            .as_ref()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+    }
+
+    /// Reasoning level for the connection as it stands.
+    pub fn active_reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort_for(&self.model, &self.provider_id)
     }
 
     pub fn save(&self) {
@@ -477,6 +608,7 @@ impl Agent {
             config.api_key.clone(),
             config.model.clone(),
             config.temperature,
+            config.active_reasoning_effort(),
         );
         Agent {
             provider,
@@ -496,6 +628,7 @@ impl Agent {
             config.api_key,
             config.model,
             config.temperature,
+            self.config.active_reasoning_effort(),
         );
     }
 
@@ -738,6 +871,7 @@ mod tests {
             api_key: format!("key-{id}"),
             models: models.iter().map(|m| m.to_string()).collect(),
             context_window: None,
+            model_meta: BTreeMap::new(),
             enabled: true,
             disabled_models: Vec::new(),
         }
@@ -825,6 +959,161 @@ mod tests {
         c.providers[1].context_window = Some(128_000);
         assert_eq!(c.context_window_for("m1", ""), 1_000_000, "no override falls back to the global window");
         assert_eq!(c.context_window_for("m3", ""), 128_000, "the owning provider's override wins");
+    }
+
+    #[test]
+    fn a_models_own_window_beats_its_providers() {
+        let mut c = cfg(vec![provider("a", &["small", "big"])]);
+        c.providers[0].context_window = Some(128_000);
+        c.providers[0].model_meta.insert(
+            "small".into(),
+            ModelMeta { advertised_window: Some(8_000), ..Default::default() },
+        );
+        assert_eq!(c.context_window_for("small", ""), 8_000, "what the provider advertised for this model wins");
+        assert_eq!(c.context_window_for("big", ""), 128_000, "a model with nothing advertised keeps the shelf-wide number");
+    }
+
+    #[test]
+    fn a_hand_set_window_beats_the_advertised_one() {
+        let mut c = cfg(vec![provider("a", &["m1"])]);
+        c.providers[0].model_meta.insert(
+            "m1".into(),
+            ModelMeta { advertised_window: Some(8_000), window_override: Some(200_000), ..Default::default() },
+        );
+        assert_eq!(c.context_window_for("m1", ""), 200_000, "the user's own number is the last word");
+    }
+
+    #[test]
+    fn the_catalogue_carries_each_models_window_and_levels() {
+        let mut c = cfg(vec![provider("a", &["plain", "thinker"])]);
+        c.providers[0].model_meta.insert(
+            "thinker".into(),
+            ModelMeta {
+                advertised_window: Some(272_000),
+                reasoning: Some(true),
+                reasoning_efforts: vec!["low".into(), "high".into()],
+                reasoning_effort: Some("high".into()),
+                ..Default::default()
+            },
+        );
+        let cat = c.model_catalog();
+        let plain = cat.iter().find(|x| x.model == "plain").expect("plain");
+        let thinker = cat.iter().find(|x| x.model == "thinker").expect("thinker");
+        assert_eq!((plain.context_window, plain.window_known), (1_000_000, false), "a fallback window is flagged as a guess");
+        assert_eq!((thinker.context_window, thinker.window_known), (272_000, true));
+        assert_eq!(thinker.reasoning_efforts, vec!["low", "high"], "the picker gets the levels the provider named");
+        assert_eq!(thinker.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(plain.reasoning, None, "a silent listing is not a refusal");
+    }
+
+    #[test]
+    fn a_level_is_only_requested_when_the_model_takes_one() {
+        let mut c = cfg(vec![provider("a", &["thinker", "plain"])]);
+        c.providers[0].model_meta.insert(
+            "thinker".into(),
+            ModelMeta { reasoning: Some(true), reasoning_effort: Some("medium".into()), ..Default::default() },
+        );
+        // A level left over from before the provider said "no reasoning here".
+        c.providers[0].model_meta.insert(
+            "plain".into(),
+            ModelMeta { reasoning: Some(false), reasoning_effort: Some("high".into()), ..Default::default() },
+        );
+        assert_eq!(c.reasoning_effort_for("thinker", "").as_deref(), Some("medium"));
+        assert_eq!(c.reasoning_effort_for("plain", ""), None, "a model that refuses levels is never sent one");
+        assert_eq!(c.reasoning_effort_for("unknown", ""), None, "an unknown model asks for nothing");
+        c.use_model("thinker", "");
+        assert_eq!(c.active_reasoning_effort().as_deref(), Some("medium"), "the level follows the selected model");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_users_settings_and_drops_what_is_gone() {
+        use crate::engine::provider::ModelInfo;
+        let mut p = provider("a", &["keep", "gone"]);
+        p.disabled_models = vec!["gone".into()];
+        p.model_meta.insert(
+            "keep".into(),
+            ModelMeta {
+                advertised_window: Some(8_000),
+                window_override: Some(64_000),
+                reasoning_effort: Some("high".into()),
+                ..Default::default()
+            },
+        );
+        p.model_meta.insert("gone".into(), ModelMeta { advertised_window: Some(1), ..Default::default() });
+        p.absorb(vec![
+            ModelInfo { id: "keep".into(), context_window: Some(200_000), reasoning: Some(true), reasoning_efforts: vec!["high".into()] },
+            ModelInfo { id: "fresh".into(), context_window: Some(32_000), ..Default::default() },
+        ]);
+
+        let keep = p.model_meta.get("keep").expect("keep survives");
+        assert_eq!(keep.advertised_window, Some(200_000), "what the provider says is refreshed");
+        assert_eq!(keep.window_override, Some(64_000), "what the user set is untouched");
+        assert_eq!(keep.reasoning_effort.as_deref(), Some("high"), "the chosen level survives a refresh");
+        assert_eq!(p.models, vec!["keep", "fresh"]);
+        assert!(!p.model_meta.contains_key("gone"), "a model the provider dropped stops taking up room");
+        assert!(p.disabled_models.is_empty(), "an opt-out for a model that no longer exists is stale");
+    }
+
+    #[test]
+    fn a_refresh_that_revokes_reasoning_drops_the_stale_level() {
+        use crate::engine::provider::ModelInfo;
+        let mut p = provider("a", &["m1"]);
+        p.model_meta.insert(
+            "m1".into(),
+            ModelMeta { reasoning: Some(true), reasoning_effort: Some("high".into()), ..Default::default() },
+        );
+        p.absorb(vec![ModelInfo { id: "m1".into(), reasoning: Some(false), ..Default::default() }]);
+        assert_eq!(p.model_meta["m1"].reasoning_effort, None, "a level the model no longer takes must stop being sent");
+    }
+
+    #[test]
+    fn metadata_for_a_hand_added_model_is_not_pruned_before_a_refresh() {
+        let mut c = cfg(vec![provider("a", &[])]);
+        c.providers[0].model_meta.insert("typed/by-hand".into(), ModelMeta { window_override: Some(4_096), ..Default::default() });
+        c.normalize();
+        assert!(
+            c.providers[0].model_meta.contains_key("typed/by-hand"),
+            "an empty model list means 'never refreshed', not 'serves nothing'"
+        );
+    }
+
+    /// The whole chain a real refresh goes through: a gateway's JSON, folded
+    /// into a provider, read back out as picker rows, and finally as the two
+    /// things that change a request — the compaction budget and the level sent.
+    #[test]
+    fn a_listing_reaches_the_picker_and_the_request() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"data":[
+                {"id":"openai/gpt-5","context_length":400000,
+                 "top_provider":{"context_length":272000},
+                 "supported_parameters":["tools","reasoning","max_tokens"]},
+                {"id":"tiny/chat","context_length":8192,
+                 "supported_parameters":["tools","max_tokens"]}
+            ]}"#,
+        )
+        .expect("gateway json");
+
+        let mut c = cfg(vec![provider("gw", &[])]);
+        c.providers[0].absorb(crate::engine::provider::parse_models(&body));
+        c.normalize();
+
+        let cat = c.model_catalog();
+        let big = cat.iter().find(|x| x.model == "openai/gpt-5").expect("listed");
+        let tiny = cat.iter().find(|x| x.model == "tiny/chat").expect("listed");
+        assert_eq!((big.context_window, big.window_known), (272_000, true), "each model gets its own window, not one per shelf");
+        assert_eq!((tiny.context_window, tiny.window_known), (8_192, true));
+        assert_eq!(big.reasoning, Some(true), "the picker knows which one takes a level");
+        assert_eq!(tiny.reasoning, Some(false));
+
+        // Dial a level on the reasoning model, the way the picker does.
+        c.providers[0].model_meta.get_mut("openai/gpt-5").expect("meta").reasoning_effort = Some("high".into());
+        c.use_model("openai/gpt-5", "");
+        assert_eq!(c.active_context_window(), 272_000, "compaction budgets against the model in use");
+        assert_eq!(c.active_reasoning_effort().as_deref(), Some("high"));
+
+        c.use_model("tiny/chat", "");
+        assert_eq!(c.active_context_window(), 8_192);
+        assert_eq!(c.active_reasoning_effort(), None, "switching to a model that takes no level sends none");
     }
 
     /// A config written before providers could be switched off has no

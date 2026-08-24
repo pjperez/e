@@ -108,7 +108,8 @@ let ctxWindow = 1_000_000;
 const COMPACT_AT = 0.85;
 
 function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  // A round million reads as "1M", not "1.0M".
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
   if (n >= 1_000) return Math.round(n / 1_000) + "k";
   return String(n);
 }
@@ -1074,6 +1075,36 @@ const pickerMenu = document.getElementById("picker-menu") as HTMLElement;
 const pickerInput = document.getElementById("picker-input") as HTMLInputElement;
 const pickerList = document.getElementById("picker-list") as HTMLElement;
 
+/** Levels to offer when a provider says a model reasons but not with which
+ *  levels. The OpenAI-compatible set, which is what `reasoning_effort` means. */
+const DEFAULT_EFFORTS = ["minimal", "low", "medium", "high"];
+const EFFORT_LABEL: Record<string, string> = { minimal: "min", medium: "med" };
+
+/** Levels to show for a model: the ones its provider named, or the standard
+ *  set when it only said "this one reasons". */
+function effortsFor(c: api.ModelChoice): string[] {
+  const named = (c.reasoning_efforts || []).filter((e) => e.trim());
+  return named.length ? named : DEFAULT_EFFORTS;
+}
+
+/** Whether the level chips belong on this row. A provider that explicitly said
+ *  the model takes no level hides them; one that said nothing does not, since
+ *  plenty of gateways describe nothing at all — but then only the model in use
+ *  shows them, so a long list stays readable. */
+function showEfforts(c: api.ModelChoice, active: boolean): boolean {
+  if (c.reasoning === false) return false;
+  return c.reasoning === true || active;
+}
+
+/** What the title-bar pill says. A level that was dialled in belongs there:
+ *  asking a model to think hard is a standing choice, not a hidden one. */
+function pillText(): string {
+  if (!currentModel) return "no model";
+  const c = catalog.find((x) => x.model === currentModel && x.provider_id === currentProviderId);
+  const e = (c?.reasoning_effort || "").trim();
+  return e ? `${currentModel} · ${EFFORT_LABEL[e] || e}` : currentModel;
+}
+
 function renderPicker(): void {
   const q = pickerInput.value.trim().toLowerCase();
   // Matching the provider name too means "openai" finds that provider's whole
@@ -1100,10 +1131,49 @@ function renderPicker(): void {
       h.textContent = c.provider_name;
       pickerList.appendChild(h);
     }
-    const it = document.createElement("div");
     const active = c.model === currentModel && c.provider_id === currentProviderId;
-    it.className = "picker-item" + (active ? " active" : "");
-    it.textContent = c.model;
+    const it = document.createElement("div");
+    it.className = "picker-item mdl" + (active ? " active" : "");
+
+    const top = document.createElement("div");
+    top.className = "mdl-top";
+    const name = document.createElement("span");
+    name.className = "mdl-name";
+    name.textContent = c.model;
+    const win = document.createElement("span");
+    // A guessed window is dimmed: it is the global fallback, not something the
+    // provider actually promised, and compaction fires off the number shown.
+    win.className = "mdl-win" + (c.window_known ? "" : " guess");
+    win.textContent = fmtTokens(c.context_window);
+    win.title = c.window_known
+      ? `Context window: ${c.context_window.toLocaleString()} tokens`
+      : `No window advertised for this model — using the ${c.context_window.toLocaleString()} token default. Set one in Settings.`;
+    top.append(name, win);
+    it.appendChild(top);
+
+    if (showEfforts(c, active)) {
+      const row = document.createElement("div");
+      row.className = "mdl-efforts";
+      const chosen = (c.reasoning_effort || "").trim();
+      [""].concat(effortsFor(c)).forEach((e) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "eff" + (e === chosen ? " on" : "");
+        b.textContent = e ? EFFORT_LABEL[e] || e : "auto";
+        b.title = e
+          ? `Ask this model to think at "${e}"`
+          : "Send no reasoning level — whatever the provider defaults to";
+        // Tuning the level keeps the picker open: dialling effort and picking
+        // a model are different intentions.
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          void selectModel(c, e, true);
+        });
+        row.appendChild(b);
+      });
+      it.appendChild(row);
+    }
+
     it.addEventListener("click", () => void selectModel(c));
     pickerList.appendChild(it);
   });
@@ -1117,22 +1187,36 @@ function openPicker(): void {
 function closePicker(): void {
   pickerMenu.hidden = true;
 }
-async function selectModel(c: api.ModelChoice): Promise<void> {
+/// Point the app at a model, optionally setting the reasoning level to ask it
+/// for. `effort` is only written when passed, so plain model switching never
+/// disturbs a level that was already dialled in.
+async function selectModel(c: api.ModelChoice, effort?: string, keepOpen = false): Promise<void> {
   try {
     const cfg = await api.getConfig();
     cfg.model = c.model;
     // Carry the provider: the same model id can be served by more than one, so
     // the backend must not have to guess which connection was meant.
     cfg.provider_id = c.provider_id;
+    if (effort !== undefined) {
+      const p = (cfg.providers || []).find((x) => x.id === c.provider_id);
+      if (p) metaOf(p, c.model).reasoning_effort = effort || null;
+    }
     await api.saveConfig(cfg);
     currentModel = c.model;
     currentProviderId = c.provider_id;
-    modelPill.textContent = c.model;
+    // Re-read rather than patching the row: the backend is the arbiter of what
+    // actually stuck, here as everywhere else.
+    catalog = await api.listModels().catch(() => catalog);
+    modelPill.textContent = pillText();
     sbModel.textContent = c.model;
     sbProv.textContent = "[" + c.provider_name + "]";
     if (currentSession) await api.setSessionModel(currentSession, c.model, c.provider_id);
     ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
     sbUpdate();
+    if (keepOpen) {
+      renderPicker();
+      return;
+    }
   } catch (e) {
     statusText.textContent = "save failed";
     console.error(e);
@@ -1914,6 +1998,19 @@ function setModelOn(p: ProviderItem, m: string, on: boolean): void {
   p.disabled_models = [...off];
 }
 
+/** The metadata slot for one model, created on demand so a window can be set
+ *  for a model the provider never described. */
+function metaOf(p: ProviderItem, m: string): api.ModelMeta {
+  const all = (p.model_meta = p.model_meta || {});
+  return (all[m] = all[m] || {});
+}
+
+/** The window a model falls back to when nothing is set for it: what its
+ *  provider advertised, then the provider-wide number, then the global one. */
+function fallbackWindow(p: ProviderItem, m: string): number {
+  return (p.model_meta || {})[m]?.advertised_window || p.context_window || defaultCtxWindow;
+}
+
 /** Read the open editor's text fields back into the draft. Called before any
  *  re-render or provider switch so typing is never silently thrown away. */
 function commitProviderForm(): void {
@@ -1924,6 +2021,18 @@ function commitProviderForm(): void {
   p.api_key = el<HTMLInputElement>("#cfg-key").value.trim();
   const win = parseInt(el<HTMLInputElement>("#cfg-ctxwin").value, 10);
   p.context_window = win > 0 ? win : null;
+  // Per-model windows commit on blur, which Save would otherwise race.
+  overlay.querySelectorAll<HTMLInputElement>("#cfg-models .model-win").forEach((box) => {
+    const m = box.dataset.model;
+    if (m) setModelWindow(p, m, box.value);
+  });
+}
+
+/** Store a hand-set window for one model. Blank clears the override and hands
+ *  the model back to whatever its provider advertised. */
+function setModelWindow(p: ProviderItem, m: string, raw: string): void {
+  const n = parseInt(raw, 10);
+  metaOf(p, m).window_override = n > 0 ? n : null;
 }
 
 function renderModelList(): void {
@@ -1944,6 +2053,7 @@ function renderModelList(): void {
     return;
   }
   list.forEach((m) => {
+    const meta = (p.model_meta || {})[m] || {};
     const row = document.createElement("label");
     row.className = "model-row";
     const cb = document.createElement("input");
@@ -1952,6 +2062,28 @@ function renderModelList(): void {
     const name = document.createElement("span");
     name.className = "model-name";
     name.textContent = m;
+    if (meta.reasoning === true) {
+      const tag = document.createElement("span");
+      tag.className = "model-tag";
+      tag.textContent = "thinks";
+      tag.title = meta.reasoning_efforts?.length
+        ? "Takes a reasoning level: " + meta.reasoning_efforts.join(", ")
+        : "Takes a reasoning level — set it in the model picker";
+      name.appendChild(tag);
+    }
+    // Per-model window: the provider's own figure is the placeholder, so the
+    // box shows what will be used without pretending the user typed it.
+    const win = document.createElement("input");
+    win.type = "number";
+    win.className = "model-win";
+    win.min = "0";
+    win.step = "1000";
+    win.dataset.model = m;
+    win.value = meta.window_override ? String(meta.window_override) : "";
+    win.placeholder = fmtTokens(fallbackWindow(p, m));
+    win.title = meta.advertised_window
+      ? `Provider advertises ${meta.advertised_window.toLocaleString()} tokens. Type a number to override it.`
+      : `Nothing advertised for this model — using ${fallbackWindow(p, m).toLocaleString()} tokens. Type a number to set one.`;
     const drop = document.createElement("button");
     drop.className = "sess-act";
     drop.type = "button";
@@ -1962,14 +2094,20 @@ function renderModelList(): void {
       renderModelList();
       renderProviderList();
     });
+    win.addEventListener("click", (e) => e.stopPropagation());
+    win.addEventListener("change", () => {
+      setModelWindow(p, m, win.value);
+      win.placeholder = fmtTokens(fallbackWindow(p, m));
+    });
     drop.addEventListener("click", (e) => {
       e.preventDefault();
       p.models = p.models.filter((x) => x !== m);
       p.disabled_models = (p.disabled_models || []).filter((x) => x !== m);
+      delete (p.model_meta || {})[m];
       renderModelList();
       renderProviderList();
     });
-    row.append(cb, name, drop);
+    row.append(cb, name, win, drop);
     box.appendChild(row);
   });
 }
@@ -2070,14 +2208,16 @@ el<HTMLButtonElement>("#cfg-refresh").addEventListener("click", async () => {
   }
   statusText.textContent = "refreshing…";
   try {
-    const list = await api.refreshModels(p.base_url, p.api_key);
-    // Keep what the user turned off, drop entries the provider no longer
-    // serves — a stale opt-out would silently hide a re-added model.
-    p.disabled_models = (p.disabled_models || []).filter((m) => list.includes(m));
-    p.models = list;
+    // The backend does the folding-in: what the provider advertises is
+    // refreshed, what the user set by hand is left alone. Assigning in place
+    // keeps this the same draft object the editor is pointed at.
+    Object.assign(p, await api.refreshModels(p));
     renderModelList();
     renderProviderList();
-    statusText.textContent = list.length + " models";
+    const described = p.models.filter((m) => (p.model_meta || {})[m]?.advertised_window).length;
+    statusText.textContent = described
+      ? `${p.models.length} models · ${described} with a window`
+      : `${p.models.length} models`;
   } catch (e) {
     statusText.textContent = "refresh failed";
     console.error(e);
@@ -2129,6 +2269,7 @@ el<HTMLButtonElement>("#cfg-addprov").addEventListener("click", () => {
     api_key: "",
     models: [],
     context_window: null,
+    model_meta: {},
     enabled: true,
     disabled_models: [],
   };
@@ -2155,6 +2296,11 @@ async function openSettings(): Promise<void> {
     ...p,
     models: [...(p.models || [])],
     disabled_models: [...(p.disabled_models || [])],
+    // Deep enough that editing a window in the draft can't reach through to
+    // the saved config and make Cancel a lie.
+    model_meta: Object.fromEntries(
+      Object.entries(p.model_meta || {}).map(([m, meta]) => [m, { ...meta }]),
+    ),
   }));
   currentWs = cfg.workspace;
   defaultCtxWindow = cfg.context_window || 1_000_000;
@@ -2224,7 +2370,7 @@ async function syncModelState(): Promise<void> {
       await api.setSessionModel(currentSession, currentModel, currentProviderId);
     }
   }
-  modelPill.textContent = currentModel || "no model";
+  modelPill.textContent = pillText();
   sbModel.textContent = currentModel || "?";
   sbProv.textContent = "[" + providerLabel() + "]";
   ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);
@@ -2239,7 +2385,7 @@ async function applySessionModel(model: string, provider: string): Promise<void>
     currentProviderId =
       provider || catalog.find((c) => c.model === model)?.provider_id || currentProviderId;
   }
-  modelPill.textContent = currentModel || "no model";
+  modelPill.textContent = pillText();
   sbModel.textContent = currentModel || "?";
   sbProv.textContent = "[" + providerLabel() + "]";
   ctxWindow = await api.contextBudget(currentSession).catch(() => ctxWindow);

@@ -542,11 +542,16 @@ async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Resul
         })
         .collect();
 
+    // Read before the config is taken apart to build the connection.
+    let effort = client_cfg.active_reasoning_effort();
     let provider = engine::provider::ChatProvider::new(
         client_cfg.base_url,
         client_cfg.api_key,
         client_cfg.model,
         client_cfg.temperature,
+        // Summarising with the chat's own model means its own reasoning level
+        // too, so compaction can't fail against a model that requires one.
+        effort,
     );
     let prompt = vec![Msg::text(
         "user",
@@ -555,8 +560,7 @@ async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Resul
             old_text
         ),
     )];
-    let never = AtomicBool::new(false);
-    let summary = provider
+    let never = AtomicBool::new(false);    let summary = provider
         .chat(&prompt, &[], |_| {}, |_| {}, &never)
         .await
         .map(|c| c.text)
@@ -661,13 +665,21 @@ fn get_session(state: tauri::State<AppState>, id: String) -> Result<serde_json::
     }))
 }
 
+/// Fetch a provider's model listing and fold it into what that provider
+/// already knows. The merge lives here, not in the UI, so the rule that a
+/// refresh never overwrites a hand-set window or a chosen level is enforced in
+/// one tested place. The updated provider is returned rather than saved:
+/// Settings edits a copy, and Cancel has to really cancel.
 #[tauri::command]
-async fn refresh_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+async fn refresh_models(
+    provider: engine::agent::ProviderItem,
+) -> Result<engine::agent::ProviderItem, String> {
+    let mut provider = provider;
     let client = reqwest::Client::new();
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
     let mut req = client.get(&url);
-    if !api_key.is_empty() {
-        req = req.bearer_auth(&api_key);
+    if !provider.api_key.is_empty() {
+        req = req.bearer_auth(&provider.api_key);
     }
     let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
     if !resp.status().is_success() {
@@ -677,15 +689,13 @@ async fn refresh_models(base_url: String, api_key: String) -> Result<Vec<String>
         return Err(format!("provider returned {status}: {cut}"));
     }
     let v: serde_json::Value = resp.json().await.map_err(|e| format!("bad json: {e}"))?;
-    let mut out = Vec::new();
-    if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
-        for m in data {
-            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
-                out.push(id.to_string());
-            }
-        }
+    let listed = engine::provider::parse_models(&v);
+    if listed.is_empty() {
+        // Absorbing nothing would blank a working shelf on a malformed reply.
+        return Err("the provider listed no models".into());
     }
-    Ok(out)
+    provider.absorb(listed);
+    Ok(provider)
 }
 
 #[tauri::command]

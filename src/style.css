@@ -368,6 +368,31 @@ footer#composer-wrap { padding: 0 16px 16px; }
 .picker-group:first-child { padding-top: 4px; }
 .picker-empty { padding: 10px; color: var(--text-faint); font-size: 12.5px; text-align: center; }
 
+/* ---------- model rows: the window budgeted against, and the level asked for
+   ---------- Scoped to #picker-list because .picker-item is shared with the
+   session list, the slash menu and search results, which stay single-line. */
+#picker-list .picker-item.mdl {
+  position: relative; padding-left: 22px;
+  display: flex; flex-direction: column; gap: 5px; white-space: normal;
+}
+#picker-list .picker-item.mdl.active::before { position: absolute; left: 9px; top: 7px; margin: 0; }
+.mdl-top { display: flex; align-items: baseline; gap: 8px; }
+.mdl-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mdl-win {
+  flex: none; font-size: 10px; letter-spacing: 0.04em; color: var(--text-faint);
+  border: 1px solid var(--edge); border-radius: 999px; padding: 1px 7px;
+}
+/* Dashed: this is the global fallback, not a figure the provider promised. */
+.mdl-win.guess { border-style: dashed; opacity: 0.65; }
+.mdl-efforts { display: flex; flex-wrap: wrap; gap: 4px; }
+.eff {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em;
+  padding: 2px 8px; border-radius: 999px; cursor: pointer;
+  background: transparent; color: var(--text-faint); border: 1px solid var(--edge);
+}
+.eff:hover { color: var(--text); border-color: var(--text-faint); }
+.eff.on { color: var(--accent); border-color: var(--accent); }
+
 /* ---------- slash command popup (anchored above the composer) ---------- */
 #slash-menu {
   left: 0; right: auto; top: auto; bottom: calc(100% + 8px);
@@ -809,6 +834,19 @@ html[data-theme="light"] .empty-mark {
 .model-row input[type="checkbox"] { width: auto; margin: 0; flex: none; accent-color: var(--accent); cursor: pointer; }
 .model-name { flex: 1; font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-row input:checked ~ .model-name { color: var(--text); }
+/* What a refresh learned about this model, and the chance to disagree with it. */
+.model-tag {
+  margin-left: 7px; padding: 1px 6px; border-radius: 999px; font-size: 9px;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--accent); border: 1px solid var(--edge);
+}
+.model-row input.model-win {
+  flex: none; width: 74px; margin: 0; padding: 3px 7px; font-family: var(--mono);
+  font-size: 10.5px; text-align: right; border-radius: 6px;
+  background: var(--bg-2); color: var(--text); border: 1px solid var(--edge);
+}
+.model-row input.model-win::placeholder { color: var(--text-faint); }
+.model-row input.model-win:focus { border-color: var(--accent); outline: none; }
 
 /* ---------- sidebar: fully hidden when closed (no stray strip) ---------- */
 #sidebar {

@@ -11,16 +11,26 @@ pub struct ChatProvider {
     pub api_key: String,
     pub model: String,
     pub temperature: f64,
+    /// Reasoning level to ask for. `None` leaves the field out of the request
+    /// entirely, so providers that don't take one are never sent it.
+    pub reasoning_effort: Option<String>,
     pub client: reqwest::Client,
 }
 
 impl ChatProvider {
-    pub fn new(base_url: String, api_key: String, model: String, temperature: f64) -> Self {
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        model: String,
+        temperature: f64,
+        reasoning_effort: Option<String>,
+    ) -> Self {
         ChatProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
             temperature,
+            reasoning_effort: reasoning_effort.map(|e| e.trim().to_string()).filter(|e| !e.is_empty()),
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -119,6 +129,12 @@ impl ChatProvider {
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.to_vec());
+        }
+        // Only ever sent when a level was actually chosen for this model:
+        // providers that don't know the field reject the whole request, so an
+        // always-present default would break every non-reasoning model.
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = Value::String(effort.clone());
         }
         body
     }
@@ -256,4 +272,305 @@ fn truncate(s: &str, n: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+// ---------- what a provider says about its own models ----------
+
+/// One entry of a provider's `/models` listing.
+///
+/// Every field past the id is optional, and `None` means "the listing didn't
+/// say" — never "no". Gateways range from OpenAI's bare `{id, object}` to
+/// OpenRouter's fully described entries, and a silent listing must not be read
+/// as the model refusing a capability.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Usable context window in tokens, as advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Whether this model takes a reasoning level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// The levels it takes, when the listing enumerates them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
+}
+
+/// Keys used for the context window in the wild: OpenRouter (`context_length`),
+/// GitHub-style capability blocks (`max_context_window_tokens`), vLLM
+/// (`max_model_len`), LiteLLM (`max_input_tokens`).
+const WINDOW_KEYS: &[&str] = &[
+    "context_window",
+    "context_length",
+    "max_context_window_tokens",
+    "max_context_length",
+    "max_model_len",
+    "max_input_tokens",
+];
+
+/// Keys whose presence says something about reasoning. Values may be a bool, a
+/// list of levels, or a nested object, so each is inspected rather than cast.
+const REASONING_KEYS: &[&str] = &[
+    "reasoning",
+    "reasoning_effort",
+    "supports_reasoning",
+    "supports_reasoning_effort",
+    "include_reasoning",
+    "thinking",
+    "supported_reasoning_efforts",
+    "reasoning_efforts",
+];
+
+/// Request fields a model accepts. An explicit list that omits reasoning is the
+/// one case where we can say a model definitely doesn't take a level.
+const PARAM_LIST_KEYS: &[&str] = &["supported_parameters", "supported_params"];
+
+/// How deep to hunt for capability keys. Providers nest them under
+/// `top_provider`, `capabilities`, `capabilities.limits` or `model_info`, so
+/// searching by key beats hard-coding every vendor's path.
+const SEARCH_DEPTH: usize = 3;
+
+/// Pull the model list out of a `/models` response, keeping everything the
+/// provider chose to tell us about each model instead of only the id.
+pub fn parse_models(v: &Value) -> Vec<ModelInfo> {
+    let items = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .or_else(|| v.get("models").and_then(|d| d.as_array()))
+        .or_else(|| v.as_array());
+    let Some(items) = items else { return Vec::new() };
+    let mut out: Vec<ModelInfo> = Vec::new();
+    for m in items {
+        let Some(info) = model_info(m) else { continue };
+        // A gateway that fronts several upstreams can list the same id twice;
+        // the picker treats a model id as unique per provider, so must we.
+        if out.iter().any(|x| x.id == info.id) {
+            continue;
+        }
+        out.push(info);
+    }
+    out
+}
+
+fn model_info(m: &Value) -> Option<ModelInfo> {
+    let id = ["id", "model", "model_name", "name"]
+        .iter()
+        .find_map(|k| m.get(*k).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let (reasoning, reasoning_efforts) = reasoning_of(m);
+    Some(ModelInfo { id, context_window: window_of(m), reasoning, reasoning_efforts })
+}
+
+/// Every value filed under one of `keys`, anywhere in the shallow object tree.
+fn collect<'a>(v: &'a Value, keys: &[&str], depth: usize, out: &mut Vec<&'a Value>) {
+    let Some(obj) = v.as_object() else { return };
+    for k in keys {
+        if let Some(found) = obj.get(*k) {
+            out.push(found);
+        }
+    }
+    if depth == 0 {
+        return;
+    }
+    for val in obj.values() {
+        collect(val, keys, depth - 1, out);
+    }
+}
+
+/// The smallest window the listing mentions.
+///
+/// Deliberately the smallest rather than the first match: a listing can quote
+/// both a headline window and the smaller one actually served (OpenRouter's
+/// `top_provider`), and this number is a budget to stay under. Guessing high
+/// overflows the model; guessing low only compacts a little early.
+fn window_of(m: &Value) -> Option<u64> {
+    let mut found = Vec::new();
+    collect(m, WINDOW_KEYS, SEARCH_DEPTH, &mut found);
+    found
+        .iter()
+        .filter_map(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| *f > 0.0).map(|f| f as u64)))
+        .filter(|n| *n > 0)
+        .min()
+}
+
+fn reasoning_of(m: &Value) -> (Option<bool>, Vec<String>) {
+    let mut efforts: Vec<String> = Vec::new();
+    let mut yes = false;
+    let mut no = false;
+
+    let mut found = Vec::new();
+    collect(m, REASONING_KEYS, SEARCH_DEPTH, &mut found);
+    for v in found {
+        match v {
+            Value::Bool(b) => {
+                if *b {
+                    yes = true
+                } else {
+                    no = true
+                }
+            }
+            // A list under one of these keys is the set of levels on offer.
+            Value::Array(a) => {
+                for e in a.iter().filter_map(|e| e.as_str()) {
+                    push_effort(&mut efforts, e);
+                }
+                yes = true;
+            }
+            // A described block (`"reasoning": {"effort": [...]}`) is itself
+            // the provider saying the model reasons.
+            Value::Object(o) => {
+                yes = true;
+                for e in o.values().filter_map(|v| v.as_array()).flatten().filter_map(|e| e.as_str()) {
+                    push_effort(&mut efforts, e);
+                }
+            }
+            Value::String(s) => {
+                let low = s.trim().to_ascii_lowercase();
+                if low == "false" || low == "none" || low == "off" {
+                    no = true;
+                } else if !low.is_empty() {
+                    yes = true;
+                    push_effort(&mut efforts, s);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut params = Vec::new();
+    collect(m, PARAM_LIST_KEYS, SEARCH_DEPTH, &mut params);
+    for list in params.iter().filter_map(|v| v.as_array()) {
+        if list
+            .iter()
+            .filter_map(|x| x.as_str())
+            .any(|s| s.eq_ignore_ascii_case("reasoning") || s.eq_ignore_ascii_case("reasoning_effort") || s.eq_ignore_ascii_case("include_reasoning") || s.eq_ignore_ascii_case("thinking"))
+        {
+            yes = true;
+        } else if !list.is_empty() {
+            // The provider enumerated what this model accepts and reasoning was
+            // not on it — the one honest "no" available to us.
+            no = true;
+        }
+    }
+
+    let verdict = if yes {
+        Some(true)
+    } else if no {
+        Some(false)
+    } else {
+        None
+    };
+    if verdict != Some(true) {
+        efforts.clear();
+    }
+    (verdict, efforts)
+}
+
+fn push_effort(out: &mut Vec<String>, raw: &str) {
+    let e = raw.trim().to_ascii_lowercase();
+    // Skip the flag names themselves; only real levels belong in the list.
+    if e.is_empty() || e == "true" || e == "false" || e == "reasoning" || e == "reasoning_effort" {
+        return;
+    }
+    if !out.iter().any(|x| *x == e) {
+        out.push(e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn one(v: serde_json::Value) -> ModelInfo {
+        parse_models(&v).into_iter().next().expect("one model")
+    }
+
+    #[test]
+    fn a_bare_openai_listing_still_yields_the_model() {
+        let got = one(json!({ "data": [{ "id": "gpt-4o", "object": "model", "owned_by": "openai" }] }));
+        assert_eq!(got.id, "gpt-4o");
+        assert_eq!(got.context_window, None, "a silent listing must not invent a window");
+        assert_eq!(got.reasoning, None, "silence is not the same as 'no reasoning'");
+    }
+
+    #[test]
+    fn openrouter_style_metadata_is_kept() {
+        let got = one(json!({ "data": [{
+            "id": "openai/gpt-5",
+            "context_length": 400_000,
+            "top_provider": { "context_length": 272_000, "max_completion_tokens": 128_000 },
+            "supported_parameters": ["tools", "reasoning", "include_reasoning", "max_tokens"],
+        }] }));
+        assert_eq!(got.context_window, Some(272_000), "the window actually served wins over the headline one");
+        assert_eq!(got.reasoning, Some(true));
+    }
+
+    #[test]
+    fn a_nested_capability_block_is_found() {
+        let got = one(json!({ "data": [{
+            "id": "gpt-4.1",
+            "capabilities": {
+                "family": "gpt-4.1",
+                "limits": { "max_context_window_tokens": 128_000, "max_output_tokens": 16_384 },
+                "supports": { "streaming": true, "tool_calls": true },
+            },
+        }] }));
+        assert_eq!(got.context_window, Some(128_000), "hunting by key beats hard-coding vendor paths");
+        assert_eq!(got.reasoning, None);
+    }
+
+    #[test]
+    fn an_enumerated_parameter_list_without_reasoning_is_a_real_no() {
+        let got = one(json!({ "data": [{ "id": "small", "supported_parameters": ["tools", "max_tokens"] }] }));
+        assert_eq!(got.reasoning, Some(false), "the provider listed what it takes and reasoning wasn't in it");
+    }
+
+    #[test]
+    fn advertised_levels_are_captured() {
+        let got = one(json!({ "data": [{
+            "id": "thinker",
+            "supported_reasoning_efforts": ["Low", "medium", "HIGH", "low"],
+            "max_model_len": 32_768,
+        }] }));
+        assert_eq!(got.reasoning, Some(true));
+        assert_eq!(got.reasoning_efforts, vec!["low", "medium", "high"], "levels are normalised and de-duplicated");
+        assert_eq!(got.context_window, Some(32_768));
+    }
+
+    #[test]
+    fn an_explicit_false_is_respected_over_a_missing_window() {
+        let got = one(json!({ "data": [{ "id": "plain", "supports_reasoning": false }] }));
+        assert_eq!(got.reasoning, Some(false));
+        assert!(got.reasoning_efforts.is_empty(), "a model that doesn't reason offers no levels");
+    }
+
+    #[test]
+    fn other_list_shapes_and_duplicates_are_handled() {
+        let v = json!({ "models": [
+            { "id": "a", "max_input_tokens": 8_000 },
+            { "id": "a", "max_input_tokens": 99 },
+            { "name": "b" },
+            { "object": "model" },
+        ] });
+        let got = parse_models(&v);
+        assert_eq!(got.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(got[0].context_window, Some(8_000), "the first entry for an id wins");
+    }
+
+    #[test]
+    fn a_reasoning_level_is_sent_only_when_one_was_chosen() {
+        let plain = ChatProvider::new("https://x.test/v1".into(), String::new(), "m".into(), 0.7, None);
+        let body = plain.to_openai(&[Msg::text("user", "hi")], &[]);
+        assert!(body.get("reasoning_effort").is_none(), "a model with no level chosen must not be sent the field");
+
+        let thinking = ChatProvider::new("https://x.test/v1".into(), String::new(), "m".into(), 0.7, Some("high".into()));
+        let body = thinking.to_openai(&[Msg::text("user", "hi")], &[]);
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        let blank = ChatProvider::new("https://x.test/v1".into(), String::new(), "m".into(), 0.7, Some("  ".into()));
+        assert!(blank.reasoning_effort.is_none(), "an empty level is no level at all");
+    }
 }
