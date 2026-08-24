@@ -16,6 +16,18 @@
   --err: #f87171;
   --code-bg: #12151c;
   --radius: 14px;
+  /* The reading column, shared by every element that lines up with the
+     conversation: turns, activity strip, composer, hint, banner. It grows with
+     the window instead of pinning to a fixed 780px, which left a wide window
+     mostly empty, but stays capped so a line never runs so long the eye loses
+     its place coming back. Below the floor the cap simply stops binding and
+     the column fills whatever room is left. */
+  --content-width: clamp(48rem, 64vw, 72rem);
+  /* Measure for running text. The column above is sized for code blocks, tool
+     cards and tables, which earn every pixel; prose does not, so a paragraph
+     stops here (~95 mono characters) rather than running the full 1152px and
+     making the eye hunt for the start of the next line. */
+  --measure: 50rem;
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto,
     "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", SFMono-Regular,
@@ -122,7 +134,7 @@ main#conversation::-webkit-scrollbar { width: 10px; }
 main#conversation::-webkit-scrollbar-thumb { background: var(--edge); border-radius: 5px; }
 main#conversation::-webkit-scrollbar-thumb:hover { background: #2a303c; }
 
-.turn { max-width: 780px; margin: 0 auto; padding: 6px 22px 22px; }
+.turn { max-width: var(--content-width); margin: 0 auto; padding: 6px 22px 22px; }
 .turn .role {
   font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--text-faint); margin-bottom: 10px;
@@ -137,8 +149,16 @@ main#conversation::-webkit-scrollbar-thumb:hover { background: #2a303c; }
   font-variant-ligatures: none;
   color: var(--text);
 }
-.body.assistant { max-width: 72ch; }
+/* The turn already carries the column. A second, narrower cap here used to
+   strand the reply in the left half of its own column. */
+.body.assistant { max-width: 100%; }
+/* Prose stops at the measure; code blocks, tool cards and tables are left to
+   use the whole column, which is the reason it got wider. */
+.body.assistant .text > :is(p, ul, ol, blockquote, h1, h2, h3, h4, hr) {
+  max-width: var(--measure);
+}
 .body.user {
+  max-width: var(--measure);
   background: var(--bg-3);
   border: 1px solid var(--edge);
   border-radius: var(--radius);
@@ -248,7 +268,7 @@ main#conversation::-webkit-scrollbar-thumb:hover { background: #2a303c; }
 /* ---------- activity strip ---------- */
 #activity {
   display: flex; align-items: center; gap: 10px;
-  max-width: 780px; margin: 0 auto 8px;
+  max-width: var(--content-width); margin: 0 auto 8px;
   padding: 6px 14px; border: 1px solid var(--edge); border-radius: 10px;
   background: var(--bg-2); font-size: 12.5px; color: var(--text-dim);
 }
@@ -267,7 +287,7 @@ main#conversation::-webkit-scrollbar-thumb:hover { background: #2a303c; }
 footer#composer-wrap { padding: 0 16px 16px; }
 #composer {
   position: relative;
-  max-width: 780px; margin: 0 auto;
+  max-width: var(--content-width); margin: 0 auto;
   display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px;
   background: var(--bg-2);
   border: 1px solid var(--edge);
@@ -292,7 +312,7 @@ footer#composer-wrap { padding: 0 16px 16px; }
 #send.stop { background: var(--err); color: #20070a; }
 
 .hint {
-  max-width: 780px; margin: 8px auto 0; text-align: center;
+  max-width: var(--content-width); margin: 8px auto 0; text-align: center;
   font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.02em; color: var(--text-faint);
 }
 .hint kbd {
@@ -1166,7 +1186,7 @@ html[data-theme="light"] .empty-mark {
 /* ---------- chat banner ---------- */
 #chat-banner {
   padding: 8px 22px 0;
-  max-width: 780px; margin: 0 auto;
+  max-width: var(--content-width); margin: 0 auto;
   font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em;
   color: var(--text-faint); text-transform: uppercase;
   user-select: none;
@@ -1227,7 +1247,7 @@ footer#composer-wrap {
 }
 #composer, .hint, #activity {
   width: 100%;
-  max-width: 780px;
+  max-width: var(--content-width);
 }
 #activity { margin: 0 auto 8px; }
 .hint { margin: 8px auto 0; }
@@ -1246,7 +1266,7 @@ footer#composer-wrap {
 /* ---------- queued message chip ---------- */
 #queued {
   display: flex; align-items: center; gap: 10px;
-  width: 100%; max-width: 780px; margin: 0 auto 8px;
+  width: 100%; max-width: var(--content-width); margin: 0 auto 8px;
   padding: 6px 14px;
   border: 1px dashed var(--edge-2); border-radius: 10px;
   background: var(--bg-2);
