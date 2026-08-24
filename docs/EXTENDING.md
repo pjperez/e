@@ -1,95 +1,112 @@
 # Extending e
 
-`e` is designed around two clean extension surfaces: **tools** (things the agent
-can do) and **providers** (where the model comes from).
+Four surfaces, in order of how often you'll reach for them: **tools**,
+**providers**, **skills**, and **plugins**.
 
-## 1. Add a tool (the main one)
+## Tools
 
-A tool is just a struct that implements the [`Tool`](../src-tauri/src/engine/tools.rs) trait:
+A tool is a struct implementing the
+[`Tool`](../src-tauri/src/engine/tools.rs) trait, registered in
+`ToolRegistry::new()`. The [README](../README.md#add-a-tool) has a complete
+worked example; this is the reference.
 
 ```rust
-use crate::engine::tools::{Tool, ToolContext, ToolResult};
-use serde_json::{json, Value};
-
-pub struct ShoutTool;
-impl Tool for ShoutTool {
-    fn name(&self) -> &str { "shout" }
-    fn description(&self) -> &str {
-        "Echo a message back in ALL CAPS."
-    }
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "message": { "type": "string", "description": "Text to shout." }
-            },
-            "required": ["message"]
-        })
-    }
-    fn run(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
-        let msg = args.get("message")
-            .and_then(|m| m.as_str())
-            .ok_or("missing 'message'")?
-            .to_uppercase();
-        Ok(msg)
-    }
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> Value;   // JSON Schema for `arguments`
+    fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult;
 }
 ```
 
-Then register it in `ToolRegistry::new()` (`engine/tools.rs`):
+- `name()` is sanitised to `^[a-zA-Z0-9_-]{1,64}$` before it reaches the model.
+- `description()` and `parameters()` are the whole prompt the model gets — a
+  vague description is the usual reason a tool never gets called.
+- `run()` returns `Result<String, String>`; both arms are fed back into the
+  conversation, so an error message is a chance to tell the model how to retry.
+- `ctx.dir()` resolves the chat's workspace, refusing empty or relative paths
+  rather than silently falling back to the process's current directory.
 
-```rust
-r.register(ShoutTool);   // or any tool you write
-r.register(MyHttpTool);
-```
+`run()` is synchronous, on a worker thread. Bound anything long-running
+yourself — `ShellTool` shows the `mpsc::recv_timeout` pattern.
 
-That's it. The tool's `parameters()` JSON-Schema is sent to the model, its
-`run()` is invoked with the model's arguments, and the result is fed back into
-the conversation — the agent loop and UI tool cards just work.
+### Approval
 
-> **Tip:** implement `std::sync::mpsc` + a timeout inside `run()` (like the
-> built-in `shell` tool) for anything long-running or blocking.
+`shell` and `write_file` prompt the user before running unless YOLO mode is on.
+The list is `RISKY` in [`engine/agent.rs`](../src-tauri/src/engine/agent.rs) —
+add your tool's name there to require the same confirmation. The prompt
+mechanism itself is in
+[`engine/approval.rs`](../src-tauri/src/engine/approval.rs); with no GUI host
+(headless/RPC) it auto-approves.
 
-### Where to put your own tools
+## Providers
 
-Keep the core in `engine/tools.rs` for built-ins, or create
-`engine/plugins/mod.rs` and register them from `ToolRegistry::new()`. For a
-plugin, expose a simple `pub fn register_all(registry: &mut ToolRegistry)` and
-call it from `new()`.
+Any endpoint speaking the OpenAI streaming `/chat/completions` contract works —
+add it in Settings (⚙), no code required. `ChatProvider`
+([`engine/provider.rs`](../src-tauri/src/engine/provider.rs)) handles SSE
+streaming, tool calls, reasoning deltas, usage/cost reporting, and retries a
+throttled provider with exponential backoff.
 
-## 2. Change the provider / model
+Environment variables override the active provider for one launch:
 
-Any OpenAI-compatible endpoint works. The `ChatProvider`
-(`engine/provider.rs`) speaks the streaming `/chat/completions` contract with
-tool calling. Configure it in the GUI (gear icon) or via env:
+| env var        | meaning                                                     |
+|----------------|-------------------------------------------------------------|
+| `E_BASE_URL`   | e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1` |
+| `E_API_KEY`    | bearer key (optional for local servers)                      |
+| `E_MODEL`      | model id                                                     |
+| `E_WORKSPACE`  | working dir for `shell` and relative paths                   |
 
-| env var        | meaning                     |
-|----------------|-----------------------------|
-| `E_BASE_URL`   | e.g. `https://api.openai.com/v1`, or `http://localhost:11434/v1` (Ollama) |
-| `E_API_KEY`    | bearer key (optional for local servers) |
-| `E_MODEL`      | model id                     |
-| `E_WORKSPACE`  | working dir for `shell` etc. |
-
-To add a *different* provider protocol, implement a second client that returns
+For a different *protocol*, implement a client returning
 [`Completion`](../src-tauri/src/engine/mod.rs) and swap it into
 [`Agent`](../src-tauri/src/engine/agent.rs).
 
-## 3. Customize behavior
+## Skills
 
-- **System prompt** — edit in Settings. The agent seeds each new session with it.
-- **Max steps** — `MAX_STEPS` in `engine/agent.rs` bounds the agent loop.
-- **Workspace** — change where `shell` / relative file tools operate.
+A skill is a folder with a `SKILL.md` — instructions injected only when
+relevant, so they cost nothing until used.
 
-## Ideas (not yet built)
+```
+~/.e/skills/<name>/SKILL.md          # global
+~/.agents/skills/<name>/SKILL.md     # global, shared with other agent tools
+<project>/.e/skills/<name>/SKILL.md  # project-local
+```
 
-- **Sessions** — persist conversations and resume / fork them.
-- **Declarative tools** — define a tool in a JSON manifest (name, schema, and
-  an HTTP URL or command) with no recompile.
-- **Custom events** — subscribe to `e:token`, `e:tool_*` from the UI to add
-  panels (costs, plan preview, git diff).
-- **Model picker** — query the server's `/models` and list them in Settings.
-- **Streaming to plugins** — expose raw deltas and tool logs on a local event
-  bus so external tools can react.
+The front matter's `name` and `description` are listed to the model; the body is
+loaded when it calls the `skills` tool. See
+[`engine/skills.rs`](../src-tauri/src/engine/skills.rs).
 
-Most of these reduce to: add a command in `lib.rs`, emit an event, render a
-panel in `main.ts`.
+## Plugins
+
+A plugin is a drop-in TypeScript folder that can contribute tools without
+touching Rust:
+
+```
+~/.e/plugins/<name>/            # global
+<project>/.e/plugins/<name>/    # project-local
+```
+
+The manifest declares tools; calls are dispatched to the webview as
+`e:plugin_tool_call` and answered with `plugin_tool_result`. See
+[`engine/plugins.rs`](../src-tauri/src/engine/plugins.rs) and
+[EXTENSIBILITY.md](EXTENSIBILITY.md) for the full model.
+
+## MCP
+
+[`engine/mcp.rs`](../src-tauri/src/engine/mcp.rs) merges tools from external
+Model Context Protocol servers into the same registry, so they appear to the
+agent exactly like built-ins.
+
+## Headless
+
+The `e-rpc` binary drives the same engine over JSONL on stdio — commands in,
+events out — for scripts, IDEs, and other agents.
+
+```bash
+echo '{"id":1,"type":"send","text":"list the repo"}' | e-rpc
+```
+
+Commands are `send`, `reset` and `stop`. Events mirror the `Emitter` trait in
+[`engine/mod.rs`](../src-tauri/src/engine/mod.rs): `token`, `reasoning`,
+`activity`, `retry`, `tool_call`, `tool_result`, `message_end`, `summary`,
+`done`, `error`. Anything you add to `Emitter` is available to the GUI and the
+RPC transport at once.

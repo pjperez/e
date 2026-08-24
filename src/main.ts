@@ -465,7 +465,10 @@ function explainError(raw: string): ErrInfo {
 
   let title = "Run failed";
   let hint = message || "";
-  if (/^workspace folder does not exist/i.test(raw)) {
+  if (/^no provider configured/i.test(raw)) {
+    title = "No provider yet";
+    hint = "Open Settings (⚙) to add an OpenAI-compatible provider — a base URL, and a key if it needs one — then pick a model from the title bar.";
+  } else if (/^workspace folder does not exist/i.test(raw)) {
     title = "Workspace folder is missing";
     hint = raw.replace(/^workspace folder does not exist:\s*/i, "Folder: ");
   } else if (/insufficient tool messages|must be followed by tool messages|tool_call_id/i.test(raw)) {

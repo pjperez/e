@@ -5,6 +5,8 @@ dist/
 src-tauri/target/
 # config (contains your API key)
 .e/
+# local tool caches
+.impeccable/hook.cache.json
 # os
 .DS_Store
 Thumbs.db

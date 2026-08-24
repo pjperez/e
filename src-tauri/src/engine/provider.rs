@@ -197,6 +197,13 @@ impl ChatProvider {
             return Ok(Completion { text: String::new(), tool_calls: Vec::new(), usage: (0, 0), cost: None, reasoning: String::new() });
         }
 
+        // A fresh install has no provider. Say so plainly — the alternative is
+        // posting to a relative URL and reporting a transport error nobody can
+        // act on.
+        if self.base_url.is_empty() {
+            return Err("no provider configured".to_string());
+        }
+
         let body = self.to_openai(msgs, tools);
         let max_attempts = MAX_RETRIES + 1;
         let mut attempt: u32 = 0;

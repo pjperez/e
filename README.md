@@ -5,12 +5,12 @@
 </p>
 
 **e** is a minimalist, fast, extensible **agent harness** with a native GUI —
-think the inner loop of an agent coding tool (converse → plan → fork tools →
-apply → repeat) without the terminal. A slim Rust core drives the agent and its
-tools; a tiny hand-tuned webview renders the conversation.
+the inner loop of an agent coding tool (converse → call tools → apply → repeat)
+without the terminal. A slim Rust core drives the agent and its tools; a tiny
+hand-tuned webview renders the conversation.
 
 Built on **Tauri v2** (Rust + the OS WebView) with a vanilla TypeScript
-frontend. No electron, no heavy framework — the whole renderer is ~12 KB of JS.
+frontend. No Electron, no framework — the whole renderer is ~20 KB.
 
 ```
 .______________________________.
@@ -28,42 +28,128 @@ frontend. No electron, no heavy framework — the whole renderer is ~12 KB of JS
 '______________________________'
 ```
 
-## Highlights
+## What it does
 
-- **Fast & slim** — native WebView, single small Rust binary, ~20 KB static UI.
-- **Beautiful & minimal** — dark, calm, system-typography UI with streaming
-  tokens, collapsible tool cards, and a clean composer.
-- **A real harness, not a wrapper** — iterative agent loop: the model can call
-  tools (shell, read/write files, list dir) and the results feed back until it
-  finishes.
-- **Extensible** — add a tool by implementing one trait (see
-  [docs/EXTENDING.md](docs/EXTENDING.md)). Point it at any OpenAI-compatible
-  provider (OpenAI, Ollama, LM Studio, vLLM, Together, your gateway).
-- **Private** — your key and config live in `~/.e/config.json`, never in the
-  repo. Respects `E_API_KEY` / `E_BASE_URL` / `E_MODEL` / `E_WORKSPACE` env vars.
+- **A real harness, not a wrapper.** The model calls tools — shell, read/write
+  files, list dir — and the results feed back until the task is done, bounded to
+  25 steps and cancellable with **Esc**.
+- **Any OpenAI-compatible provider.** OpenAI, Ollama, LM Studio, vLLM, Together,
+  OpenRouter, or your own gateway. Keep several at once and switch per chat.
+- **Chats and projects.** Conversations persist, fork, and carry their own model,
+  workspace and token budget. History is summarised automatically when a chat
+  approaches its model's context window.
+- **Streaming everything.** Tokens, reasoning, tool cards, and live token and
+  cost counters as the run happens.
+- **Extensible.** Add a tool by implementing one trait — see
+  [Add a tool](#add-a-tool) below.
+- **Yours.** Keys and settings live in `~/.e/config.json`, never in the repo.
 
-## Prerequisites
+## Install
 
-- Node.js ≥ 18 and npm
-- Rust (stable) with your platform's Tauri prerequisites:
-  <https://tauri.app/start/prerequisites/> (on Windows: WebView2 runtime and the
-  MSVC toolchain)
-
-## Run it
+Prerequisites: Node.js ≥ 18, Rust (stable), and your platform's
+[Tauri prerequisites](https://tauri.app/start/prerequisites/) (on Windows:
+WebView2 runtime + MSVC toolchain).
 
 ```bash
 npm install
 npm run tauri dev        # dev server + native window, hot reload
-```
-
-Configure the model once: click the **gear** in the title bar (or set
-`E_API_KEY` etc. before launching).
-
-To build a distributable binary:
-
-```bash
 npm run tauri build      # single native executable in src-tauri/target/release/
 ```
+
+## First run
+
+`e` ships with **no provider configured**. Open **Settings (⚙)** and add one:
+
+1. **+ Add provider** — give it a name, a base URL (e.g.
+   `https://api.openai.com/v1`, or `http://localhost:11434/v1` for Ollama) and a
+   key if it needs one.
+2. **Refresh** pulls the model list from `<base_url>/models`, or add model ids by
+   hand for gateways that don't list everything they serve.
+3. Pick a model from the title bar. A model carries its provider with it, so
+   choosing one selects the base URL, key and context window too.
+
+Environment variables override the active provider for a launch: `E_BASE_URL`,
+`E_API_KEY`, `E_MODEL`, `E_WORKSPACE`.
+
+## Built-in tools
+
+| tool         | purpose                                        |
+|--------------|------------------------------------------------|
+| `shell`      | run a command in the workspace (120 s timeout)  |
+| `read_file`  | read a text file (truncated if huge)            |
+| `write_file` | write a file, creating parents                  |
+| `list_dir`   | list a directory                                |
+| `skills`     | load a `SKILL.md` on demand                     |
+
+The **workspace** — where `shell` runs and relative paths resolve — belongs to
+the chat's project and is set in the sidebar (✎).
+
+## Add a tool
+
+A tool is a struct implementing one trait. Here is a complete, working one:
+
+```rust
+// src-tauri/src/engine/tools.rs
+use serde_json::{json, Value};
+
+pub struct GitStatusTool;
+
+impl Tool for GitStatusTool {
+    fn name(&self) -> &str {
+        "git_status"
+    }
+
+    fn description(&self) -> &str {
+        "Show the working tree status of the workspace's git repository."
+    }
+
+    /// JSON Schema for `arguments`. This is what the model is shown.
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "short": { "type": "boolean", "description": "Use --short output." }
+            }
+        })
+    }
+
+    fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult {
+        let short = args.get("short").and_then(|s| s.as_bool()).unwrap_or(true);
+
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(ctx.dir()?).arg("status");
+        if short {
+            cmd.arg("--short");
+        }
+
+        let out = cmd.output().map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+}
+```
+
+Register it in `ToolRegistry::new()`:
+
+```rust
+r.register(GitStatusTool);
+```
+
+That is the whole surface. `parameters()` is sent to the model, `run()` receives
+whatever the model passed, and the returned `Ok`/`Err` string is fed back into
+the conversation — the agent loop, the tool card in the UI, and the approval
+prompt all work automatically.
+
+Two things worth knowing:
+
+- `ctx.dir()?` resolves the chat's workspace and returns a readable error if it
+  is unset or missing, so a tool never runs somewhere unexpected.
+- `run()` is synchronous and runs on a worker thread. For anything long-running,
+  apply your own timeout (the `shell` tool uses `mpsc::recv_timeout`).
+
+See [docs/EXTENDING.md](docs/EXTENDING.md) for providers, skills and plugins.
 
 ## How it works
 
@@ -79,50 +165,52 @@ Tauri frontend (TypeScript)          Rust core (src-tauri/src)
 
 The engine owns a `Vec<Msg>` conversation, calls the provider, executes any
 requested tools, injects the results, and repeats until the model stops
-requesting tools (bounded to 25 steps; cancellable with **Esc**).
+requesting tools.
 
-### Built-in tools
-
-| tool         | purpose                              |
-|--------------|--------------------------------------|
-| `shell`      | run a command in the workspace (120 s timeout) |
-| `read_file`  | read a text file (truncated if huge) |
-| `write_file` | write a file, creating parents        |
-| `list_dir`   | list a directory                     |
-
-The **workspace** (where `shell` runs and relative paths resolve) is
-configured in Settings and defaults to where you launched `e`.
+```
+src-tauri/src/
+  main.rs            desktop entry point
+  lib.rs             Tauri app, commands, event bridge
+  engine/
+    mod.rs           message/tool-call model + Emitter trait
+    provider.rs      OpenAI-compatible streaming client
+    tools.rs         Tool trait, registry, built-in tools
+    agent.rs         config + the agent loop
+    sessions.rs      chats, projects, persistence
+    skills.rs        SKILL.md discovery
+    mcp.rs           MCP client
+    plugins.rs       drop-in TypeScript plugins
+src/
+  main.ts            UI controller
+  api.ts             typed bridge to the Rust backend
+  markdown.ts        tiny XSS-safe markdown renderer
+  copy.ts            copy-to-clipboard buttons
+  style.css          all styling
+```
 
 ## Configuration
 
-`e` ships pointed at your **AI Gateway** by default — same base URL,
-bearer auth, and models Pi uses. The key is never in the repo: set
-`E_API_KEY`, or put it in the local (git-ignored) `~/.e/config.json`.
-Portable overrides: `E_BASE_URL`, `E_MODEL`, `E_WORKSPACE` (they apply to the
-provider the current model belongs to). Settings live in `~/.e/config.json`:
+Settings live in `~/.e/config.json` and are written by the GUI — edit by hand
+only if you want to.
 
 ```jsonc
 {
   "temperature": 0.7,
   "system": "You are e, a fast, capable agent…",
   "workspace": "C:/src/work",
-  "model": "opencode-go/deepseek-v4-flash",  // the picked model…
-  "provider_id": "aigateway",                // …and who serves it
+  "model": "gpt-4.1-mini",     // the picked model…
+  "provider_id": "openai",     // …and who serves it
   "providers": [
     {
-      "id": "aigateway",
-      "name": "AI Gateway",
-      "base_url": "https://provider.example/v1",
-      "api_key": "",              // your gateway key here, or set E_API_KEY
+      "id": "openai",
+      "name": "OpenAI",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",              // or set E_API_KEY
       "enabled": true,            // off hides its models but keeps the key
-      "context_window": null,     // shelf-wide fallback; null = global
-      "models": [
-        "zai-coding/glm-5.2",
-        "opencode-go/deepseek-v4-flash",
-        "openai/gpt-5.6-luna"
-      ],
+      "context_window": null,     // provider-wide fallback; null = global
+      "models": ["gpt-4.1-mini", "gpt-4.1"],
       "model_meta": {             // per model: learned on Refresh, tuned by you
-        "openai/gpt-5.6-luna": {
+        "gpt-4.1": {
           "advertised_window": 272000,   // what /models said
           "window_override": null,       // your number; beats the above
           "reasoning": true,             // takes a reasoning level
@@ -130,7 +218,7 @@ provider the current model belongs to). Settings live in `~/.e/config.json`:
           "reasoning_effort": "high"     // the level to ask for
         }
       },
-      "disabled_models": ["zai-coding/glm-5.2"]  // hidden from the picker
+      "disabled_models": ["gpt-4.1"]     // hidden from the picker
     },
     {
       "id": "ollama",
@@ -145,72 +233,13 @@ provider the current model belongs to). Settings live in `~/.e/config.json`:
 }
 ```
 
-`base_url`, `api_key` and `models` are also written at the top level, but they
-are **derived** — the connection `e` actually uses is always the one belonging
-to the provider that serves the selected model.
+Top-level `base_url`, `api_key` and `models` are derived — the connection `e`
+uses is always the one belonging to the provider serving the selected model.
 
-### Providers and models
-
-Keep as many providers as you like. **Settings (⚙) decides what is available**,
-not what is active:
-
-- Tick a provider to enable it, untick to hide all of its models — the API key
-  stays, so turning it back on is one click.
-- Open a provider (✎) to tick individual models, filter them, `All` / `None`
-  them, `Refresh` from `<base>/models`, or add a model id by hand for gateways
-  that don't list everything they serve.
-- `Refresh` keeps everything the listing says about each model — its context
-  window and whether it takes a reasoning level — not just the ids. It never
-  overwrites a window you typed or a level you chose; each model row shows the
-  advertised figure as the placeholder, so typing over it is an override and
-  clearing the box hands the model back to its provider.
-- `disabled_models` is an opt-out list, so a `Refresh` surfaces newly added
-  models instead of silently hiding them.
-
-**Picking is separate:** click the model name in the title bar and you get every
-enabled model from every enabled provider in one list, grouped by provider.
-Choosing a model chooses its provider too — base URL, key and context window all
-follow it, per chat. Two providers can even serve the same model id; a chat
-stays on the one it was picked from.
-
-Each row carries what that model actually costs you:
-
-- **Context window** — the number compaction is budgeted against, resolved
-  per model first, then the provider's fallback, then the global one. A dashed
-  badge means nothing was advertised and the global default is being guessed.
-- **Reasoning level** — `auto · min · low · med · high`, or exactly the levels
-  the provider enumerated. `auto` sends no `reasoning_effort` field at all, so
-  models and gateways that don't take one are never sent it. A provider that
-  explicitly says a model takes no level hides the chips entirely; one that says
-  nothing still lets you dial the model you're on. Clicking a level keeps the
-  picker open — dialling effort and switching models are different intentions.
-
-Switching model mid-chat moves the budget straight away. It does **not** compact:
-if the new model's window is smaller than what the chat is already carrying, the
-status bar turns amber and history is only summarised when you send the next
-message. Picking a model by mistake is therefore undoable — pick the old one
-back and nothing has been lost. The budget is tracked per chat, so a queued run
-in a background chat is measured against its own model rather than whichever one
-happens to be on screen.
-
-## Project layout
-
-```
-src-tauri/src/
-  main.rs            desktop entry point
-  lib.rs             Tauri app, commands, event bridge
-  engine/
-    mod.rs           message/tool-call model + Emitter trait
-    provider.rs      OpenAI-compatible streaming client
-    tools.rs         Tool trait, registry, built-in tools
-    agent.rs         config + the agent loop
-src/
-  main.ts            UI controller
-  api.ts             typed bridge to the Rust backend
-  markdown.ts        tiny XSS-safe markdown renderer
-  copy.ts            copy-to-clipboard buttons (messages, code, tool output)
-  style.css          all styling
-```
+**Context window** resolves per model, then the provider's fallback, then the
+global default; it is what compaction is budgeted against. **Reasoning level**
+is `auto · min · low · med · high`, or exactly the levels the provider
+enumerated — `auto` sends no `reasoning_effort` field at all.
 
 ## Brand
 
@@ -218,50 +247,10 @@ src/
   <img src="design/brand/e-construction.svg" alt="the mark's construction" width="440">
 </p>
 
-The mark is a lowercase **e** whose bowl really is a logarithmic spiral — it is
-generated, not drawn by hand. [`design/logo.py`](design/logo.py) emits every
-asset from the same equations, so the mint curve in the drawing above is not an
-overlay: it *is* the outer contour.
-
-*e* and φ meet in exactly one place: the **logarithmic spiral**.
-
-```
-r(θ) = r₀·e^(bθ)
-```
-
-The canonical *golden* spiral is the one that grows by φ every quarter turn:
-
-```
-e^(bπ/2) = φ    ⟹    b = 2·lnφ/π ≈ 0.3063489
-```
-
-**That rate is too aggressive for a letterform.** Across this `e`'s 307.5°
-sweep it compounds to φ^3.42 ≈ 5.6×, and the shape stops reading as an `e` at
-all. So the bowl uses the same equation tuned to grow by exactly φ across the
-whole sweep instead:
-
-```
-b = lnφ/sweep ≈ 0.08967
-```
-
-Still a true logarithmic spiral, still golden — the radius at the terminal is
-exactly φ times the radius at the crossbar junction. φ sets the proportion,
-*e* does the growing. From there, the rest of the letter:
-
-| measurement | value |
-|-------------|-------|
-| bowl        | `r = r₀·e^(bθ)`, `b = lnφ/sweep` — radius `×φ` end to end |
-| x-height    | `2R` — the fitted bounding box |
-| weight      | `R/φ³`, modulated `×φ` on the stress axis |
-| crossbar    | golden section of the counter, so eye : counter = `1 : φ` |
-| aperture    | `360/φ⁴` = 52.5° of wedge, removed at the lower right |
-| tile radius | `size/φ³`, mark inset `size/φ³` |
-
-`growth` in `MARK` is the one knob: `1.0` collapses the bowl back to a circle,
-`φ` is what ships. The app tile also carries a canonical golden spiral as an
-ornament in its top-right corner — that one is decoration, not construction.
-
-Regenerate everything (marks, tile, banner, favicon):
+The mark is a lowercase **e** whose bowl is a true logarithmic spiral,
+`r(θ) = r₀·e^(bθ)`, tuned so the radius grows by exactly φ across the sweep. It
+is generated, not drawn: [`design/logo.py`](design/logo.py) emits every asset
+from the same equations.
 
 ```bash
 python design/logo.py            # writes design/brand/* and public/e.svg
@@ -271,14 +260,3 @@ npm run tauri -- icon design/brand/e-tile.svg   # platform icon set
 
 `public/e.svg` is the single source of truth for the in-app mark: the title bar
 and empty state tint it with a CSS mask, so it follows the theme for free.
-
-## Status
-
-A clean, working v0. See [docs/EXTENDING.md](docs/EXTENDING.md) for how to add
-tools, and the open ideas there for custom models, sessions, and plugins.
-
-## Extensible
-See [docs/EXTENSIBILITY.md](docs/EXTENSIBILITY.md) for the roadmap: user-facing
-**plugins** (drop-in TS folders), **skills** (SKILL.md, on demand), **MCP**
-servers (feature-flagged client that merges external tools), and **remote/RPC**
-(headless JSONL mode) — while the Rust core stays a thin, stable kernel.
