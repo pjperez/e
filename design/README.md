@@ -15,17 +15,36 @@ python logo.py --review   # contact sheet of the six candidate cuts -> out/index
 *e* and φ meet in exactly one place: the **logarithmic spiral**.
 
 ```
-r(θ) = a·e^(bθ)     is golden when it grows by φ every quarter turn
+r(θ) = r₀·e^(bθ)
+```
+
+The canonical *golden* spiral grows by φ every quarter turn:
+
+```
 e^(bπ/2) = φ   ⟹   b = 2·lnφ/π ≈ 0.3063489
 ```
 
-The golden spiral is literally *e* raised to a golden power. φ sets the
-proportion, *e* does the growing — which is a fair description of an agent
-harness too. So every measurement in the letter is a power of φ:
+That rate is too aggressive for a letter. Across this `e`'s 307.5° sweep it
+compounds to φ^3.42 ≈ 5.6×, which destroys the shape — run
+`python logo.py --growth` to see it fail. So the bowl uses the same equation
+tuned to grow by exactly φ across the whole sweep:
+
+```
+b = lnφ/sweep ≈ 0.08967
+```
+
+Still a genuine logarithmic spiral, still golden: the terminal radius is
+exactly φ times the radius at the crossbar junction. φ sets the proportion,
+*e* does the growing — which is a fair description of an agent harness too.
+
+**The spiral is the contour, not an overlay.** `_build_parts()` returns the
+exact curve it used to generate the outer edge, and `construction_svg()` draws
+*that* curve. If they ever stop coinciding, the drawing is wrong.
 
 | measurement | value                                    |
 |-------------|------------------------------------------|
-| x-height    | `2R`, the mark's bounding circle         |
+| bowl        | `r = r₀·e^(bθ)`, `b = lnφ/sweep`, radius `×φ` end to end |
+| x-height    | `2R`, the fitted bounding box            |
 | weight      | `R/φ³`, modulated `×φ` on the stress axis|
 | stress      | tilted `360/φ⁸ ≈ 8.2°` off vertical      |
 | crossbar    | golden section of the counter → eye : counter = `1 : φ` |
@@ -33,6 +52,10 @@ harness too. So every measurement in the letter is a power of φ:
 | tile radius | `size/φ³`, with the mark inset `size/φ³` |
 
 `brand/e-construction.svg` draws all of it.
+
+The app tile also carries a *canonical* golden spiral (φ per quarter turn)
+etched into its top-right corner. That one is an ornament, not construction —
+it does not generate anything.
 
 ## Files
 
