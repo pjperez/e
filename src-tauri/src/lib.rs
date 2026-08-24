@@ -174,6 +174,10 @@ fn save_config(state: tauri::State<AppState>, config: Config) -> Result<(), Stri
             config.model = cur.model;
             config.provider_id = cur.provider_id;
         }
+        // Which plugins are off is owned by `set_plugin_enabled`, not by this
+        // form. Taking it from the payload would clear the list every time
+        // Settings was saved, quietly re-enabling a plugin the user rejected.
+        config.disabled_plugins = cur.disabled_plugins;
     }
     config.normalize();
     if let Ok(mut c) = state.config.lock() {
@@ -273,26 +277,78 @@ fn set_session_model(state: tauri::State<AppState>, id: String, model: String, p
     Ok(())
 }
 
+/// Plugins visible from this chat's project, with the ones the user switched
+/// off already marked — the frontend never has to re-derive that.
 #[tauri::command]
-fn list_plugins() -> Vec<engine::plugins::PluginManifest> {
-    plugins::discover()
+fn list_plugins(state: tauri::State<AppState>, workspace: Option<String>) -> Vec<engine::plugins::PluginInfo> {
+    let off = state.config().disabled_plugins;
+    plugins::discover(workspace.as_deref())
+        .into_iter()
+        .map(|mut p| {
+            p.enabled = !off.contains(&p.name);
+            p
+        })
+        .collect()
 }
 
 #[tauri::command]
-fn get_plugin(name: String) -> Result<serde_json::Value, String> {
-    plugins::get_plugin(&name)
-        .map(|(mf, src)| serde_json::json!({ "manifest": mf, "source": src }))
-        .ok_or_else(|| format!("plugin '{}' not found", name))
+fn get_plugin(name: String, workspace: Option<String>) -> Result<serde_json::Value, String> {
+    plugins::get_plugin(&name, workspace.as_deref())
+        .map(|(info, src)| serde_json::json!({ "manifest": info, "source": src }))
 }
 
+/// Turn a plugin on or off. Persisted, because a plugin the user rejected must
+/// stay rejected across restarts.
 #[tauri::command]
-fn set_plugin_tools(state: tauri::State<AppState>, tools: Vec<engine::plugins::PluginToolDef>) {
-    state.tools.set_plugin_tools(tools);
+fn set_plugin_enabled(state: tauri::State<AppState>, name: String, enabled: bool) -> Result<(), String> {
+    let mut cfg = state.config();
+    cfg.disabled_plugins.retain(|n| n != &name);
+    if !enabled {
+        cfg.disabled_plugins.push(name);
+        cfg.disabled_plugins.sort();
+    }
+    if let Ok(mut c) = state.config.lock() {
+        *c = cfg.clone();
+    }
+    cfg.save();
+    Ok(())
+}
+
+/// Replace the plugin tool table. Returns what had to be refused (a name that
+/// shadows a built-in, a duplicate) so the host can tell the user instead of
+/// leaving a tool silently missing.
+#[tauri::command]
+fn set_plugin_tools(state: tauri::State<AppState>, tools: Vec<engine::plugins::PluginToolDef>) -> Vec<String> {
+    state.tools.set_plugin_tools(tools)
 }
 
 #[tauri::command]
 fn plugin_tool_result(sid: String, ok: bool, output: String) {
     plugins::resolve(&sid, ok, output);
+}
+
+/// The host says whether any plugin watches tool calls. While none does, the
+/// engine skips the veto round-trip entirely.
+#[tauri::command]
+fn set_plugin_veto(active: bool) {
+    plugins::set_veto_active(active);
+}
+
+#[tauri::command]
+fn plugin_veto_result(id: String, reason: Option<String>) {
+    plugins::veto_resolve(&id, reason);
+}
+
+#[tauri::command]
+fn list_mcp_servers() -> Vec<engine::mcp::McpStatus> {
+    engine::mcp::status()
+}
+
+/// Re-scan every extension surface. MCP servers are restarted here; plugins
+/// and skills are re-read by the frontend, which owns their runtime.
+#[tauri::command]
+fn reload_extensions(state: tauri::State<AppState>, workspace: Option<String>) {
+    engine::mcp::load(state.tools.clone(), workspace);
 }
 
 #[tauri::command]
@@ -398,13 +454,15 @@ fn search_sessions(state: tauri::State<AppState>, query: String) -> Result<serde
 }
 
 #[tauri::command]
-fn list_skills() -> Vec<engine::skills::SkillMeta> {
-    SkillStore::new().list()
+fn list_skills(workspace: Option<String>) -> Vec<engine::skills::SkillMeta> {
+    SkillStore::for_workspace(&workspace.unwrap_or_default()).list()
 }
 
 #[tauri::command]
-fn get_skill(name: String) -> Result<String, String> {
-    SkillStore::new().get(&name).ok_or_else(|| format!("skill '{name}' not found"))
+fn get_skill(name: String, workspace: Option<String>) -> Result<String, String> {
+    SkillStore::for_workspace(&workspace.unwrap_or_default())
+        .get(&name)
+        .ok_or_else(|| format!("skill '{name}' not found"))
 }
 
 #[tauri::command]
@@ -929,17 +987,15 @@ pub fn run() {
         .setup(|app| {
             plugins::init(app.handle().clone());
             approval::init(app.handle().clone());
+            // MCP servers start against the chat's project folder, so a
+            // server told to serve "." serves the project rather than
+            // wherever the app was launched from.
             {
                 let h = app.handle().clone();
                 std::thread::spawn(move || {
-                    let tools = h.state::<AppState>().tools.clone();
-                    for srv in engine::mcp::load_servers() {
-                        if let Ok(list) = srv.list_tools() {
-                            for t in list {
-                                tools.register_boxed(Box::new(engine::mcp::McpTool::new(srv.clone(), t)));
-                            }
-                        }
-                    }
+                    let state = h.state::<AppState>();
+                    let ws = state.store.lock().ok().map(|s| s.resolved_workspace(&s.current.clone()));
+                    engine::mcp::load(state.tools.clone(), ws.filter(|w| !w.is_empty()));
                 });
             }
             Ok(())
@@ -970,8 +1026,13 @@ pub fn run() {
             set_session_model,
             list_plugins,
             get_plugin,
+            set_plugin_enabled,
             set_plugin_tools,
             plugin_tool_result,
+            set_plugin_veto,
+            plugin_veto_result,
+            list_mcp_servers,
+            reload_extensions,
             list_projects,
             new_project,
             switch_project,

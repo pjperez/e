@@ -71,16 +71,19 @@ export type Config = {
   /** Provider that serves `model`; the backend re-derives the connection. */
   provider_id: string;
   providers: ProviderItem[];
+  /** Plugins the user switched off in Settings → Extensions. */
+  disabled_plugins?: string[];
 };
 
 
 export type EngineEvents =
   | { type: "token"; text: string; sid: string }
-  | { type: "tool_call"; sid: string; id: string; name: string; arguments: string }
+  | { type: "tool_call"; sid: string; id: string; name: string; arguments: string; args?: Record<string, unknown> }
   | { type: "tool_result"; sid: string; id: string; name: string; success: boolean; output: string }
   | { type: "message_end"; sid: string }
   | { type: "reasoning"; text: string; sid: string }
   | { type: "plugin_tool_call"; sid: string; name: string; arguments: string }
+  | { type: "plugin_veto_request"; id: string; sid: string; tool: string; arguments: string }
   | { type: "done"; stopped: boolean; sid: string }
   | { type: "activity"; sid: string; phase: string; tool: string | null; step: number }
   | { type: "retry"; sid: string; attempt: number; max: number; delayMs: number; status: number; reason: string }
@@ -136,21 +139,82 @@ export async function readAttachment(path: string): Promise<{ path: string; cont
 
 export type ProjectMeta = { id: string; name: string; workspace: string; created: number; scratch?: boolean };
 
-export type PluginToolDef = { name: string; description: string; parameters?: unknown };
+export type PluginToolDef = { name: string; description: string; parameters?: unknown; plugin?: string };
 
-export async function listPlugins(): Promise<{ name: string; version?: string; description?: string; capabilities?: string[]; entry?: string }[]> {
+/** A plugin folder as the backend found it: identity, provenance, and why it
+ *  cannot load when it cannot. */
+export type PluginInfo = {
+  name: string;
+  display: string;
+  version: string;
+  description: string;
+  capabilities: string[];
+  entry: string;
+  dir: string;
+  scope: "global" | "project";
+  enabled: boolean;
+  error: string;
+};
+
+export type SkillMeta = { name: string; display: string; description: string; path: string; scope: "global" | "project" };
+
+export type McpStatus = {
+  name: string;
+  command: string;
+  scope: "global" | "project";
+  state: "ready" | "starting" | "disabled" | "error";
+  tools: string[];
+  error: string;
+};
+
+export async function listPlugins(workspace?: string): Promise<PluginInfo[]> {
   if (!inTauri) return [];
-  return invoke("list_plugins");
+  return invoke("list_plugins", { workspace });
 }
 
-export async function getPlugin(name: string): Promise<{ manifest: unknown; source: string }> {
-  if (!inTauri) return { manifest: {}, source: "" };
-  return invoke("get_plugin", { name });
+export async function getPlugin(name: string, workspace?: string): Promise<{ manifest: PluginInfo; source: string }> {
+  if (!inTauri) return { manifest: {} as PluginInfo, source: "" };
+  return invoke("get_plugin", { name, workspace });
 }
 
-export async function setPluginTools(tools: PluginToolDef[]): Promise<void> {
+export async function setPluginEnabled(name: string, enabled: boolean): Promise<void> {
   if (!inTauri) return;
-  await invoke("set_plugin_tools", { tools });
+  await invoke("set_plugin_enabled", { name, enabled });
+}
+
+/** Returns what the engine refused (shadowed or duplicate tool names). */
+export async function setPluginTools(tools: PluginToolDef[]): Promise<string[]> {
+  if (!inTauri) return [];
+  return invoke("set_plugin_tools", { tools });
+}
+
+/** Tell the engine whether any plugin is watching tool calls. While none is,
+ *  the engine skips the veto round-trip entirely. */
+export async function setPluginVeto(active: boolean): Promise<void> {
+  if (!inTauri) return;
+  await invoke("set_plugin_veto", { active });
+}
+
+export async function pluginVetoResult(id: string, reason: string | null): Promise<void> {
+  if (!inTauri) return;
+  await invoke("plugin_veto_result", { id, reason });
+}
+
+export async function listSkills(workspace?: string): Promise<SkillMeta[]> {
+  if (!inTauri) return [];
+  return invoke("list_skills", { workspace });
+}
+
+export async function listMcpServers(): Promise<McpStatus[]> {
+  if (!inTauri) return [];
+  return invoke("list_mcp_servers");
+}
+
+/** Restart MCP servers for this workspace. Plugins and skills are re-read by
+ *  the frontend, which owns their runtime. */
+export async function reloadExtensions(workspace?: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke("reload_extensions", { workspace });
 }
 
 export async function approvalResolve(id: string, approved: boolean): Promise<void> {
@@ -339,6 +403,7 @@ export function onEngineEvent(cb: (ev: EngineEvents) => void): Unlisten {
     un.push(await evt.listen<{ sid: string }>("e:message_end", (e) => cb({ type: "message_end", sid: e.payload.sid })));
     un.push(await evt.listen<{ sid: string; text: string }>("e:reasoning", (e) => cb({ type: "reasoning", ...e.payload })));
     un.push(await evt.listen<{ sid: string; name: string; arguments: string }>("e:plugin_tool_call", (e) => cb({ type: "plugin_tool_call", ...e.payload })));
+    un.push(await evt.listen<{ id: string; sid: string; tool: string; arguments: string }>("e:plugin_veto_request", (e) => cb({ type: "plugin_veto_request", ...e.payload })));
     un.push(await evt.listen<Record<string, unknown>>("e:summary", (e) => cb({ type: "summary", ...e.payload } as never)));;
     un.push(await evt.listen<Record<string, unknown>>("e:activity", (e) => cb({ type: "activity", ...e.payload } as never)));
     un.push(await evt.listen<Record<string, unknown>>("e:retry", (e) => cb({ type: "retry", ...e.payload } as never)));

@@ -30,6 +30,11 @@ pub struct Config {
     pub provider_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderItem>,
+    /// Plugins the user switched off in Settings → Extensions. An opt-out
+    /// list, so dropping a folder into `~/.e/plugins` still just works and a
+    /// plugin that is removed and restored keeps its state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_plugins: Vec<String>,
 }
 
 pub fn default_context_window() -> u64 {
@@ -236,6 +241,7 @@ impl Config {
                 "openai/gpt-5.6-luna".into(),
                 "command-code/inclusionai/ling-3.0-flash-free".into(),
             ],
+            disabled_plugins: Vec::new(),
         };
 
         if let Ok(text) = std::fs::read_to_string(&cfg_file) {
@@ -504,8 +510,10 @@ fn merge(base: &mut Config, c: Config) {
         base.context_window = c.context_window;
     }
     // Copied unconditionally: the "skip empty values" rule used above cannot
-    // express a bool the user deliberately turned off.
+    // express a bool the user deliberately turned off, nor a list the user
+    // deliberately emptied by re-enabling the last disabled plugin.
     base.yolo = c.yolo;
+    base.disabled_plugins = c.disabled_plugins;
 }
 
 /// Lenient bool parsing for env overrides; unrecognised values leave the
@@ -721,7 +729,7 @@ impl Agent {
                 return finish_stopped(stats, emit);
             }
 
-            let schema = self.tools.openai_schema();
+            let schema = self.tools.openai_schema(&self.workspace_ctx());
             emit.activity("thinking", None, stats.steps + 1);
             let completion: Completion = match self
                 .provider
@@ -813,6 +821,15 @@ impl Agent {
                     continue;
                 }
                 emit.activity("tool", Some(tc.name.as_str()), stats.steps);
+                // Plugins get first refusal: a guard plugin can stop a call
+                // before the user is ever asked to approve it. Costs nothing
+                // until a plugin actually registers a `tool_call` handler.
+                if let Some(reason) = crate::engine::plugins::veto(&self.session, &tc.name, &tc.arguments) {
+                    let msg = format!("Blocked by a plugin: {reason}");
+                    self.history.push(Msg::tool_result(&tc.id, &tc.name, msg.clone()));
+                    emit.tool_result(&tc.id, &tc.name, false, &msg);
+                    continue;
+                }
                 if RISKY.contains(&tc.name.as_str()) && !self.config.yolo {
                     let preview = tool_preview(tc);
                     if !crate::engine::approval::request(&self.session, &tc.name, &preview, cancelled) {
@@ -897,6 +914,7 @@ mod tests {
             context_window: 1_000_000,
             provider_id: String::new(),
             providers,
+            disabled_plugins: Vec::new(),
         }
     }
 

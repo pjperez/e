@@ -1,219 +1,148 @@
-# e — extensibility plan: plugins, skills, MCP, remote (minimal core)
+# Extensibility: how the edges stay open while the core stays small
 
-**Rule that governs everything: the core of `e` is a thin, stable kernel. Every
-extension surface is optional, loaded on demand, and never changes the core.**
+**The rule that governs everything: the core of `e` is a thin, stable kernel.
+Every extension surface is optional, discovered on disk, and never changes the
+core.**
+
+This is the design document. For *how to write one*, see
+[EXTENDING.md](EXTENDING.md).
 
 ```
                 e core (Rust) — SMALL, NEVER-GROWING
    engine loop · provider · built-in tools · sessions · event bus · commands
         │  Tauri commands + events (already the contract)
         ▼
-              WebView (TS) — SMALL UI + plugin/skill host
+              WebView (TS) — SMALL UI + plugin host
 ```
 
 Extensions plug into the sides — most never touch Rust:
 
 ```
-Plugins (~/.e/plugins/)   TS modules: tools / events / UI / commands
-Skills  (~/.e/skills/)    SKILL.md (agentskills.io standard) injected on demand
-MCP     (external)        stdio/SSE servers -> tools merged at runtime
-Remote  (headless)        JSONL over stdio / socket; embed in IDEs, agents
+Plugins (~/.e/plugins/)   ES modules: tools / events / commands / UI / guards
+Skills  (~/.e/skills/)    SKILL.md (agentskills.io standard), loaded on demand
+MCP     (~/.e/mcp.json)   stdio servers -> tools merged at runtime
+Remote  (e-rpc)           JSONL over stdio; embed in IDEs, scripts, agents
 ```
+
+Each of those also has a project form: `<project>/.e/plugins`, `.e/skills`,
+`.e/mcp.json`. The project folder is the chat's own workspace, never the
+process's current directory — where the app was launched from must never decide
+which code runs.
 
 ---
 
 ## 1. Design decisions (why this stays minimal)
 
-1. **The Rust core is closed (by default), the edges are open.** Adding a tool
-   to the core requires compiling Rust (the `Tool` trait). Almost all user
-   extension work happens in TypeScript in the webview or in external
-   processes — no recompiles, no new Rust deps in core.
-2. **Discovery instead of registration.** The app scans well-known folders
-   (`~/.e/…` global, `.e/…` project) at startup; whatever is there is
-   available, reloadable. Nothing is "installed" into the app.
+1. **The Rust core is closed by default, the edges are open.** Adding a tool to
+   the core means compiling Rust. Almost all extension work is TypeScript in
+   the webview or an external process — no recompiles, no new core deps.
+2. **Discovery instead of registration.** The app scans well-known folders;
+   whatever is there is available and reloadable. Nothing is "installed", so
+   nothing has to be uninstalled — and a plugin is a folder you can read, diff
+   and delete with ordinary tools.
 3. **The event bus is the contract.** Plugins observe the same
-   `e:token / e:tool_* / e:summary / e:activity` events the UI uses, plus their
-   own lifecycle hooks. If an event exists in `engine/mod.rs → Emitter`, a
-   plugin can listen to it (and in some cases intercept / block it).
-4. **Capabilities, not trust.** Extensions are third-party code. Default is a
-   per-plugin capability set (e.g. `tools`, `events`, `ui`, `network`,
-   `session-read`, `session-write`); risky surfaces are opt-in and surfaced in
-   the UI.
-5. **On-demand loading.** Nothing is parsed/executed until it is actually
-   needed (a skill's SKILL.md is only injected when relevant; a plugin's module
-   loads on first use). Startup cost stays ~zero.
+   `e:token / e:tool_* / e:summary / e:activity` events the UI uses. If an
+   event exists in `engine/mod.rs → Emitter`, a plugin can listen to it, and a
+   `tool_call` listener can refuse the call.
+4. **Capabilities, not trust.** A manifest asks for what it needs and the host
+   hands out exactly that. Refusals are loud, in the UI and in the toast — a
+   capability that silently does nothing is worse than one that is refused. An
+   unrecognised capability stops the plugin loading, so a typo can never look
+   like a grant.
+5. **Failure is visible, never silent.** A broken `plugin.json`, a missing
+   entry file, an MCP server that would not start, a tool name that collided
+   with a built-in: all of it shows in Settings → Extensions with the reason.
+   The alternative — a plugin that appears fine while doing nothing — is the
+   worst outcome for something you are asked to trust.
+6. **Nothing pays for a surface it does not use.** Skills are read only when
+   the model asks. MCP is inert without an `mcp.json`. The veto hook is skipped
+   entirely until a plugin registers a `tool_call` listener.
 
 ---
 
 ## 2. The five surfaces
 
-### A. Built-in tools (Rust, compile-time) — exists today
-The `Tool` trait + registry in `src-tauri/src/engine/tools.rs`. Stable, tiny,
-documented in EXTENDING.md. Not the primary surface for users.
+### A. Built-in tools (Rust, compile-time)
+The `Tool` trait + registry in `src-tauri/src/engine/tools.rs`. Stable and
+tiny: `name`, `description`, `parameters`, `run`, plus an optional
+`parameters_for(ctx)` for tools whose schema depends on the project.
 
-### B. Plugins (TS, runtime, the main surface) — mirrors pi's extension model
-- Locations: `~/.e/plugins/<name>/` (global) and `.e/plugins/<name>/`
-  (project). Each dir contains `plugin.json` (manifest) + `index.js`/`.ts`.
-- Manifest (`plugin.json`):
-  ```json
-  {
-    "name": "git-guard",
-    "version": "0.1.0",
-    "capabilities": ["tools", "events", "session-read", "ui"],
-    "entry": "index.js"
-  }
-  ```
-- Runtime: a small TS host in the frontend loads the module and gives it an `e`
-  API object (thin, mirroring what we already expose):
-  ```ts
-  export default function (e: PluginAPI) {
-    e.registerTool({ name, description, parameters, async run(args, ctx) {…} });
-    e.on("tool_call", (ev) => { if (dangerous) return { block: true, reason: "…" }; });
-    e.on("session_end", (ev) => {…});
-    e.registerCommand("/checkpoint", async (ctx) => {…});
-    e.ui.notify("…");            // toast
-    e.ui.confirm("…");           // modal dialog
-    e.setSessionMeta(key, val);  // persisted in the session
-    e.fetch(url);                // requires "network" capability
-  }
-  ```
-- Bridging:
-  - `list_plugins` / `load_plugin` scan + serve manifests/modules.
-  - Plugin tools reach the engine by extending `ToolRegistry` with a proxy tool
-    whose `run` calls `plugin_tool_run` (engine loop unchanged).
-  - `on(…)`: the backend event bus is mirrored into the frontend via `e:*`
-    events; a listener can veto by calling `plugin_veto` which the engine
-    consults before executing a tool (an optional no-op `VetoHook` in the tool
-    pipeline; default = off, zero cost).
+### B. Plugins (TS, runtime — the main surface)
+`plugin.json` + an ES module. Rust discovers them and proxies tool calls; the
+module runs in the webview, which is the only JS runtime the app already has.
+A plugin can register tools and slash commands, listen to engine events, show
+toasts and confirmations, and refuse tool calls. What it may do is exactly what
+its manifest declared.
 
-### C. Skills (prompt packages) — the Agent Skills standard
-- Locations: `~/.e/skills/`, `~/.agents/skills/` (global); `.e/skills/`
-  (project). Each skill is a `SKILL.md` per the agentskills.io spec —
-  frontmatter (name, description, license) + workflow/setup body + optional
-  `scripts/`.
-- How it reaches the model: skills become a `#skills` tool exposed to the
-  model (like pi). Invoking a skill injects its SKILL.md into context before
-  the next `provider.chat` call (a pre-call hook in `agent.rs`).
-- Implementation (small): `list_skills` (scan + frontmatter parse),
-  `get_skill(name)`, and an inject step. ~100 lines, no new deps.
+Tool calls round-trip as `e:plugin_tool_call` → `plugin_tool_result`, guarded
+by a timeout so a plugin that never answers fails its call rather than the run.
 
-### D. MCP servers (external tools) — runtime tool merging
-- Config `~/.e/mcp.json`: `{ "servers": { "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } } }`.
-- Client: a small Rust module gated behind the `mcp` cargo feature (default
-  off), or an `e-mcp` sidecar; implements MCP client (initialize,
-  tools/list, tools/call) over stdio (SSE later).
-- Merge: listed servers -> `tools/list` -> register as `mcp:<server>/<tool>` in
-  the running `ToolRegistry`; calls round-trip via `tools/call`.
-- Core stays clean: the protocol code is feature-flagged and separate; the core
-  never knows MCP exists when the feature is off.
+### C. Skills (prompt packages)
+`SKILL.md` with `name`/`description` frontmatter. Every skill the project can
+see is enumerated in the `skills` tool's schema — a skill the model cannot see
+is a skill it will never use — and its body enters the context only when the
+model asks for it by name.
 
-### E. Remote / headless — drive `e` from anything
-- RPC mode (`e --rpc`): headless engine loop, JSONL protocol on stdin/stdout
-  (pi's proven framing: LF-only records, `id`-correlated responses, events as
-  JSON lines). Enables IDEs, other GUIs, scripts, agents to embed `e`.
-- Remote daemon (later): `e --serve :port` exposes the same protocol over a
-  socket with a session token; the desktop app can attach to a remote `e`. The
-  provider/gateway stays the network path for the LLM itself (already supported
-  via `E_BASE_URL`).
+### D. MCP servers (external tools)
+A small stdio client: spawn, `initialize`, `tools/list`, `tools/call`. Tools
+merge in as `mcp_<server>_<tool>`. Servers start in parallel, each with its own
+reader thread and request timeouts, so a slow or wedged server degrades to a
+failed tool call instead of a frozen app.
+
+### E. Remote / headless
+`e-rpc`: the engine with JSONL on stdin/stdout — `send`, `stop`, `reset` in;
+events and responses out. MCP tools are available; plugins are not, because
+their modules need the webview.
 
 ---
 
-## 3. Phased roadmap (each phase ships independently; core stays minimal)
+## 3. What is built
 
-| Phase | What | Core cost | User-visible |
-|------|------|-----------|--------------|
-| **P0 — Plugin foundation** | `~/.e/plugins` discovery + manifest + safe loader + `PluginAPI` (`registerTool`, `on(events)`, `registerCommand`, `ui.confirm/notify`) | +1 command, ~120 lines TS host | drop a folder → it works |
-| **P1 — Tools & commands** | plugin tools reach the engine (proxied `ToolRegistry` entry) + veto hook for tool interception; `/commands` from plugins | +2 commands, default no-op veto hook | permission gates, git guards, stateful tools |
-| **P2 — Skills** | `~/.e/skills` + `#skills` tool + inject hook | ~100 lines backend | skill packages land like pi |
-| **P3 — MCP** | `mcp` cargo feature: stdio client, `mcp.json`, tool merging, reconnect | feature-flagged module | any MCP server's tools appear |
-| **P4 — Remote/RPC** | `e --rpc` JSONL headless; later `--serve` socket | new bin/target | embeds in IDEs/tools |
-| **P5 — Registry** | `plugin.json` → `e plugin add <repo>` fetches a bundle (folder/tarball) into `~/.e/plugins`; integrity hash + capabilities review screen | small | install from repo, no compile |
+| surface | state |
+|---------|-------|
+| **Plugins** | discovery (global + project), manifest validation, capability enforcement, ES-module loading, per-plugin enable/disable persisted in `~/.e/config.json`, live reload, tool-name collision refusal, `tool_call` veto |
+| **Skills** | `~/.e/skills`, `~/.agents/skills`, project `.e/skills`; frontmatter parsing; advertised in the `skills` tool schema; resolved per chat with no reload |
+| **MCP** | stdio client with `env`, `cwd`, `disabled`; global + project config; parallel start; per-request timeouts; live status and errors; restart on reload |
+| **RPC** | `e-rpc` binary, JSONL protocol, MCP tools loaded before the first command |
+| **UI** | Settings → Extensions lists all three surfaces with scope, capabilities, tools, commands and failures; `/extensions` and `/reload` |
 
-**Recommended order: P0 → P2 → P4** (P0 unlocks everything; skills are the
-cheapest high-value; RPC enables remote/IDE use). P1 and P3 slot in anytime.
+**Core cost of all of it:** eleven Tauri commands, one hook that is skipped
+unless a plugin uses it, and three self-contained modules (`plugins.rs`,
+`skills.rs`, `mcp.rs`) that the engine loop knows nothing about. The engine
+still runs one pipeline: everything is a tool.
 
----
+## 4. What is deliberately not built
 
-## 4. Security & trust model (non-negotiable)
+- **A plugin registry** (`e plugin add <repo>`). Installing code from a URL
+  needs an integrity story and a review screen before it needs a downloader.
+  Everything else is in place, so it stays a small addition when it is wanted.
+- **A heavy plugin runtime.** No Node in Rust, no embedded JS engine: plugins
+  run in the webview that is already there.
+- **A plugin framework.** A plugin is a folder with JSON and a module. If that
+  is not enough, it wants to be an MCP server, not a bigger core.
+- **`session-write`.** Reading the current session is enough for everything
+  asked of it so far; letting extensions rewrite history needs a much clearer
+  story about what a corrupted transcript costs.
+- **Per-project tool registries.** Plugin and MCP tools live in one registry
+  shared by every chat, which is why reload is explicit rather than automatic
+  on project switch: swapping tools out from under a run in flight would fail
+  that run.
+- **MCP over SSE/HTTP.** stdio covers local servers, which is what the app is
+  for. The transport is one module away when a remote server needs one.
 
-- Plugins are **reviewable folders**, not opaque binaries: show
-  name/version/capabilities + the module source in Settings → Plugins before
-  enabling anything broader than `events`.
-- Capabilities default **deny**: a plugin that only wants `events` never
-  silently gains `network` or `session-write`.
-- **Skills** are instructions: the model may act on them — surface a
-  "reviewed?" hint and agent-skills style warnings like pi.
-- **MCP** servers run as subprocesses with their own stdio; token scoping and
-  per-server enablement. Never inherit the app's session token.
-- No remote access without the session token; RPC/socket binds localhost by
-  default.
+## 5. Trust model
 
-## 5. What is deliberately NOT built (to stay minimal)
-
-- No heavy plugin runtime (no Node-in-Rust, no QJSEngine): TS plugins run in
-  the existing WebView, which is already there.
-- No framework for plugins: a plugin is a folder with JSON + a module. If a
-  user needs "more", it folds into a bigger plugin, not a bigger core.
-- No compile-time plugin SDK in a new language: the `Tool` trait stays the only
-  Rust surface; everything else is data-in / events-out.
-- The core adds at most ~5 commands and one no-op hook across all phases.
-
-## 6. The first surface in sketch (P0)
-
-```
-~/.e/plugins/my-tool/plugin.json      # manifest
-~/.e/plugins/my-tool/index.js         # plain JS module
-list_plugins -> load_plugin(name) -> eval(index.js) with allowlist API
-engine tool loop sees "my-tool/foo" -> ToolRegistry proxy -> plugin_tool_run
-```
-The plugin author writes:
-```js
-export default function (e) {
-  e.registerTool({
-    name: "say-hi", description: "Echo a greeting",
-    parameters: { type: "object", properties: { name: { type: "string" } } },
-    async run(args) { return "hi " + (args.name || "there"); }
-  });
-}
-```
-That is the entire mental model. It composes with everything else — skills and
-MCP are also just tools, so there is one pipeline in the engine.
-
----
-
-## Status — all phases implemented
-
-- **P2 Skills — DONE.** `~/.e/skills` + `~/.agents/skills` + project `.e/skills`
-  scanned; `list_skills`/`get_skill` commands; a `#skills` tool returns the
-  SKILL.md contents to the model (on-demand injection).
-- **P0+P1 Plugins — DONE.** `~/.e/plugins/<name>/plugin.json` + `index.js`
-  discovered via `list_plugins`/`get_plugin`; frontend host exposes `PluginAPI`
-  (`registerTool`, `on(event)`, `registerCommand("/x")`, `ui.notify`,
-  `ui.confirm`); plugin tools reach the engine through a proxy that emits
-  `e:plugin_tool_call` and waits on `plugin_tool_result` (timeout-guarded);
-  `/commands` from plugins are checked in `runSlash`; toast + confirm UI built.
-  (Vetos / `block: true` are reserved for a follow-up: the hook point exists.)
-- **P3 MCP — DONE.** `~/.e/mcp.json` servers are spawned (stdio), handshaken
-  (initialize), tools discovered via `tools/list` and merged as
-  `mcp:<server>/<tool>` into the ToolRegistry; calls round-trip through
-  `tools/call`. Verified end-to-end with a live server.
-- **P4 Remote/RPC — DONE.** `e-rpc` binary (built) = headless JSONL protocol
-  over stdio: `{"type":"send|stop|reset","id":…}` in, `{"type":"event"…}`
-  + `{"type":"response"…}` out. Verified streaming reasoning/tokens/summary
-  with real usage. `default-run = "e"` keeps `tauri dev` on the GUI.
-- **P5 Registry — NOT built** (deliberately deferred): an `e plugin add <repo>`
-  installer. Everything else is in place so it's a small add-on.
-
-**Core cost of all phases:** ~8 commands, one feature-flag-free MCP module that
-is inert without `mcp.json`, one no-op hook, `pub mod engine`, and
-`default-run`. The UI stayed a single small WebView bundle.
-
-## Usage cheatsheet
-- **Skill**: create `~/.e/skills/my-skill/SKILL.md` (with `name:`/`description:`
-  frontmatter); ask the agent about it — it calls `#skills`.
-- **Plugin**: `~/.e/plugins/hello/plugin.json` + `index.js` with
-  `export default (e) => { e.registerTool({…}); }`; restart (or reload).
-- **MCP**: write `~/.e/mcp.json` with `{ "servers": { "files": { "command": …,
-  "args": […] } } }`; tools appear as `mcp:files/…` automatically.
-- **RPC**: `target/debug/e-rpc.exe`; echo a JSON command per line; events stream
-  out.
+- Plugins are **reviewable folders**, not opaque binaries. Settings →
+  Extensions shows name, version, scope, capabilities and every failure before
+  you decide to keep one enabled; untick it and the choice persists.
+- Capabilities **bound the API, they are not a sandbox**. A plugin is code you
+  placed in your own home directory and it runs in the app's webview. The
+  honest guarantee is: it gets what it declared, refusals are visible, and
+  turning it off is one click.
+- **Skills are instructions**, and the model may act on them. Read one as you
+  would read a pull request.
+- **MCP servers are subprocesses** with their own environment. They never
+  inherit app state, each can be parked with `"disabled": true`, and anything
+  in `env` is a secret handed to that process.
+- **Nothing is fetched from the network** to make any of this work. Every
+  surface is a file already on your disk.

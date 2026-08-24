@@ -2,6 +2,7 @@
 //! IDE/script/agent. Commands on stdin (one JSON per line), events on stdout.
 
 use e_lib::engine::agent::{Agent, Config};
+use e_lib::engine::tools::ToolRegistry;
 use e_lib::engine::{Emitter, RunSummary, ToolCall};
 use serde_json::json;
 use std::io::{BufRead, Write};
@@ -58,7 +59,14 @@ fn response(id: &serde_json::Value, ok: bool, error: Option<&str>) {
 #[tokio::main]
 async fn main() {
     let cfg = Config::from_env();
-    let mut agent = Agent::new(cfg);
+    // MCP servers work headless — they are subprocesses, not UI. Start them
+    // before the first command is answered so their tools are in the schema.
+    // (Plugins are not available here: their modules run in the webview.)
+    let tools = Arc::new(ToolRegistry::new());
+    for h in e_lib::engine::mcp::load(tools.clone(), Some(cfg.workspace.clone())) {
+        let _ = h.join();
+    }
+    let mut agent = Agent::with_tools(cfg, tools);
     let cancelled = Arc::new(AtomicBool::new(false));
 
     // stdin is read on its own thread so `stop` is observed *during* a run.

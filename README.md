@@ -36,8 +36,10 @@ frontend. No electron, no heavy framework — the whole renderer is ~12 KB of JS
 - **A real harness, not a wrapper** — iterative agent loop: the model can call
   tools (shell, read/write files, list dir) and the results feed back until it
   finishes.
-- **Extensible** — add a tool by implementing one trait (see
-  [docs/EXTENDING.md](docs/EXTENDING.md)). Point it at any OpenAI-compatible
+- **Extensible without a rebuild** — drop a folder in `~/.e/` and reload:
+  **plugins** (tools, commands, event guards), **skills** (`SKILL.md`, loaded
+  on demand), and **MCP servers** whose tools merge straight into the registry.
+  See [docs/EXTENDING.md](docs/EXTENDING.md). Point it at any OpenAI-compatible
   provider (OpenAI, Ollama, LM Studio, vLLM, Together, your gateway).
 - **Private** — your key and config live in `~/.e/config.json`, never in the
   repo. Respects `E_API_KEY` / `E_BASE_URL` / `E_MODEL` / `E_WORKSPACE` env vars.
@@ -89,6 +91,10 @@ requesting tools (bounded to 25 steps; cancellable with **Esc**).
 | `read_file`  | read a text file (truncated if huge) |
 | `write_file` | write a file, creating parents        |
 | `list_dir`   | list a directory                     |
+| `skills`     | load a `SKILL.md` package by name    |
+
+Plugins and MCP servers add more at runtime — `/extensions` lists everything
+the app can currently reach.
 
 The **workspace** (where `shell` runs and relative paths resolve) is
 configured in Settings and defaults to where you launched `e`.
@@ -141,7 +147,8 @@ provider the current model belongs to). Settings live in `~/.e/config.json`:
       "models": ["qwen3-coder:30b"],
       "disabled_models": []
     }
-  ]
+  ],
+  "disabled_plugins": ["noisy-plugin"]  // unticked in Settings → Extensions
 }
 ```
 
@@ -193,19 +200,64 @@ back and nothing has been lost. The budget is tracked per chat, so a queued run
 in a background chat is measured against its own model rather than whichever one
 happens to be on screen.
 
+## Extensions
+
+Three folders and one JSON file, all optional, all reloadable without a
+restart (`/reload`, or Settings → Extensions → Reload):
+
+```
+~/.e/plugins/<name>/plugin.json + index.js   tools, /commands, event guards
+~/.e/skills/<name>/SKILL.md                  prompt packages, loaded on demand
+~/.e/mcp.json                                MCP servers; tools merge in
+```
+
+Each one also has a project form — `<project>/.e/plugins`, `.e/skills`,
+`.e/mcp.json` — that applies to that project only and shadows a global one of
+the same name.
+
+A plugin declares what it may touch (`tools`, `commands`, `events`, `ui`,
+`network`, `session-read`) and gets exactly that; anything it did not declare
+is refused out loud. **Settings (⚙) → Extensions** — or `/extensions` — lists
+everything that was found, what loaded, what it registered, and why anything
+failed. Untick a plugin to keep it off for good.
+
+```js
+// ~/.e/plugins/hello/index.js
+export default function (e) {
+  e.registerTool({
+    name: "say_hi",
+    description: "Greet someone by name.",
+    parameters: { type: "object", properties: { name: { type: "string" } } },
+    async run(args) { return "hi " + (args.name || "there"); },
+  });
+}
+```
+
+Working starting points live in [`examples/`](examples). The full reference —
+the plugin API, the event list, tool-call guards, `SKILL.md`, `mcp.json`, the
+Rust `Tool` trait and the headless JSONL protocol — is in
+[docs/EXTENDING.md](docs/EXTENDING.md); the design behind it is in
+[docs/EXTENSIBILITY.md](docs/EXTENSIBILITY.md).
+
 ## Project layout
 
 ```
 src-tauri/src/
   main.rs            desktop entry point
   lib.rs             Tauri app, commands, event bridge
+  bin/e-rpc.rs       headless JSONL protocol over stdio
   engine/
     mod.rs           message/tool-call model + Emitter trait
     provider.rs      OpenAI-compatible streaming client
     tools.rs         Tool trait, registry, built-in tools
     agent.rs         config + the agent loop
+    sessions.rs      projects, chats, persisted history
+    approval.rs      human approval for risky tools
+    plugins.rs       plugin discovery + the bridge to the host
+    skills.rs        SKILL.md discovery
+    mcp.rs           MCP stdio client
 src/
-  main.ts            UI controller
+  main.ts            UI controller + plugin host
   api.ts             typed bridge to the Rust backend
   markdown.ts        tiny XSS-safe markdown renderer
   copy.ts            copy-to-clipboard buttons (messages, code, tool output)
@@ -274,11 +326,9 @@ and empty state tint it with a CSS mask, so it follows the theme for free.
 
 ## Status
 
-A clean, working v0. See [docs/EXTENDING.md](docs/EXTENDING.md) for how to add
-tools, and the open ideas there for custom models, sessions, and plugins.
-
-## Extensible
-See [docs/EXTENSIBILITY.md](docs/EXTENSIBILITY.md) for the roadmap: user-facing
-**plugins** (drop-in TS folders), **skills** (SKILL.md, on demand), **MCP**
-servers (feature-flagged client that merges external tools), and **remote/RPC**
-(headless JSONL mode) — while the Rust core stays a thin, stable kernel.
+A clean, working v0: projects and chats, per-chat model and context budget,
+human approval for risky tools, and the four extension surfaces above —
+plugins, skills, MCP and a headless `e-rpc` binary. The one piece deliberately
+left out is an installer (`e plugin add <repo>`); see
+[docs/EXTENSIBILITY.md](docs/EXTENSIBILITY.md) for what that would take and
+what else is intentionally not built.
