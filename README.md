@@ -210,27 +210,48 @@ src/
   <img src="design/brand/e-construction.svg" alt="the mark's construction" width="440">
 </p>
 
-The mark is a lowercase **e** drawn on a φ grid, and it is generated, not
-drawn by hand — [`design/logo.py`](design/logo.py) emits every asset from the
-same equations.
+The mark is a lowercase **e** whose bowl really is a logarithmic spiral — it is
+generated, not drawn by hand. [`design/logo.py`](design/logo.py) emits every
+asset from the same equations, so the mint curve in the drawing above is not an
+overlay: it *is* the outer contour.
 
 *e* and φ meet in exactly one place: the **logarithmic spiral**.
 
 ```
-r(θ) = a·e^(bθ)        is golden when it grows by φ every quarter turn:
-e^(bπ/2) = φ    ⟹     b = 2·lnφ/π ≈ 0.3063489
+r(θ) = r₀·e^(bθ)
 ```
 
-The golden spiral is literally *e* raised to a golden power — φ sets the
-proportion, *e* does the growing. From that, the whole letter:
+The canonical *golden* spiral is the one that grows by φ every quarter turn:
+
+```
+e^(bπ/2) = φ    ⟹    b = 2·lnφ/π ≈ 0.3063489
+```
+
+**That rate is too aggressive for a letterform.** Across this `e`'s 307.5°
+sweep it compounds to φ^3.42 ≈ 5.6×, and the shape stops reading as an `e` at
+all. So the bowl uses the same equation tuned to grow by exactly φ across the
+whole sweep instead:
+
+```
+b = lnφ/sweep ≈ 0.08967
+```
+
+Still a true logarithmic spiral, still golden — the radius at the terminal is
+exactly φ times the radius at the crossbar junction. φ sets the proportion,
+*e* does the growing. From there, the rest of the letter:
 
 | measurement | value |
 |-------------|-------|
-| x-height    | `2R` — the mark's bounding circle |
+| bowl        | `r = r₀·e^(bθ)`, `b = lnφ/sweep` — radius `×φ` end to end |
+| x-height    | `2R` — the fitted bounding box |
 | weight      | `R/φ³`, modulated `×φ` on the stress axis |
 | crossbar    | golden section of the counter, so eye : counter = `1 : φ` |
 | aperture    | `360/φ⁴` = 52.5° of wedge, removed at the lower right |
 | tile radius | `size/φ³`, mark inset `size/φ³` |
+
+`growth` in `MARK` is the one knob: `1.0` collapses the bowl back to a circle,
+`φ` is what ships. The app tile also carries a canonical golden spiral as an
+ornament in its top-right corner — that one is decoration, not construction.
 
 Regenerate everything (marks, tile, banner, favicon):
 
