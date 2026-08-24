@@ -1293,6 +1293,11 @@ footer#composer-wrap {
 #activity.awaiting .act-spinner { display: none; }
 #activity.awaiting { border-color: var(--warn); }
 
+/* Backing off a throttled provider. The spinner stays — the run is still
+   alive, it's just waiting — and the border says why the pause is expected. */
+#activity.retrying { border-color: var(--warn); }
+#activity.retrying #act-text { color: var(--warn); }
+
 /* ---------- copy affordances ----------
    Present on hover, absent otherwise: the transcript stays clean to read, and
    the button is exactly where the pointer already is when you want it. */

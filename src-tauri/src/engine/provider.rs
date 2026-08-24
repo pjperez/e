@@ -1,6 +1,34 @@
 use crate::engine::{Completion, Msg, Part, ToolCall};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// How many times a throttled or overloaded request is retried before the
+/// failure is surfaced. Retrying is only ever attempted *before* the first
+/// token has been streamed, so a retry can never duplicate visible output.
+const MAX_RETRIES: u32 = 3;
+/// First backoff step. Doubled on each subsequent attempt.
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Longest we are willing to sit on a retry. A provider asking for more than
+/// this via `Retry-After` isn't throttling us for a moment, it's shut for the
+/// hour — waiting it out silently would look like a hang, so we surface it.
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// A throttled attempt that is about to be slept off, reported so the UI can
+/// say what is happening and how long the wait is instead of freezing on
+/// "thinking…".
+pub struct RetryNotice {
+    /// Which attempt just failed, 1-based.
+    pub attempt: u32,
+    /// Total attempts this request gets, including the first.
+    pub max_attempts: u32,
+    /// How long we are about to wait before trying again.
+    pub delay: Duration,
+    /// HTTP status that triggered the retry.
+    pub status: u16,
+    /// Short human-readable cause, e.g. "rate limited".
+    pub reason: String,
+}
 
 /// A generic OpenAI-compatible chat provider (streaming, with tool calling).
 /// Works with OpenAI and any gateway/local server exposing the
@@ -144,17 +172,24 @@ impl ChatProvider {
     /// Stream one completion. `cancelled` is polled between network chunks so a
     /// Stop takes effect mid-response instead of after the model finishes; the
     /// partial text produced so far is still returned.
-    pub async fn chat<F, G>(
+    ///
+    /// A throttled (429) or unavailable (5xx) provider is retried up to
+    /// [`MAX_RETRIES`] times with exponential backoff and jitter, and each wait
+    /// is announced through `on_retry` so the caller can tell the user what is
+    /// going on rather than showing a stall.
+    pub async fn chat<F, G, H>(
         &self,
         msgs: &[Msg],
         tools: &[Value],
         on_delta: F,
         on_reasoning: G,
+        on_retry: H,
         cancelled: &AtomicBool,
     ) -> Result<Completion, String>
     where
         F: Fn(&str) + Send + Sync,
         G: Fn(&str) + Send + Sync,
+        H: Fn(&RetryNotice) + Send + Sync,
     {
         use futures_util::StreamExt;
 
@@ -163,17 +198,64 @@ impl ChatProvider {
         }
 
         let body = self.to_openai(msgs, tools);
-        let mut req = self.client.post(self.url()).header("Accept", "text/event-stream");
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
+        let max_attempts = MAX_RETRIES + 1;
+        let mut attempt: u32 = 0;
 
-        let resp = req.json(&body).send().await.map_err(|e| format!("request failed: {e}"))?;
-        if !resp.status().is_success() {
+        // Retries live here, before a single byte of the response body has been
+        // read: once tokens start flowing they have already been shown, and
+        // replaying the request would duplicate them.
+        let resp = loop {
+            attempt += 1;
+            let mut req = self.client.post(self.url()).header("Accept", "text/event-stream");
+            if !self.api_key.is_empty() {
+                req = req.bearer_auth(&self.api_key);
+            }
+
+            let resp = req.json(&body).send().await.map_err(|e| format!("request failed: {e}"))?;
             let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+
+            let asked = retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("provider returned {status}: {}", truncate(&text, 400)));
-        }
+            let code = status.as_u16();
+            let fail = || {
+                let retried = attempt - 1;
+                let note = if retried > 0 {
+                    format!(" after {retried} {}", if retried == 1 { "retry" } else { "retries" })
+                } else {
+                    String::new()
+                };
+                Err(format!("provider returned {status}{note}: {}", truncate(&text, 400)))
+            };
+
+            // 429 is the throttle; 5xx is the same class of transient failure
+            // (overloaded/gateway) and clears on its own just as often. Every
+            // other 4xx is our fault and repeating it verbatim can't help.
+            if !(code == 429 || status.is_server_error()) || attempt >= max_attempts {
+                return fail();
+            }
+            let delay = match asked {
+                // Honour the provider's own number when it's a wait worth
+                // sitting through, and give up rather than pretend otherwise.
+                Some(d) if d > BACKOFF_CAP => return fail(),
+                Some(d) => d,
+                None => backoff_delay(attempt),
+            };
+
+            on_retry(&RetryNotice {
+                attempt,
+                max_attempts,
+                delay,
+                status: code,
+                reason: if code == 429 { "rate limited".into() } else { "provider unavailable".into() },
+            });
+
+            if !sleep_cancellable(delay, cancelled).await {
+                return Ok(Completion { text: String::new(), tool_calls: Vec::new(), usage: (0, 0), cost: None, reasoning: String::new() });
+            }
+        };
 
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
@@ -259,6 +341,63 @@ impl ChatProvider {
             }
         }
         Ok(Completion { text: text_out, tool_calls, usage: (usage_in, usage_out), cost, reasoning: reasoning_out })
+    }
+}
+
+/// How long the provider asked us to wait, when it said so.
+///
+/// Only the delta-seconds form of `Retry-After` is honoured; the HTTP-date form
+/// needs a date parser and is vanishingly rare on these APIs, so it falls
+/// through to plain backoff rather than pulling in a dependency.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let secs: f64 = raw.parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some(Duration::from_millis((secs * 1000.0) as u64))
+}
+
+/// Exponential backoff with equal jitter: half the window is fixed so waits
+/// still grow with each failure, half is random so several clients throttled at
+/// the same moment don't all come back in lockstep and re-trip the limit.
+fn backoff_delay(attempt: u32) -> Duration {
+    let steps = attempt.saturating_sub(1).min(6);
+    let window = BACKOFF_BASE.saturating_mul(1 << steps).min(BACKOFF_CAP);
+    let half = window / 2;
+    half + Duration::from_millis(jitter_ms(half.as_millis() as u64))
+}
+
+/// Cheap jitter in `0..=span_ms`. This only has to de-correlate retrying
+/// clients, not be unpredictable, so the clock is enough and `rand` stays out
+/// of the dependency list.
+fn jitter_ms(span_ms: u64) -> u64 {
+    if span_ms == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    // Mixed because the fast-moving low bits are the only entropy here, and
+    // taking them modulo a span directly leaves them clustered.
+    nanos.wrapping_mul(6364136223846793005).rotate_left(17) % (span_ms + 1)
+}
+
+/// Sleep, but stay stoppable: a backoff can run into seconds, and a Stop during
+/// one has to take effect now rather than after the wait. Returns false when the
+/// run was cancelled, in which case the caller must not retry.
+async fn sleep_cancellable(d: Duration, cancelled: &AtomicBool) -> bool {
+    let deadline = std::time::Instant::now() + d;
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(left.min(Duration::from_millis(100))).await;
     }
 }
 
@@ -486,6 +625,50 @@ mod tests {
 
     fn one(v: serde_json::Value) -> ModelInfo {
         parse_models(&v).into_iter().next().expect("one model")
+    }
+
+    fn header_map(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, value.parse().expect("header value"));
+        h
+    }
+
+    #[test]
+    fn backoff_grows_and_stays_inside_its_jittered_window() {
+        // Equal jitter: each wait is somewhere in [half, full] of the step, so
+        // waits still grow while no two clients land on the same instant.
+        for (attempt, step) in [(1u32, 1000u64), (2, 2000), (3, 4000)] {
+            let ms = backoff_delay(attempt).as_millis() as u64;
+            assert!(ms >= step / 2, "attempt {attempt} waited {ms}ms, under its floor");
+            assert!(ms <= step, "attempt {attempt} waited {ms}ms, over its ceiling");
+        }
+    }
+
+    #[test]
+    fn backoff_never_exceeds_the_cap() {
+        assert!(backoff_delay(30) <= BACKOFF_CAP, "a runaway attempt count must not overflow into a huge wait");
+    }
+
+    #[test]
+    fn jitter_stays_within_the_span() {
+        for span in [0u64, 1, 500, 30_000] {
+            assert!(jitter_ms(span) <= span, "jitter escaped its span of {span}ms");
+        }
+    }
+
+    #[test]
+    fn retry_after_seconds_are_honoured() {
+        assert_eq!(retry_after(&header_map("7")), Some(Duration::from_secs(7)));
+        assert_eq!(retry_after(&header_map(" 1.5 ")), Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn an_unparseable_retry_after_falls_back_to_backoff() {
+        // The HTTP-date form and any junk must yield None rather than a wait of
+        // zero, which would hammer the provider that just throttled us.
+        assert_eq!(retry_after(&header_map("Wed, 21 Oct 2015 07:28:00 GMT")), None);
+        assert_eq!(retry_after(&header_map("-3")), None);
+        assert_eq!(retry_after(&reqwest::header::HeaderMap::new()), None);
     }
 
     #[test]

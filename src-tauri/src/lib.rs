@@ -96,6 +96,19 @@ impl Emitter for AppEmitter {
     fn activity(&self, phase: &str, tool: Option<&str>, step: usize) {
         let _ = self.handle.emit("e:activity", serde_json::json!({ "sid": self.session, "phase": phase, "tool": tool, "step": step }));
     }
+    fn retry(&self, n: &engine::provider::RetryNotice) {
+        let _ = self.handle.emit(
+            "e:retry",
+            serde_json::json!({
+                "sid": self.session,
+                "attempt": n.attempt,
+                "max": n.max_attempts,
+                "delayMs": n.delay.as_millis() as u64,
+                "status": n.status,
+                "reason": n.reason,
+            }),
+        );
+    }
     fn tool_call(&self, tc: &ToolCall) {
         let _ = self.handle.emit("e:tool_call", serde_json::json!({ "sid": self.session, "id": tc.id, "name": tc.name, "arguments": tc.arguments.to_string() }));
     }
@@ -500,7 +513,7 @@ fn rename_session(state: tauri::State<AppState>, id: String, name: String) -> Re
 }
 
 #[tauri::command]
-async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
+async fn compact_session(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
     use engine::Msg;
     // Rewriting history under a live run would race with the agent's own saves.
     if state.is_running(&id) {
@@ -560,8 +573,12 @@ async fn compact_session(state: tauri::State<'_, AppState>, id: String) -> Resul
             old_text
         ),
     )];
-    let never = AtomicBool::new(false);    let summary = provider
-        .chat(&prompt, &[], |_| {}, |_| {}, &never)
+    let never = AtomicBool::new(false);
+    // Compaction is a provider call like any other, so it gets the same retry
+    // treatment — and the same on-screen explanation while it waits.
+    let emit = AppEmitter { handle: app, session: id.clone() };
+    let summary = provider
+        .chat(&prompt, &[], |_| {}, |_| {}, |n| emit.retry(n), &never)
         .await
         .map(|c| c.text)
         .unwrap_or_default();

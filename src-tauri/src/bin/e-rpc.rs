@@ -24,6 +24,12 @@ impl Emitter for RpcEmitter {
     fn activity(&self, phase: &str, tool: Option<&str>, step: usize) {
         emit_line("activity", json!({ "phase": phase, "tool": tool, "step": step }));
     }
+    fn retry(&self, n: &e_lib::engine::provider::RetryNotice) {
+        emit_line(
+            "retry",
+            json!({ "attempt": n.attempt, "max": n.max_attempts, "delayMs": n.delay.as_millis() as u64, "status": n.status, "reason": n.reason }),
+        );
+    }
     fn tool_call(&self, tc: &ToolCall) {
         emit_line("tool_call", json!({ "id": tc.id, "name": tc.name, "arguments": tc.arguments.to_string() }));
     }

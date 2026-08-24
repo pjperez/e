@@ -82,6 +82,12 @@ type ChatUI = {
   sending: boolean;
   /** True while history is being summarised, so the UI can say so. */
   compacting: boolean;
+  /**
+   * A throttled provider call being backed off. Held as a deadline rather than
+   * a formatted string so the strip can count the wait down live: a silent
+   * multi-second pause is indistinguishable from a hang.
+   */
+  retry: { until: number; attempt: number; max: number; reason: string } | null;
 };
 
 const chatUI = new Map<string, ChatUI>();
@@ -93,7 +99,7 @@ function ui(sid: string): ChatUI {
       running: false, queued: "", startedAt: 0, activityText: "", activityStep: "",
       liveText: "", liveReason: "",
       baseIn: 0, baseOut: 0, liveIn: 0, liveOut: 0, ctxIn: 0, money: 0, costKnown: false,
-      approval: null, errored: false, sending: false, compacting: false,
+      approval: null, errored: false, sending: false, compacting: false, retry: null,
     };
     chatUI.set(sid, s);
   }
@@ -464,7 +470,7 @@ function explainError(raw: string): ErrInfo {
     hint = hint || "The provider took too long to respond.";
   } else if (code === "429") {
     title = "Rate limited";
-    hint = "The provider is throttling requests — wait a few seconds and retry, or switch model.";
+    hint = "The provider is still throttling after several automatic retries — wait a bit before sending again, or switch model.";
   } else if (code === "401" || code === "403") {
     title = "Authentication failed";
     hint = "Check this provider's API key in Settings (⚙).";
@@ -473,7 +479,7 @@ function explainError(raw: string): ErrInfo {
     hint = "The provider doesn't serve this model. Pick another from the model picker.";
   } else if (code.startsWith("5")) {
     title = "Provider error";
-    hint = hint || "The provider failed server-side. Retrying usually helps.";
+    hint = hint || "The provider failed server-side, and automatic retries didn't clear it.";
   } else if (code === "400") {
     title = "Request rejected";
   }
@@ -609,6 +615,17 @@ function fmtElapsed(ms: number): string {
 function tickTimer(): void {
   const s = currentSession ? cur() : null;
   actTime.textContent = s && s.running && s.startedAt ? fmtElapsed(Date.now() - s.startedAt) : "";
+  // The retry countdown rides the same tick, so the remaining wait visibly
+  // shrinks instead of being a single number frozen on screen.
+  if (s && s.retry && !s.approval) actText.textContent = retryLabel(s.retry);
+}
+
+/// What a backoff looks like to the user: the cause, the time left, and which
+/// attempt is coming. Recomputed per tick so it counts down.
+function retryLabel(r: NonNullable<ChatUI["retry"]>): string {
+  const left = Math.max(0, r.until - Date.now());
+  const when = left > 0 ? `retrying in ${Math.ceil(left / 1000)}s` : "retrying…";
+  return `${r.reason} — ${when} (attempt ${r.attempt + 1} of ${r.max})`;
 }
 
 /// Repaint the whole strip from the *current* chat's state. Called on every
@@ -618,6 +635,7 @@ function renderActivity(): void {
   const s = currentSession ? cur() : null;
   const running = !!s && s.running;
   const approval = s ? s.approval : null;
+  const retry = s && !approval ? s.retry : null;
 
   activity.hidden = !running && !approval;
   if (approval) {
@@ -625,7 +643,7 @@ function renderActivity(): void {
     actStep.textContent = approval.preview || "";
     actStep.title = approval.preview || "";
   } else {
-    actText.textContent = s ? s.activityText || "thinking…" : "";
+    actText.textContent = retry ? retryLabel(retry) : s ? s.activityText || "thinking…" : "";
     actStep.textContent = s ? s.activityStep : "";
     actStep.title = "";
   }
@@ -633,6 +651,7 @@ function renderActivity(): void {
   actDeny.hidden = !approval;
   actSteer.hidden = !running;
   activity.classList.toggle("awaiting", !!approval);
+  activity.classList.toggle("retrying", !!retry);
 
   tickTimer();
   if (running && !actTimer) actTimer = window.setInterval(tickTimer, 1000);
@@ -647,6 +666,7 @@ function hideActivity(): void {
     const s = cur();
     s.activityText = "";
     s.activityStep = "";
+    s.retry = null;
     s.startedAt = 0;
   }
   renderActivity();
@@ -865,6 +885,9 @@ async function maybeCompact(sid: string): Promise<void> {
   } finally {
     s.compacting = false;
     s.activityText = "thinking…";
+    // A backoff during compaction ends with it; leaving it would strand a dead
+    // countdown over the run that follows.
+    s.retry = null;
     if (sid === currentSession) {
       sbUpdate();
       renderActivity();
@@ -885,6 +908,7 @@ async function startRun(sid: string, text: string): Promise<void> {
   s.startedAt = Date.now();
   s.activityText = "thinking…";
   s.activityStep = "";
+  s.retry = null;
   chatState[sid] = "busy";
 
   if (onScreen) {
@@ -963,9 +987,22 @@ api.onEngineEvent((ev) => {
   const chat = ui(sid);
   const onScreen = sid === currentSession;
 
+  // Any sign of forward progress ends a backoff countdown — the wait is over
+  // the moment the retried request starts answering (or finally gives up).
+  if (ev.type !== "retry" && chat.retry) {
+    chat.retry = null;
+    // Repaint now rather than leaving a dead countdown on the strip: the
+    // token/tool events that follow a successful retry don't touch it.
+    if (onScreen) renderActivity();
+  }
+
   // ---- bookkeeping: happens for every chat, on screen or not ----
   let sidebarDirty = false;
   switch (ev.type) {
+    case "retry":
+      // Held as a deadline; the activity strip counts it down every second.
+      chat.retry = { until: Date.now() + (ev.delayMs || 0), attempt: ev.attempt, max: ev.max, reason: ev.reason };
+      break;
     case "token":
       chat.liveText += ev.text;
       chat.liveOut += ev.text.length / 4;
@@ -1069,6 +1106,7 @@ api.onEngineEvent((ev) => {
         break;
       }
       case "activity":
+      case "retry":
         renderActivity();
         break;
       case "approval_request":
@@ -1654,6 +1692,7 @@ async function refreshSessions(): Promise<void> {
       u.startedAt = 0;
       u.activityText = "";
       u.activityStep = "";
+      u.retry = null;
       u.approval = null;
     }
     // A chat that died in a previous app session has its failure persisted but
@@ -1726,6 +1765,7 @@ async function loadSession(id: string): Promise<void> {
     s.startedAt = 0;
     s.activityText = "";
     s.activityStep = "";
+    s.retry = null;
     s.liveText = "";
     s.liveReason = "";
     s.approval = null;

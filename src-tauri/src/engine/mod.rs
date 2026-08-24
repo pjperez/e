@@ -257,6 +257,9 @@ pub struct RunSummary {
 pub trait Emitter: Send + Sync {
     fn token(&self, _s: &str) {}
     fn activity(&self, _phase: &str, _tool: Option<&str>, _step: usize) {}
+    /// A throttled request is being backed off. Carries the wait so the UI can
+    /// count it down instead of showing an unexplained stall.
+    fn retry(&self, _n: &provider::RetryNotice) {}
     fn tool_call(&self, _tc: &ToolCall) {}
     /// Streamed thinking tokens from the model.
     fn reasoning(&self, _s: &str) {}

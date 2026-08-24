@@ -83,6 +83,7 @@ export type EngineEvents =
   | { type: "plugin_tool_call"; sid: string; name: string; arguments: string }
   | { type: "done"; stopped: boolean; sid: string }
   | { type: "activity"; sid: string; phase: string; tool: string | null; step: number }
+  | { type: "retry"; sid: string; attempt: number; max: number; delayMs: number; status: number; reason: string }
   | { type: "summary"; sid: string; steps: number; tools: number; stopped: boolean; error: string | null; tokensIn: number; tokensOut: number; contextTokens: number; cost: number | null }
   | { type: "error"; message: string; sid: string }
   | { type: "approval_request"; id: string; sid: string; tool: string; preview: string }
@@ -340,6 +341,7 @@ export function onEngineEvent(cb: (ev: EngineEvents) => void): Unlisten {
     un.push(await evt.listen<{ sid: string; name: string; arguments: string }>("e:plugin_tool_call", (e) => cb({ type: "plugin_tool_call", ...e.payload })));
     un.push(await evt.listen<Record<string, unknown>>("e:summary", (e) => cb({ type: "summary", ...e.payload } as never)));;
     un.push(await evt.listen<Record<string, unknown>>("e:activity", (e) => cb({ type: "activity", ...e.payload } as never)));
+    un.push(await evt.listen<Record<string, unknown>>("e:retry", (e) => cb({ type: "retry", ...e.payload } as never)));
     un.push(await evt.listen<Record<string, unknown>>("e:done", (e) => cb({ type: "done", stopped: !!(e.payload as {stopped?:boolean}).stopped, sid: String((e.payload as {sid?:string}).sid || "") })));
     un.push(await evt.listen<{ id: string; sid: string; tool: string; preview: string }>("e:approval_request", (e) => cb({ type: "approval_request", ...e.payload })));
     un.push(await evt.listen<{ id: string; sid: string }>("e:approval_close", (e) => cb({ type: "approval_close", ...e.payload })));

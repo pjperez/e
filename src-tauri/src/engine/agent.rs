@@ -725,7 +725,14 @@ impl Agent {
             emit.activity("thinking", None, stats.steps + 1);
             let completion: Completion = match self
                 .provider
-                .chat(&self.history, &schema, |tok| emit.token(tok), |r| emit.reasoning(r), cancelled)
+                .chat(
+                    &self.history,
+                    &schema,
+                    |tok| emit.token(tok),
+                    |r| emit.reasoning(r),
+                    |n| emit.retry(n),
+                    cancelled,
+                )
                 .await
             {
                 Ok(c) => c,
