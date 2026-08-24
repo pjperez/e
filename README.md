@@ -149,7 +149,14 @@ Two things worth knowing:
 - `run()` is synchronous and runs on a worker thread. For anything long-running,
   apply your own timeout (the `shell` tool uses `mpsc::recv_timeout`).
 
-See [docs/EXTENDING.md](docs/EXTENDING.md) for providers, skills and plugins.
+## Documentation
+
+| doc | what's in it |
+|-----|--------------|
+| [EXTENDING.md](docs/EXTENDING.md) | adding tools, providers, skills, plugins; the headless RPC binary |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the core and its four extension surfaces fit together |
+| [DESIGN.md](docs/DESIGN.md) | design tokens, themes, layout and typography |
+| [ROADMAP.md](docs/ROADMAP.md) | what's shipped, what's planned, what's deliberately out of scope |
 
 ## How it works
 

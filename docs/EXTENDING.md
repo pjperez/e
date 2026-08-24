@@ -88,7 +88,7 @@ touching Rust:
 The manifest declares tools; calls are dispatched to the webview as
 `e:plugin_tool_call` and answered with `plugin_tool_result`. See
 [`engine/plugins.rs`](../src-tauri/src/engine/plugins.rs) and
-[EXTENSIBILITY.md](EXTENSIBILITY.md) for the full model.
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full model.
 
 ## MCP
 
