@@ -1,0 +1,7 @@
+{
+  "name": "Terminal",
+  "version": "0.1.0",
+  "description": "A real shell in the side pane, running in this chat's project folder.",
+  "capabilities": ["views", "pty", "ui"],
+  "entry": "index.js"
+}

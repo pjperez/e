@@ -91,6 +91,11 @@ export type EngineEvents =
   | { type: "error"; message: string; sid: string }
   | { type: "approval_request"; id: string; sid: string; tool: string; preview: string }
   | { type: "approval_close"; id: string; sid: string }
+  // Frontend-only events. The engine never emits these — they exist because a
+  // pane view has to know which chat it belongs to, and "the current chat" is
+  // not an answer when a background chat is streaming into another tab.
+  | { type: "chat_open"; sid: string }
+  | { type: "chat_switch"; sid: string; previous: string }
 
 type Unlisten = () => void;
 
@@ -430,4 +435,71 @@ export async function workspaceRevert(id: string): Promise<boolean> {
 export async function searchSessions(query: string): Promise<{ results: { session_id: string; session_name: string; snippet: string; role?: string; project?: string }[] }> {
   if (!inTauri) return { results: [] };
   return invoke("search_sessions", { query });
+}
+
+// ---------- right pane: files ----------
+
+export type FsEntry = { name: string; path: string; dir: boolean; size: number; modified: number; symlink: boolean };
+export type FsListing = { path: string; entries: FsEntry[]; truncated: boolean };
+export type FsFile = { path: string; text: string; size: number; truncated: boolean; binary: boolean };
+
+/// List one directory of a chat's project folder. `path` is relative to that
+/// folder; the backend resolves the root from `sid` and refuses anything that
+/// escapes it, so the caller never names an absolute path.
+export async function fsList(sid: string, path = ""): Promise<FsListing> {
+  if (!inTauri) return { path, entries: [], truncated: false };
+  return invoke("fs_list", { sid, path });
+}
+
+export async function fsRead(sid: string, path: string): Promise<FsFile> {
+  if (!inTauri) return { path, text: "", size: 0, truncated: false, binary: false };
+  return invoke("fs_read", { sid, path });
+}
+
+// ---------- right pane: terminals ----------
+
+/// Open a pty running a shell in the chat's project folder. `id` is the
+/// caller's handle for the stream; output arrives on `onPtyEvent` tagged with
+/// it. Every later call repeats `sid`, because the backend checks that the
+/// terminal really belongs to that chat before touching it.
+export async function ptySpawn(sid: string, id: string, cols: number, rows: number): Promise<void> {
+  if (!inTauri) throw new Error("not-running-in-tauri");
+  await invoke("pty_spawn", { sid, id, cols, rows });
+}
+
+export async function ptyWrite(sid: string, id: string, data: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke("pty_write", { sid, id, data });
+}
+
+export async function ptyResize(sid: string, id: string, cols: number, rows: number): Promise<void> {
+  if (!inTauri) return;
+  await invoke("pty_resize", { sid, id, cols, rows });
+}
+
+export async function ptyKill(sid: string, id: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke("pty_kill", { sid, id }).catch(() => undefined);
+}
+
+export async function ptyAlive(sid: string, id: string): Promise<boolean> {
+  if (!inTauri) return false;
+  return invoke<boolean>("pty_alive", { sid, id }).catch(() => false);
+}
+
+/// Both pty streams in one subscription. The listeners are registered once for
+/// the whole app and fanned out by id, because a listener per terminal would
+/// have to be torn down on every tab close and one missed teardown leaks the
+/// tab's entire scrollback.
+export function onPtyEvent(cb: (ev: { type: "data"; id: string; data: string } | { type: "exit"; id: string; code: number }) => void): Unlisten {
+  if (!inTauri) return () => undefined;
+  const un: Unlisten[] = [];
+  void (async () => {
+    const evt = await import("@tauri-apps/api/event");
+    un.push(await evt.listen<{ id: string; data: string }>("e:pty_data", (e) => cb({ type: "data", ...e.payload })));
+    un.push(await evt.listen<{ id: string; code: number }>("e:pty_exit", (e) => cb({ type: "exit", ...e.payload })));
+  })();
+  return () => {
+    un.forEach((f) => f());
+  };
 }
