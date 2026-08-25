@@ -898,6 +898,9 @@ async function maybeCompact(sid: string): Promise<void> {
   }
   try {
     const r = await api.compactSession(sid);
+    // The backend stops a compaction mid-summary when Stop is pressed during
+    // its backoff wait. Treat that as the stop it was, not as a failure.
+    if (r.stopped) s.stopping = true;
     if (r.compacted) {
       // The next run reports the real size; treat the window as reset until then.
       s.ctxIn = 0;
@@ -914,7 +917,8 @@ async function maybeCompact(sid: string): Promise<void> {
     // Compaction is best-effort: a failed summary must never block the send.
   } finally {
     s.compacting = false;
-    s.activityText = "thinking…";
+    // Don't talk over a stop the user asked for while we were compacting.
+    s.activityText = s.stopping ? "stopping…" : "thinking…";
     // A backoff during compaction ends with it; leaving it would strand a dead
     // countdown over the run that follows.
     s.retry = null;
@@ -1044,6 +1048,10 @@ api.onEngineEvent((ev) => {
   let sidebarDirty = false;
   switch (ev.type) {
     case "retry":
+      // A backoff announced after the user pressed Stop is one we are about to
+      // cut short; showing its countdown would bury the "stopping…" that says
+      // the press landed.
+      if (chat.stopping) break;
       // Held as a deadline; the activity strip counts it down every second.
       chat.retry = { until: Date.now() + (ev.delayMs || 0), attempt: ev.attempt, max: ev.max, reason: ev.reason };
       break;
@@ -1084,6 +1092,7 @@ api.onEngineEvent((ev) => {
       chat.errored = true;
       chat.running = false;
       chat.stopping = false;
+      chat.retry = null;
       chat.startedAt = 0;
       chat.approval = null;
       chatState[sid] = "error";
@@ -1094,6 +1103,9 @@ api.onEngineEvent((ev) => {
     case "done":
       chat.running = false;
       chat.stopping = false;
+      // A run that ends during a backoff leaves the deadline behind; the next
+      // run would open under a countdown that expired minutes ago.
+      chat.retry = null;
       chat.startedAt = 0;
       chat.activityText = "";
       chat.activityStep = "";
@@ -2073,6 +2085,10 @@ async function stopCurrent(): Promise<void> {
   s.stopping = true;
   s.activityText = "stopping…";
   s.activityStep = "";
+  // Drop any backoff countdown. It is recomputed on every tick and takes
+  // priority over the activity text, so leaving it up means a press during a
+  // retry wait shows nothing at all — the button looks broken while it works.
+  s.retry = null;
   renderActivity();
   const ok = await api.cancelRun(sid);
   if (ok || s.sending || !s.stopping) return;
@@ -2095,6 +2111,7 @@ function abortBeforeStart(sid: string, text: string): void {
   s.startedAt = 0;
   s.activityText = "";
   s.activityStep = "";
+  s.retry = null;
   s.liveIn = 0;
   chatState[sid] = "idle";
   renderSessions();
