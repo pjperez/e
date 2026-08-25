@@ -80,6 +80,14 @@ type ChatUI = {
   errored: boolean;
   /** True while a send_text call is in flight and the backend hasn't registered the run yet. */
   sending: boolean;
+  /**
+   * Stop was pressed. The button goes live the moment the UI says "running",
+   * which is before the backend has a run to cancel — attachments, the context
+   * check and a compaction pass all happen first. Without this the press hit an
+   * unknown session, was reported as a stale flag, and the run started anyway:
+   * Stop looked like it did nothing. `startRun` checks it at the hand-off.
+   */
+  stopping: boolean;
   /** True while history is being summarised, so the UI can say so. */
   compacting: boolean;
   /**
@@ -99,7 +107,7 @@ function ui(sid: string): ChatUI {
       running: false, queued: "", startedAt: 0, activityText: "", activityStep: "",
       liveText: "", liveReason: "",
       baseIn: 0, baseOut: 0, liveIn: 0, liveOut: 0, ctxIn: 0, money: 0, costKnown: false,
-      approval: null, errored: false, sending: false, compacting: false, retry: null,
+      approval: null, errored: false, sending: false, stopping: false, compacting: false, retry: null,
     };
     chatUI.set(sid, s);
   }
@@ -926,6 +934,7 @@ async function startRun(sid: string, text: string): Promise<void> {
   s.liveText = "";
   s.liveReason = "";
   s.running = true;
+  s.stopping = false;
   s.errored = false;
   s.startedAt = Date.now();
   s.activityText = "thinking…";
@@ -959,13 +968,24 @@ async function startRun(sid: string, text: string): Promise<void> {
     s.liveIn = Math.floor((text.length + ctx.length) / 4);
     if (sid === currentSession) sbUpdate();
     await maybeCompact(sid);
+    // Stop pressed while we were still preparing (reading @files, checking the
+    // context, compacting): there was no run to cancel, so honour it here
+    // instead of starting the one the user just stopped.
+    if (s.stopping) {
+      abortBeforeStart(sid, text);
+      return;
+    }
     await api.sendText(sid, ctx ? text + "\n\n## Referenced files\n" + ctx : text, urls);
+    // Stop landed while the send itself was in flight, before the backend had
+    // registered the run. There is a flag to set now, so re-issue it.
+    if (s.stopping) void api.cancelRun(sid);
     if (onScreen) {
       attachments = [];
       renderAttachments();
     }
   } catch (e) {
     s.running = false;
+    s.stopping = false;
     s.startedAt = 0;
     s.errored = true;
     chatState[sid] = "error";
@@ -1063,6 +1083,7 @@ api.onEngineEvent((ev) => {
     case "error":
       chat.errored = true;
       chat.running = false;
+      chat.stopping = false;
       chat.startedAt = 0;
       chat.approval = null;
       chatState[sid] = "error";
@@ -1072,6 +1093,7 @@ api.onEngineEvent((ev) => {
       break;
     case "done":
       chat.running = false;
+      chat.stopping = false;
       chat.startedAt = 0;
       chat.activityText = "";
       chat.activityStep = "";
@@ -2023,7 +2045,7 @@ input.addEventListener("keydown", (e) => {
     input.value = "";
     autoGrow();
     renderQueued();
-    void api.cancelRun(currentSession);
+    void stopCurrent();
     return;
   }
   if (e.key === "Enter" && !e.shiftKey) {
@@ -2039,21 +2061,70 @@ input.addEventListener("keydown", (e) => {
 
 async function stopCurrent(): Promise<void> {
   if (!currentSession) return;
-  const s = cur();
+  const sid = currentSession;
+  const s = ui(sid);
+  if (!s.running) return;
   if (s.approval) {
     // A run parked on an approval prompt is waiting on the user, not the model.
     resolveApproval(false);
   }
+  // Record the intent first: the run may not have reached the backend yet, and
+  // this is what stops `startRun` handing it over after the fact.
+  s.stopping = true;
   s.activityText = "stopping…";
   s.activityStep = "";
   renderActivity();
-  const ok = await api.cancelRun(currentSession);
-  if (!ok) {
-    // Backend has no run for this chat: our flag was stale.
-    s.running = false;
-    s.startedAt = 0;
-    chatState[currentSession] = "idle";
-    renderSessions();
+  const ok = await api.cancelRun(sid);
+  if (ok || s.sending || !s.stopping) return;
+  // Backend has no run for this chat and none is on its way: our flag was stale.
+  s.stopping = false;
+  s.running = false;
+  s.startedAt = 0;
+  chatState[sid] = "idle";
+  renderSessions();
+  if (sid === currentSession) applyChatUI();
+}
+
+/// Undo a run the user stopped before the backend ever accepted it. No `done`
+/// event is coming for a run that never started, so everything that event would
+/// have settled has to be settled here.
+function abortBeforeStart(sid: string, text: string): void {
+  const s = ui(sid);
+  s.stopping = false;
+  s.running = false;
+  s.startedAt = 0;
+  s.activityText = "";
+  s.activityStep = "";
+  s.liveIn = 0;
+  chatState[sid] = "idle";
+  renderSessions();
+
+  const onScreen = sid === currentSession;
+  if (onScreen) {
+    // The message never reached the model or the stored history, so leaving its
+    // bubble on screen would show a turn that vanishes on the next reload.
+    const t = lastTurn();
+    if (t && t.role === "user" && t.raw === text) {
+      t.el.remove();
+      turns.pop();
+    }
+    // Hand the text back rather than swallowing it — unless something is
+    // already waiting to be typed or sent.
+    if (!s.queued && !input.value.trim()) {
+      input.value = text;
+      autoGrow();
+    }
+    updateEmpty();
+  }
+
+  // Ctrl+Enter steers by queueing the replacement and stopping the run; with no
+  // `done` event to flush it, that message would sit in the chip forever.
+  const q = s.queued;
+  if (q) {
+    s.queued = "";
+    if (onScreen) renderQueued();
+    setTimeout(() => void startRun(sid, q), 10);
+  } else if (onScreen) {
     applyChatUI();
   }
 }
