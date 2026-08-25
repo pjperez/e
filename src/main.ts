@@ -1449,6 +1449,9 @@ let projects: api.ProjectMeta[] = [];
 let currentProject = "";
 let sessions: api.SessionMetaItem[] = [];
 let currentSession = "";
+/// Chats already announced with `chat_open`. A plugin should hear "this chat
+/// appeared" once, not again every time you switch back to it.
+const seenChats = new Set<string>();
 const chatState: Record<string, string> = {};
 const openProjs = new Set<string>();
 
@@ -1683,6 +1686,9 @@ function renderSessions(): void {
                 await api.deleteSession(s.id);
                 chatUI.delete(s.id);
                 delete chatState[s.id];
+                // A chat's terminals must not outlive it: the shells would keep
+                // running against a project folder nothing on screen refers to.
+                closePaneTabsFor(s.id);
                 await refreshSessions();
                 if (wasCurrent && currentSession) await loadSession(currentSession);
                 else if (wasCurrent) {
@@ -1701,10 +1707,24 @@ function renderSessions(): void {
 async function refreshSessions(): Promise<void> {
   const [r, pr] = await Promise.all([api.listSessions(), api.listProjects()]);
   sessions = r.sessions;
+  const previous = currentSession;
   currentSession = r.current;
   projects = pr.projects;
   currentProject = pr.current;
   if (currentProject) openProjs.add(currentProject);
+  // This is the other place the visible chat can change (boot, or a chat being
+  // deleted out from under the current one), so the pane has to follow it here
+  // as well as in `loadSession` — otherwise the tab strip keeps showing the
+  // previous chat's tabs.
+  if (previous !== currentSession) {
+    renderPaneTabs();
+    notifyPaneShown();
+    if (currentSession) emitChatEvent({ type: "chat_switch", sid: currentSession, previous });
+  }
+  if (currentSession && !seenChats.has(currentSession)) {
+    seenChats.add(currentSession);
+    emitChatEvent({ type: "chat_open", sid: currentSession });
+  }
 
   // The backend is the source of truth for "is this chat running". Persisted
   // `state` in the index can be stale (e.g. app killed mid-run), which used to
@@ -1777,7 +1797,18 @@ async function loadSession(id: string): Promise<void> {
     }
   }
   await api.switchSession(id);
+  const previous = currentSession;
   currentSession = id;
+  // The pane belongs to the chat, so it has to swap before anything else can
+  // render against it — a tab left from the previous chat is a terminal
+  // pointing at the previous project's folder.
+  renderPaneTabs();
+  notifyPaneShown();
+  if (previous !== id) emitChatEvent({ type: "chat_switch", sid: id, previous });
+  if (!seenChats.has(id)) {
+    seenChats.add(id);
+    emitChatEvent({ type: "chat_open", sid: id });
+  }
   const g = await api.getSession(id);
   await applySessionModel(g.model, g.provider);
   renderHistory(g.messages);
@@ -2499,6 +2530,12 @@ async function renderExtensions(): Promise<void> {
     for (const c of p.capabilities) top.appendChild(chip(c, "cap"));
     if (p.tools.length) top.appendChild(chip(p.tools.length + (p.tools.length === 1 ? " tool" : " tools")));
     if (p.commands.length) top.appendChild(chip(p.commands.join(" ")));
+    // Name the views, not just how many: "2 views" tells you nothing about
+    // which tab in the pane came from which folder on disk.
+    for (const key of p.views) {
+      const v = paneViews.get(key);
+      top.appendChild(chip((v ? (v.icon ? v.icon + " " : "") + v.title : key) + " view"));
+    }
     row.appendChild(top);
 
     const detail = document.createElement("p");
@@ -2805,6 +2842,447 @@ function openRenameModal(id: string, name: string, workspace: string): void {
   rmInput.focus();
 }
 
+// ---------- right pane ----------
+// A third column beside the conversation, holding tabs contributed by plugins.
+// Two rules shape everything below.
+//
+// Tabs belong to a chat, not to the window. Switching chats has to swap the
+// whole tab strip, or a terminal opened in one project would be sitting in
+// another project's chat pointing at the wrong folder.
+//
+// A view is mounted once and then only hidden. Tearing the DOM down on tab
+// switch loses a terminal's scrollback and every folder a tree had expanded,
+// which makes tabs feel like they reset themselves for no reason.
+
+/** What a plugin hands to `e.registerView`. */
+type PaneViewDef = {
+  /** Unique within the plugin; the pane namespaces it as `<plugin>:<id>`. */
+  id: string;
+  /** Menu entry, and the default tab label. */
+  title: string;
+  /** Short glyph shown before the tab label. */
+  icon?: string;
+  /** Build the view into `el`. Return a cleanup function to release resources
+   *  (a pty, a watcher) when the tab is closed. */
+  mount: (el: HTMLElement, ctx: PaneViewContext) => void | (() => void) | Promise<void | (() => void)>;
+};
+
+/** What a mounted view is told about where it lives. */
+type PaneViewContext = {
+  /** This tab's instance id — unique per tab, stable while the tab exists. */
+  tab: string;
+  /** The chat the tab belongs to. Views must use this rather than "the current
+   *  chat": a tab keeps running while you read another conversation. */
+  sid: string;
+  /** Rename the tab, so a terminal can show its cwd and a tree its folder. */
+  setTitle: (t: string) => void;
+  /** Mark the tab spent (a shell that exited) without closing it. */
+  setDone: (done: boolean) => void;
+  /** True while this tab is the visible one. */
+  isActive: () => boolean;
+  /** Called when the tab becomes visible or is resized — the moment a view
+   *  that measures itself (a terminal working out its column count) can
+   *  actually get a non-zero box. */
+  onShow: (fn: () => void) => void;
+  /** Close this tab from inside the view. */
+  close: () => void;
+};
+
+type RegisteredView = PaneViewDef & { plugin: string; key: string };
+
+type PaneTab = {
+  tab: string;
+  sid: string;
+  key: string;
+  title: string;
+  icon: string;
+  done: boolean;
+  el: HTMLElement;
+  cleanup: (() => void) | null;
+  onShow: (() => void)[];
+};
+
+const paneViews = new Map<string, RegisteredView>();
+/** Tabs per chat id. A chat with no entry has simply never opened one. */
+const paneTabs = new Map<string, PaneTab[]>();
+const paneActive = new Map<string, string>();
+
+const rightPane = document.getElementById("rightpane") as HTMLElement;
+const paneGrip = document.getElementById("pane-grip") as HTMLElement;
+const paneTabList = document.getElementById("pane-tablist") as HTMLElement;
+const paneBody = document.getElementById("pane-body") as HTMLElement;
+const paneEmpty = document.getElementById("pane-empty") as HTMLElement;
+const paneAdd = document.getElementById("pane-add") as HTMLButtonElement;
+const paneCloseBtn = document.getElementById("pane-close") as HTMLButtonElement;
+const paneMenu = document.getElementById("pane-menu") as HTMLElement;
+const paneMenuList = document.getElementById("pane-menu-list") as HTMLElement;
+const paneBtn = document.getElementById("btn-pane") as HTMLButtonElement;
+
+const PANE_MIN = 260;
+/// Leave the conversation a readable column no matter how far the grip is
+/// dragged: a 90%-wide pane technically works and makes the app useless.
+const PANE_MAX_SHARE = 0.62;
+let paneOpen = localStorage.getItem("e:pane") === "1";
+let paneWidth = Math.max(PANE_MIN, Number(localStorage.getItem("e:pane-w")) || 380);
+let paneSeq = 0;
+
+function paneMaxWidth(): number {
+  return Math.max(PANE_MIN, Math.round(window.innerWidth * PANE_MAX_SHARE));
+}
+
+function applyPaneWidth(w: number): void {
+  paneWidth = Math.min(paneMaxWidth(), Math.max(PANE_MIN, Math.round(w)));
+  document.documentElement.style.setProperty("--pane-w", paneWidth + "px");
+}
+
+function setPaneOpen(open: boolean): void {
+  paneOpen = open;
+  rightPane.hidden = !open;
+  paneGrip.hidden = !open;
+  paneBtn.classList.toggle("on", open);
+  paneBtn.setAttribute("aria-pressed", open ? "true" : "false");
+  localStorage.setItem("e:pane", open ? "1" : "0");
+  if (open) {
+    applyPaneWidth(paneWidth);
+    renderPaneTabs();
+    // The pane was 0×0 while hidden, so anything that measures itself has to
+    // be told to look again now that it has a box.
+    notifyPaneShown();
+  }
+}
+
+function tabsFor(sid: string): PaneTab[] {
+  let list = paneTabs.get(sid);
+  if (!list) {
+    list = [];
+    paneTabs.set(sid, list);
+  }
+  return list;
+}
+
+/// Views a plugin registered, in a stable order so the menu does not reshuffle
+/// itself between reloads.
+function paneViewList(): RegisteredView[] {
+  return [...paneViews.values()].sort((a, b) => a.plugin.localeCompare(b.plugin) || a.title.localeCompare(b.title));
+}
+
+function renderPaneTabs(): void {
+  const sid = currentSession;
+  const list = tabsFor(sid);
+  const active = paneActive.get(sid) || "";
+  paneTabList.replaceChildren();
+  for (const t of list) {
+    const el = document.createElement("div");
+    el.className = "pane-tab" + (t.tab === active ? " active" : "") + (t.done ? " exited" : "");
+    el.setAttribute("role", "tab");
+    el.setAttribute("aria-selected", t.tab === active ? "true" : "false");
+    el.title = t.title;
+    const label = document.createElement("span");
+    label.className = "pane-tab-label";
+    label.textContent = (t.icon ? t.icon + " " : "") + t.title;
+    const x = document.createElement("button");
+    x.className = "pane-tab-x";
+    x.type = "button";
+    x.textContent = "×";
+    x.title = "Close tab";
+    x.setAttribute("aria-label", `Close ${t.title}`);
+    x.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closePaneTab(t.tab);
+    });
+    el.append(label, x);
+    el.addEventListener("click", () => activatePaneTab(t.tab));
+    // Middle-click closes, the way it does in every other tab strip.
+    el.addEventListener("auxclick", (e) => {
+      if ((e as MouseEvent).button === 1) {
+        e.preventDefault();
+        closePaneTab(t.tab);
+      }
+    });
+    paneTabList.appendChild(el);
+  }
+  paneEmpty.hidden = list.length > 0;
+  // Only the current chat's views may be on screen. A tab left visible after a
+  // chat switch is a terminal in the wrong project's folder.
+  for (const [, all] of paneTabs) {
+    for (const t of all) {
+      t.el.classList.toggle("active", t.sid === sid && t.tab === active);
+    }
+  }
+}
+
+function notifyPaneShown(): void {
+  const sid = currentSession;
+  const active = paneActive.get(sid);
+  const t = tabsFor(sid).find((x) => x.tab === active);
+  if (!t) return;
+  for (const fn of t.onShow) {
+    try {
+      fn();
+    } catch (e) {
+      console.error("pane view onShow", t.key, e);
+    }
+  }
+}
+
+function activatePaneTab(tab: string): void {
+  const sid = currentSession;
+  if (!tabsFor(sid).some((t) => t.tab === tab)) return;
+  paneActive.set(sid, tab);
+  renderPaneTabs();
+  notifyPaneShown();
+}
+
+/// Open a view as a new tab in a chat. Returns the tab id, or "" when the view
+/// is not registered — a plugin can be disabled between a menu being drawn and
+/// a click landing on it.
+async function openPaneTab(key: string, sid = currentSession): Promise<string> {
+  const view = paneViews.get(key);
+  if (!view) {
+    notify(`No such view: ${key}`, "error");
+    return "";
+  }
+  const tab = `t${++paneSeq}_${Date.now().toString(36)}`;
+  const el = document.createElement("div");
+  el.className = "pane-view";
+  paneBody.appendChild(el);
+
+  const entry: PaneTab = {
+    tab,
+    sid,
+    key,
+    title: view.title,
+    icon: view.icon || "",
+    done: false,
+    el,
+    cleanup: null,
+    onShow: [],
+  };
+  tabsFor(sid).push(entry);
+  paneActive.set(sid, tab);
+  if (!paneOpen) setPaneOpen(true);
+  renderPaneTabs();
+
+  const ctx: PaneViewContext = {
+    tab,
+    sid,
+    setTitle: (t) => {
+      entry.title = String(t || view.title).slice(0, 80);
+      if (sid === currentSession) renderPaneTabs();
+    },
+    setDone: (done) => {
+      entry.done = !!done;
+      if (sid === currentSession) renderPaneTabs();
+    },
+    isActive: () => paneActive.get(entry.sid) === tab && entry.sid === currentSession && paneOpen,
+    onShow: (fn) => {
+      entry.onShow.push(fn);
+    },
+    close: () => closePaneTab(tab),
+  };
+
+  try {
+    const cleanup = await view.mount(el, ctx);
+    entry.cleanup = typeof cleanup === "function" ? cleanup : null;
+  } catch (e) {
+    console.error("pane view", key, e);
+    el.innerHTML = `<div class="files-error"></div>`;
+    (el.querySelector(".files-error") as HTMLElement).textContent = `${view.title} failed to open: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  // Mounting can take an await; the tab may already be the visible one by now.
+  notifyPaneShown();
+  return tab;
+}
+
+function closePaneTab(tab: string): void {
+  for (const [sid, list] of paneTabs) {
+    const i = list.findIndex((t) => t.tab === tab);
+    if (i < 0) continue;
+    const [t] = list.splice(i, 1);
+    // Cleanup first: it is what kills the pty, and a throw here must not leave
+    // the tab on screen with nothing behind it.
+    try {
+      t.cleanup?.();
+    } catch (e) {
+      console.error("pane view cleanup", t.key, e);
+    }
+    t.el.remove();
+    if (paneActive.get(sid) === tab) {
+      const next = list[Math.min(i, list.length - 1)];
+      if (next) paneActive.set(sid, next.tab);
+      else paneActive.delete(sid);
+    }
+    if (sid === currentSession) {
+      renderPaneTabs();
+      notifyPaneShown();
+    }
+    return;
+  }
+}
+
+/// Drop every tab belonging to a chat — used when that chat is deleted, so its
+/// shells do not outlive it.
+function closePaneTabsFor(sid: string): void {
+  for (const t of [...tabsFor(sid)]) closePaneTab(t.tab);
+  paneTabs.delete(sid);
+  paneActive.delete(sid);
+}
+
+function openPaneMenu(): void {
+  const views = paneViewList();
+  paneMenuList.replaceChildren();
+  if (!views.length) {
+    const row = document.createElement("div");
+    row.className = "picker-item dim";
+    row.textContent = "No views installed";
+    paneMenuList.appendChild(row);
+  }
+  for (const v of views) {
+    const row = document.createElement("div");
+    row.className = "picker-item";
+    row.innerHTML = `<span class="pi-name"></span><span class="pi-sub"></span>`;
+    (row.querySelector(".pi-name") as HTMLElement).textContent = (v.icon ? v.icon + " " : "") + v.title;
+    (row.querySelector(".pi-sub") as HTMLElement).textContent = v.plugin;
+    row.addEventListener("click", () => {
+      paneMenu.hidden = true;
+      void openPaneTab(v.key);
+    });
+    paneMenuList.appendChild(row);
+  }
+  paneMenu.hidden = false;
+}
+
+paneAdd.addEventListener("click", (e) => {
+  e.stopPropagation();
+  // Toggle rather than always-open, so a second click (or an impatient
+  // double-click) closes the menu instead of reopening it under the cursor.
+  if (!paneMenu.hidden) {
+    paneMenu.hidden = true;
+    return;
+  }
+  const views = paneViewList();
+  // One view installed makes a menu of one an obstacle, not a choice.
+  if (views.length === 1) void openPaneTab(views[0].key);
+  else openPaneMenu();
+});
+paneCloseBtn.addEventListener("click", () => setPaneOpen(false));
+document.addEventListener("click", (e) => {
+  if (!paneMenu.hidden && !paneMenu.contains(e.target as Node)) paneMenu.hidden = true;
+});
+// Escape closes the menu before anything else can read it — without this it is
+// the one popup in the app you can only dismiss with the mouse.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || paneMenu.hidden) return;
+  e.preventDefault();
+  e.stopPropagation();
+  paneMenu.hidden = true;
+}, true);
+paneBtn.addEventListener("click", () => setPaneOpen(!paneOpen));
+
+// Ctrl/Cmd+B is the near-universal "toggle the side panel" binding.
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "b") {
+    e.preventDefault();
+    setPaneOpen(!paneOpen);
+  }
+});
+
+// The grip drags on pointer events rather than mouse events so a trackpad or
+// pen behaves the same, and captures the pointer so leaving the 5px strip
+// mid-drag does not drop it.
+paneGrip.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  paneGrip.setPointerCapture(e.pointerId);
+  paneGrip.classList.add("dragging");
+  document.body.classList.add("pane-dragging");
+  const startX = e.clientX;
+  const startW = paneWidth;
+  const move = (ev: PointerEvent): void => {
+    // The pane is on the right, so dragging left widens it.
+    applyPaneWidth(startW - (ev.clientX - startX));
+  };
+  const up = (): void => {
+    paneGrip.releasePointerCapture(e.pointerId);
+    paneGrip.classList.remove("dragging");
+    document.body.classList.remove("pane-dragging");
+    paneGrip.removeEventListener("pointermove", move);
+    paneGrip.removeEventListener("pointerup", up);
+    paneGrip.removeEventListener("pointercancel", up);
+    localStorage.setItem("e:pane-w", String(paneWidth));
+    notifyPaneShown();
+  };
+  paneGrip.addEventListener("pointermove", move);
+  paneGrip.addEventListener("pointerup", up);
+  paneGrip.addEventListener("pointercancel", up);
+});
+// Keyboard resize, so the grip is not mouse-only.
+paneGrip.addEventListener("keydown", (e) => {
+  const step = e.shiftKey ? 60 : 16;
+  if (e.key === "ArrowLeft") applyPaneWidth(paneWidth + step);
+  else if (e.key === "ArrowRight") applyPaneWidth(paneWidth - step);
+  else return;
+  e.preventDefault();
+  localStorage.setItem("e:pane-w", String(paneWidth));
+  notifyPaneShown();
+});
+
+let paneResizeTimer = 0;
+window.addEventListener("resize", () => {
+  applyPaneWidth(paneWidth);
+  // Views re-measure on a trailing edge: a terminal reflowing on every frame
+  // of a window drag is thousands of pointless resize round-trips to the pty.
+  clearTimeout(paneResizeTimer);
+  paneResizeTimer = window.setTimeout(notifyPaneShown, 120);
+});
+
+applyPaneWidth(paneWidth);
+setPaneOpen(paneOpen);
+
+// ---------- pty stream fan-out ----------
+// Two listeners for the whole app, demultiplexed by terminal id. A listener per
+// terminal would have to be unregistered on every tab close, and one missed
+// teardown keeps that tab's entire scrollback (and its closure) alive forever.
+const ptyDataSubs = new Map<string, Set<(data: string) => void>>();
+const ptyExitSubs = new Map<string, Set<(code: number) => void>>();
+
+function subscribe<T>(map: Map<string, Set<T>>, id: string, fn: T): () => void {
+  let set = map.get(id);
+  if (!set) {
+    set = new Set();
+    map.set(id, set);
+  }
+  set.add(fn);
+  return () => {
+    const s = map.get(id);
+    if (!s) return;
+    s.delete(fn);
+    if (!s.size) map.delete(id);
+  };
+}
+
+api.onPtyEvent((ev) => {
+  if (ev.type === "data") {
+    for (const fn of ptyDataSubs.get(ev.id) || []) {
+      try {
+        fn(ev.data);
+      } catch (e) {
+        console.error("pty data handler", ev.id, e);
+      }
+    }
+    return;
+  }
+  for (const fn of ptyExitSubs.get(ev.id) || []) {
+    try {
+      fn(ev.code);
+    } catch (e) {
+      console.error("pty exit handler", ev.id, e);
+    }
+  }
+  // The process is gone; nothing more can arrive under this id.
+  ptyDataSubs.delete(ev.id);
+  ptyExitSubs.delete(ev.id);
+});
+
 // ---------- plugins ----------
 // A plugin is a folder the user put in ~/.e/plugins (or <project>/.e/plugins):
 // a manifest and an ES module. The module runs here, in the webview, and only
@@ -2821,6 +3299,7 @@ type PluginStatus = api.PluginInfo & {
   failure: string;
   tools: string[];
   commands: string[];
+  views: string[];
   notes: string[];
 };
 let pluginStatus: PluginStatus[] = [];
@@ -2834,7 +3313,24 @@ interface PluginAPIHost {
   registerTool(def: api.PluginToolDef & { run: (args: Record<string, unknown>) => unknown }): void;
   on(event: string, handler: (ev: api.EngineEvents) => unknown): void;
   registerCommand(name: string, fn: () => void, desc?: string): void;
+  /** Contribute a tab to the right pane. Needs "views". */
+  registerView(def: PaneViewDef): void;
   ui: { notify: (msg: string, kind?: string) => void; confirm: (msg: string) => Promise<boolean> };
+  /** Read-only browsing of a chat's project folder. Needs "fs". */
+  fs: {
+    list: (sid: string, path?: string) => Promise<api.FsListing>;
+    read: (sid: string, path: string) => Promise<api.FsFile>;
+  };
+  /** Real terminals in a chat's project folder. Needs "pty". */
+  pty: {
+    spawn: (sid: string, id: string, cols: number, rows: number) => Promise<void>;
+    write: (sid: string, id: string, data: string) => Promise<void>;
+    resize: (sid: string, id: string, cols: number, rows: number) => Promise<void>;
+    kill: (sid: string, id: string) => Promise<void>;
+    alive: (sid: string, id: string) => Promise<boolean>;
+    onData: (id: string, fn: (data: string) => void) => () => void;
+    onExit: (id: string, fn: (code: number) => void) => () => void;
+  };
   fetch: (input: string, init?: RequestInit) => Promise<Response>;
   session: () => { id: string; name: string; workspace: string; model: string; provider: string } | null;
   log: (...args: unknown[]) => void;
@@ -2920,6 +3416,14 @@ function dispatchToPlugins(ev: api.EngineEvents): void {
   }
 }
 
+/// Chat lifecycle, which the engine knows nothing about — it only ever sees a
+/// run. A pane view needs it: a tab is bound to one chat, so "which chat is on
+/// screen" is the difference between a file tree showing this project and one
+/// showing whichever project you looked at last.
+function emitChatEvent(ev: Extract<api.EngineEvents, { type: "chat_open" | "chat_switch" }>): void {
+  dispatchToPlugins(ev);
+}
+
 function withParsedArgs(ev: api.EngineEvents & { arguments?: string }): api.EngineEvents {
   let args: Record<string, unknown> = {};
   try { args = JSON.parse(ev.arguments || "{}"); } catch { /* leave empty */ }
@@ -2960,6 +3464,12 @@ async function answerVeto(ev: { id: string; sid: string; tool: string; arguments
 function toolName(raw: string): string {
   const clean = raw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
   return clean || "tool";
+}
+
+/// Terminal ids are namespaced by plugin. Without this, one plugin could write
+/// into — or kill — another's shell just by guessing the id it used.
+function ptyId(plugin: string, id: string): string {
+  return `${plugin}::${String(id || "")}`;
 }
 
 /// Capabilities are a contract, not a suggestion: everything a plugin can
@@ -3012,6 +3522,40 @@ function buildPluginApi(info: api.PluginInfo, status: PluginStatus): PluginAPIHo
       pluginCommands[cmd] = { run: fn, desc: desc || "plugin command", plugin: info.name };
       status.commands.push(cmd);
     },
+    registerView(def) {
+      if (!has("views")) return deny("views", `registerView("${def && def.id}")`);
+      const id = String((def && def.id) || "").trim();
+      if (!id) {
+        const msg = `${info.name}: a view needs an id`;
+        status.notes.push(msg);
+        notify(msg, "error");
+        return;
+      }
+      if (typeof def.mount !== "function") {
+        const msg = `${info.name}: view "${id}" has no mount function`;
+        status.notes.push(msg);
+        notify(msg, "error");
+        return;
+      }
+      // Namespaced by plugin, so two plugins may both contribute a "terminal"
+      // without one silently replacing the other.
+      const key = `${info.name}:${id}`;
+      if (paneViews.has(key)) {
+        const msg = `${info.name}: view "${id}" is registered twice`;
+        status.notes.push(msg);
+        notify(msg, "error");
+        return;
+      }
+      paneViews.set(key, {
+        ...def,
+        id,
+        title: String(def.title || id),
+        icon: def.icon ? String(def.icon).slice(0, 2) : "",
+        plugin: info.name,
+        key,
+      });
+      status.views.push(key);
+    },
     ui: {
       notify: (msg, kind) => {
         if (!has("ui")) return deny("ui", "ui.notify");
@@ -3023,6 +3567,76 @@ function buildPluginApi(info: api.PluginInfo, status: PluginStatus): PluginAPIHo
           return false;
         }
         return confirmModal(msg, info.display);
+      },
+    },
+    // The chat id is the argument, not a path: the backend turns it into a
+    // folder. A plugin naming its own root would make this a file browser for
+    // the whole disk, which is the one thing the capability must not be.
+    fs: {
+      list: (sid, path) => {
+        if (!has("fs")) {
+          deny("fs", "fs.list");
+          return Promise.reject(new Error(`${info.name}: fs.list needs the "fs" capability`));
+        }
+        return api.fsList(sid, path || "");
+      },
+      read: (sid, path) => {
+        if (!has("fs")) {
+          deny("fs", "fs.read");
+          return Promise.reject(new Error(`${info.name}: fs.read needs the "fs" capability`));
+        }
+        return api.fsRead(sid, path);
+      },
+    },
+    pty: {
+      spawn: (sid, id, cols, rows) => {
+        if (!has("pty")) {
+          deny("pty", "pty.spawn");
+          return Promise.reject(new Error(`${info.name}: pty.spawn needs the "pty" capability`));
+        }
+        return api.ptySpawn(sid, ptyId(info.name, id), cols, rows);
+      },
+      write: (sid, id, data) => {
+        if (!has("pty")) {
+          deny("pty", "pty.write");
+          return Promise.reject(new Error(`${info.name}: pty.write needs the "pty" capability`));
+        }
+        return api.ptyWrite(sid, ptyId(info.name, id), data);
+      },
+      resize: (sid, id, cols, rows) => {
+        if (!has("pty")) {
+          deny("pty", "pty.resize");
+          return Promise.reject(new Error(`${info.name}: pty.resize needs the "pty" capability`));
+        }
+        return api.ptyResize(sid, ptyId(info.name, id), cols, rows);
+      },
+      kill: (sid, id) => {
+        if (!has("pty")) {
+          deny("pty", "pty.kill");
+          return Promise.reject(new Error(`${info.name}: pty.kill needs the "pty" capability`));
+        }
+        return api.ptyKill(sid, ptyId(info.name, id));
+      },
+      alive: (sid, id) => {
+        if (!has("pty")) {
+          deny("pty", "pty.alive");
+          return Promise.resolve(false);
+        }
+        return api.ptyAlive(sid, ptyId(info.name, id));
+      },
+      onData: (id, fn) => {
+        if (!has("pty")) {
+          deny("pty", "pty.onData");
+          return () => undefined;
+        }
+        return subscribe(ptyDataSubs, ptyId(info.name, id), fn);
+      },
+      onExit: (id, fn) => {
+        if (!has("pty")) {
+          deny("pty", "pty.onExit");
+          return () => undefined;
+        }
+        return subscribe(ptyExitSubs, ptyId(info.name, id), fn);
       },
     },
     fetch: (input, init) => {
@@ -3071,6 +3685,12 @@ function resetPluginRuntime(): void {
   pluginReg.clear();
   pluginHandlers.length = 0;
   for (const k of Object.keys(pluginCommands)) delete pluginCommands[k];
+  // Open tabs go with the code that drew them. Keeping a view mounted after
+  // its module was dropped leaves a pane nobody owns: its buttons still call
+  // into the old closure, and a reload that was meant to pick up an edit would
+  // instead run the previous version until the tab happened to be closed.
+  for (const sid of [...paneTabs.keys()]) closePaneTabsFor(sid);
+  paneViews.clear();
   pluginStatus = [];
 }
 
@@ -3101,7 +3721,7 @@ async function loadPlugins(): Promise<void> {
     return;
   }
   for (const info of found) {
-    const status: PluginStatus = { ...info, loaded: false, failure: info.error, tools: [], commands: [], notes: [] };
+    const status: PluginStatus = { ...info, loaded: false, failure: info.error, tools: [], commands: [], views: [], notes: [] };
     pluginStatus.push(status);
     if (!info.enabled || info.error) continue;
     try {

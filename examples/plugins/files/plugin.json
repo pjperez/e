@@ -1,0 +1,7 @@
+{
+  "name": "Files",
+  "version": "0.1.0",
+  "description": "A lazy file tree of this chat's project folder, with a text preview.",
+  "capabilities": ["views", "fs", "ui", "session-read"],
+  "entry": "index.js"
+}

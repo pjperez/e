@@ -949,6 +949,97 @@ fn ui_ready(state: tauri::State<AppState>) {
     state.ui_ready.store(true, Ordering::SeqCst);
 }
 
+// ---------- right pane: terminals and files ----------
+
+/// Which chat a pane call is acting for, resolved on this side.
+///
+/// The renderer passes a chat id; everything else — the folder, which terminals
+/// it may touch — is derived from it here. A caller that could name its own
+/// workspace would make `fs` a browser for the whole disk and `pty` a shell
+/// anywhere, so that decision never leaves the backend.
+fn pane_sid(state: &tauri::State<'_, AppState>, sid: Option<String>) -> Result<String, String> {
+    let store = state.store.lock().map_err(|_| "lock")?;
+    Ok(match sid.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => store.current.clone(),
+    })
+}
+
+/// Where a pane view is allowed to look and work: the chat's own project
+/// folder, refusing the empty, relative and missing cases with the same advice
+/// the tools give.
+fn pane_root(state: &tauri::State<'_, AppState>, sid: &str) -> Result<std::path::PathBuf, String> {
+    let ws = {
+        let store = state.store.lock().map_err(|_| "lock")?;
+        store.resolved_workspace(sid)
+    };
+    let ws = ws.trim();
+    if ws.is_empty() {
+        return Err("this chat has no project folder. Pick one for its project (sidebar → ✎).".into());
+    }
+    let p = std::path::PathBuf::from(ws);
+    if !p.is_absolute() {
+        return Err(format!(
+            "project folder is a relative path ({ws}), so it would resolve differently depending on where the app was started. Pick a real folder for this project (sidebar → ✎)."
+        ));
+    }
+    if !p.is_dir() {
+        return Err(format!("project folder does not exist: {ws}"));
+    }
+    Ok(p)
+}
+
+// Every pane command runs off the UI thread. `pty_write` can block for as long
+// as the child ignores its stdin, and a directory listing can block on a cold
+// disk or a network share; on the main thread either one freezes the window.
+
+#[tauri::command(async)]
+fn fs_list(state: tauri::State<'_, AppState>, sid: Option<String>, path: Option<String>) -> Result<engine::browse::Listing, String> {
+    let sid = pane_sid(&state, sid)?;
+    let root = pane_root(&state, &sid)?;
+    engine::browse::list(&root, &path.unwrap_or_default())
+}
+
+#[tauri::command(async)]
+fn fs_read(state: tauri::State<'_, AppState>, sid: Option<String>, path: String) -> Result<engine::browse::FileText, String> {
+    let sid = pane_sid(&state, sid)?;
+    let root = pane_root(&state, &sid)?;
+    engine::browse::read_text(&root, &path)
+}
+
+#[tauri::command(async)]
+fn pty_spawn(state: tauri::State<'_, AppState>, sid: Option<String>, id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let sid = pane_sid(&state, sid)?;
+    let root = pane_root(&state, &sid)?;
+    engine::pty::spawn(&sid, &id, &root, cols, rows)
+}
+
+#[tauri::command(async)]
+fn pty_write(state: tauri::State<'_, AppState>, sid: Option<String>, id: String, data: String) -> Result<(), String> {
+    let sid = pane_sid(&state, sid)?;
+    engine::pty::write(&sid, &id, &data)
+}
+
+#[tauri::command(async)]
+fn pty_resize(state: tauri::State<'_, AppState>, sid: Option<String>, id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let sid = pane_sid(&state, sid)?;
+    engine::pty::resize(&sid, &id, cols, rows)
+}
+
+#[tauri::command(async)]
+fn pty_kill(state: tauri::State<'_, AppState>, sid: Option<String>, id: String) -> Result<(), String> {
+    let sid = pane_sid(&state, sid)?;
+    engine::pty::kill(&sid, &id)
+}
+
+#[tauri::command(async)]
+fn pty_alive(state: tauri::State<'_, AppState>, sid: Option<String>, id: String) -> bool {
+    match pane_sid(&state, sid) {
+        Ok(sid) => engine::pty::alive(&sid, &id),
+        Err(_) => false,
+    }
+}
+
 pub fn run() {
     let config = Config::from_env();
     let state = AppState {
@@ -987,6 +1078,7 @@ pub fn run() {
         .setup(|app| {
             plugins::init(app.handle().clone());
             approval::init(app.handle().clone());
+            engine::pty::init(app.handle().clone());
             // MCP servers start against the chat's project folder, so a
             // server told to serve "." serves the project rather than
             // wherever the app was launched from.
@@ -1046,10 +1138,28 @@ pub fn run() {
             search_sessions,
             confirm_close,
             close_dismissed,
-            ui_ready
+            ui_ready,
+            fs_list,
+            fs_read,
+            pty_spawn,
+            pty_write,
+            pty_resize,
+            pty_kill,
+            pty_alive
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running e");
+        .build(tauri::generate_context!())
+        .expect("error while building e")
+        // Every way out of the app ends here — the confirmed quit, a second
+        // click on the close button while the prompt is up, and a close before
+        // the UI ever booted. A pty outlives its parent on both platforms, so
+        // killing them anywhere less final leaves an abandoned shell holding
+        // the project folder open, which is what makes the next `git`
+        // operation fail for no visible reason.
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                engine::pty::shutdown();
+            }
+        });
 }
 #[cfg(test)]
 mod stash_tests {

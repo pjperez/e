@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent;
 pub mod approval;
+pub mod browse;
 pub mod mcp;
 pub mod plugins;
 pub mod provider;
+pub mod pty;
 pub mod sessions;
 pub mod skills;
 pub mod tools;

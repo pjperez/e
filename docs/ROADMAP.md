@@ -48,6 +48,9 @@ easier to follow or safer to trust don't earn their bytes.
 - Plugin capabilities enforced by the host, with a Settings → Extensions pane
   showing what loaded, what it registered, and why anything failed.
 - Plugin guards: a `tool_call` listener can refuse a call before it runs.
+- A side pane of plugin-contributed tabs, scoped to the chat that opened them:
+  real terminals (ConPTY/openpty) and read-only project browsing, both fenced
+  to that chat's own folder.
 - `e-rpc`: the same engine headless over JSONL, embeddable in editors and
   scripts.
 
@@ -86,4 +89,6 @@ collapsible section. It wants real grouping as the number of providers grows.
 - **A second SDK language.** The `Tool` trait is the only Rust surface; plugins
   are folders.
 - **Replacing the terminal.** `e` complements it by making one specific loop
-  legible.
+  legible. The side pane's terminal is there so you do not have to leave the
+  window to run one command — not an attempt to out-feature a real one. It has
+  no tmux, no ligature shaping, and does not reflow wrapped lines on resize.

@@ -19,7 +19,17 @@ use tauri::Emitter;
 /// Everything a plugin may ask for. A manifest naming anything else is a
 /// mistake we surface rather than ignore — silently dropping an unknown
 /// capability would let a typo ("net" for "network") look like a granted one.
-pub const CAPABILITIES: [&str; 6] = ["tools", "events", "commands", "ui", "network", "session-read"];
+pub const CAPABILITIES: [&str; 9] = [
+    "tools",
+    "events",
+    "commands",
+    "ui",
+    "network",
+    "session-read",
+    "views",
+    "fs",
+    "pty",
+];
 
 /// A plugin tool definition, registered from the frontend after the module
 /// asked for it.
