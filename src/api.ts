@@ -312,7 +312,7 @@ export async function renameSession(id: string, name: string): Promise<boolean> 
   return invoke("rename_session", { id, name });
 }
 
-export type CompactResult = { messages: number; compacted: boolean; dropped?: number };
+export type CompactResult = { messages: number; compacted: boolean; dropped?: number; stopped?: boolean };
 
 export async function compactSession(id: string): Promise<CompactResult> {
   if (!inTauri) return { messages: 0, compacted: false };

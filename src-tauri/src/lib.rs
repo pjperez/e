@@ -24,6 +24,11 @@ struct AppState {
     tools: Arc<ToolRegistry>,
     store: Mutex<engine::sessions::SessionStore>,
     runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Compaction happens before a chat's run is registered, but it is a
+    /// provider call like any other — retries, backoff waits and all — and it
+    /// shows on the same activity strip. It needs its own cancel flag or Stop
+    /// has nothing to set while a compaction is backing off.
+    compactions: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Set once the frontend has registered its close handler. Until then the
     /// close button must behave normally: preventing close while nothing can
     /// draw the confirmation would leave the app impossible to quit.
@@ -63,18 +68,45 @@ impl AppState {
 
     fn cancel(&self, sid: &str) -> bool {
         let flag = self.runs.lock().ok().and_then(|r| r.get(sid).cloned());
-        match flag {
-            Some(f) => {
-                f.store(true, Ordering::SeqCst);
-                true
-            }
-            None => false,
+        let compact = self.compactions.lock().ok().and_then(|c| c.get(sid).cloned());
+        let mut hit = false;
+        if let Some(f) = flag {
+            f.store(true, Ordering::SeqCst);
+            hit = true;
+        }
+        // A chat can be compacting *and* have a run registered (a queued send
+        // compacting behind a live run), so stop both rather than either.
+        if let Some(f) = compact {
+            f.store(true, Ordering::SeqCst);
+            hit = true;
+        }
+        hit
+    }
+
+    /// Register a compaction, returning its cancel flag. Unlike a run there is
+    /// only ever one per chat, and a second call simply replaces the first.
+    fn begin_compaction(&self, sid: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut c) = self.compactions.lock() {
+            c.insert(sid.to_string(), flag.clone());
+        }
+        flag
+    }
+
+    fn end_compaction(&self, sid: &str) {
+        if let Ok(mut c) = self.compactions.lock() {
+            c.remove(sid);
         }
     }
 
     fn cancel_all(&self) {
         if let Ok(runs) = self.runs.lock() {
             for f in runs.values() {
+                f.store(true, Ordering::SeqCst);
+            }
+        }
+        if let Ok(compactions) = self.compactions.lock() {
+            for f in compactions.values() {
                 f.store(true, Ordering::SeqCst);
             }
         }
@@ -631,15 +663,22 @@ async fn compact_session(app: tauri::AppHandle, state: tauri::State<'_, AppState
             old_text
         ),
     )];
-    let never = AtomicBool::new(false);
     // Compaction is a provider call like any other, so it gets the same retry
-    // treatment — and the same on-screen explanation while it waits.
+    // treatment — and the same on-screen explanation while it waits. That wait
+    // is exactly when Stop gets pressed, so it is cancellable too.
+    let cancelled = state.begin_compaction(&id);
     let emit = AppEmitter { handle: app, session: id.clone() };
     let summary = provider
-        .chat(&prompt, &[], |_| {}, |_| {}, |n| emit.retry(n), &never)
+        .chat(&prompt, &[], |_| {}, |_| {}, |n| emit.retry(n), &cancelled)
         .await
         .map(|c| c.text)
         .unwrap_or_default();
+    state.end_compaction(&id);
+    if cancelled.load(Ordering::SeqCst) {
+        // Stopped mid-summary: leave the history untouched and say so, so the
+        // caller drops the send instead of treating it as a failed compaction.
+        return Ok(serde_json::json!({ "messages": hist.len(), "compacted": false, "stopped": true }));
+    }
     if summary.trim().is_empty() {
         // Don't destroy history when summarization failed.
         return Err("could not summarize".into());
@@ -1047,6 +1086,7 @@ pub fn run() {
         tools: Arc::new(ToolRegistry::new()),
         store: Mutex::new(engine::sessions::SessionStore::new()),
         runs: Mutex::new(HashMap::new()),
+        compactions: Mutex::new(HashMap::new()),
         ui_ready: AtomicBool::new(false),
         close_pending: AtomicBool::new(false),
     };
