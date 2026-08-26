@@ -14,9 +14,12 @@ pub struct Config {
     pub temperature: f64,
     pub system: String,
     pub workspace: String,
-    /// Auto-approve risky tools (shell, write_file) instead of prompting.
+    /// Auto-approve risky tools (powershell, write_file) instead of prompting.
     #[serde(default)]
     pub yolo: bool,
+    /// Give each new task in a Git project an app-managed worktree.
+    #[serde(default = "default_true")]
+    pub task_worktrees: bool,
     #[serde(default)]
     pub models: Vec<String>,
     /// Usable context window (tokens) for the active model. Compaction is
@@ -210,9 +213,10 @@ impl Config {
             api_key: String::new(),
             model: String::new(),
             temperature: 0.7,
-            system: "You are e, a fast, capable coding agent running in a local harness with a workspace and tools: shell (run commands), read_file, write_file, list_dir.\nTool use policy: use a tool ONLY when it genuinely helps (inspect/read files, run or verify commands, modify the workspace, or when the user asks you to act). For conversational or directly-answerable requests, answer directly yourself and NEVER make a tool call.".to_string(),
+            system: "You are e, a fast, capable coding agent running in a local harness with a workspace and tools: powershell (run PowerShell commands), read_file, write_file, list_dir.\nTool use policy: use a tool ONLY when it genuinely helps (inspect/read files, run or verify commands, modify the workspace, or when the user asks you to act). For conversational or directly-answerable requests, answer directly yourself and NEVER make a tool call.".to_string(),
             workspace: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
             yolo: false,
+            task_worktrees: true,
             context_window: default_context_window(),
             // No provider ships with `e`: the first run sends you to Settings to
             // add one. Baking in an endpoint would point every install at
@@ -223,9 +227,51 @@ impl Config {
             disabled_plugins: Vec::new(),
         };
 
+        let mut had_plaintext_key = false;
         if let Ok(text) = std::fs::read_to_string(&cfg_file) {
             if let Ok(c) = serde_json::from_str::<Config>(&text) {
+                had_plaintext_key =
+                    !c.api_key.is_empty() || c.providers.iter().any(|p| !p.api_key.is_empty());
                 merge(&mut base, c);
+            }
+        }
+        // A config written before providers existed (or one whose list was
+        // emptied) still has to yield one provider, otherwise there is nothing
+        // to enable, disable or pick models from.
+        if base.providers.is_empty() {
+            base.providers.push(ProviderItem {
+                id: "default".into(),
+                name: host_of(&base.base_url),
+                base_url: base.base_url.clone(),
+                api_key: base.api_key.clone(),
+                models: base.models.clone(),
+                context_window: None,
+                model_meta: BTreeMap::new(),
+                enabled: true,
+                disabled_models: Vec::new(),
+            });
+        }
+        // A transitional config may have a provider list but still keep its key
+        // only in the old top-level field. Move that value onto the persisted
+        // provider before migrating it.
+        let persisted_active = base.resolve_provider_id(&base.model, &base.provider_id);
+        if let Some(p) = base.providers.iter_mut().find(|p| p.id == persisted_active) {
+            if p.api_key.trim().is_empty() {
+                p.api_key = base.api_key.clone();
+            }
+        }
+        // Migrate old plaintext keys before environment variables are applied.
+        // Env overrides are intentionally process-local and must never become
+        // persisted credentials.
+        for p in &mut base.providers {
+            if p.api_key.is_empty() {
+                match crate::engine::credentials::load(&p.id) {
+                    Ok(Some(key)) => p.api_key = key,
+                    Ok(None) => {}
+                    Err(e) => eprintln!("{e}"),
+                }
+            } else if let Err(e) = crate::engine::credentials::save(&p.id, &p.api_key) {
+                eprintln!("{e}");
             }
         }
         if let Some(v) = env_var("E_API_KEY") {
@@ -244,22 +290,6 @@ impl Config {
             if let Some(b) = parse_bool(&v) {
                 base.yolo = b;
             }
-        }
-        // A config written before providers existed (or one whose list was
-        // emptied) still has to yield one provider, otherwise there is nothing
-        // to enable, disable or pick models from.
-        if base.providers.is_empty() {
-            base.providers.push(ProviderItem {
-                id: "default".into(),
-                name: host_of(&base.base_url),
-                base_url: base.base_url.clone(),
-                api_key: base.api_key.clone(),
-                models: base.models.clone(),
-                context_window: None,
-                model_meta: BTreeMap::new(),
-                enabled: true,
-                disabled_models: Vec::new(),
-            });
         }
         // Env overrides land on the provider the connection points at, not just
         // the flat fields: the provider list is the source of truth now, so a
@@ -291,6 +321,11 @@ impl Config {
             }
         }
         base.use_model(&base.model.clone(), &active_id);
+        if had_plaintext_key {
+            // Config::save always strips secrets, even if migration to the OS
+            // store failed, so a key is never left behind in plaintext.
+            base.save();
+        }
         base
     }
 
@@ -430,11 +465,17 @@ impl Config {
     pub fn save(&self) {
         let home = dirs::home_dir().unwrap_or_default().join(".e");
         if std::fs::create_dir_all(&home).is_ok() {
-            let _ = std::fs::write(
-                home.join("config.json"),
-                serde_json::to_string_pretty(self).unwrap_or_default(),
-            );
+            let _ = std::fs::write(home.join("config.json"), self.persisted_json());
         }
+    }
+
+    fn persisted_json(&self) -> String {
+        let mut disk = self.clone();
+        disk.api_key.clear();
+        for provider in &mut disk.providers {
+            provider.api_key.clear();
+        }
+        serde_json::to_string_pretty(&disk).unwrap_or_default()
     }
 }
 
@@ -445,13 +486,13 @@ fn platform_hint() -> String {
     if cfg!(windows) {
         format!(
             "PLATFORM (auto-detected at startup): Windows ({arch}).
-The shell tool runs **cmd.exe** — use Windows command syntax (dir, type, copy, del, rmdir /s, where).
-Unix utilities (ls, cat, grep -r, rm -rf, chmod, tree, touch) are NOT reliably available.
+The only command-execution tool is **powershell**, running Windows PowerShell. Use PowerShell cmdlets and syntax.
+Never emit Bash, cmd.exe, POSIX shell syntax, or Unix utilities.
 Prefer the list_dir tool to list files, read_file to read, and write_file to edit. Path separator is backslash."
         )
     } else {
         format!(
-            "PLATFORM (auto-detected at startup): {} on {arch}. The shell tool runs POSIX sh — use standard Unix commands. Path separator is forward slash.",
+           "PLATFORM (auto-detected at startup): {} on {arch}. The only command-execution tool is powershell, running PowerShell. Never emit Bash or POSIX shell syntax. Path separator is forward slash.",
             std::env::consts::OS
         )
     }
@@ -492,6 +533,7 @@ fn merge(base: &mut Config, c: Config) {
     // express a bool the user deliberately turned off, nor a list the user
     // deliberately emptied by re-enabling the last disabled plugin.
     base.yolo = c.yolo;
+    base.task_worktrees = c.task_worktrees;
     base.disabled_plugins = c.disabled_plugins;
 }
 
@@ -788,7 +830,7 @@ impl Agent {
                 return stats;
             }
 
-            const RISKY: [&str; 2] = ["shell", "write_file"];
+            const RISKY: [&str; 2] = ["powershell", "write_file"];
             let ctx = self.workspace_ctx();
             for tc in &completion.tool_calls {
                 if cancelled.load(Ordering::SeqCst) {
@@ -889,6 +931,7 @@ mod tests {
             system: String::new(),
             workspace: String::new(),
             yolo: false,
+            task_worktrees: true,
             models: Vec::new(),
             context_window: 1_000_000,
             provider_id: String::new(),
@@ -912,6 +955,18 @@ mod tests {
         assert_eq!(got, vec!["m3"]);
         assert_eq!(c.providers.len(), 2, "disabling must not delete the provider or its key");
         assert_eq!(c.providers[0].api_key, "key-a");
+    }
+
+    #[test]
+    fn persisted_config_never_contains_api_keys() {
+        let mut c = cfg(vec![provider("a", &["m1"])]);
+        c.api_key = "top-level-secret".into();
+        let json = c.persisted_json();
+        assert!(!json.contains("top-level-secret"), "{json}");
+        assert!(!json.contains("key-a"), "{json}");
+        let disk: Config = serde_json::from_str(&json).expect("saved config");
+        assert!(disk.api_key.is_empty());
+        assert!(disk.providers[0].api_key.is_empty());
     }
 
     #[test]

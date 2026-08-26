@@ -111,7 +111,7 @@ fn a_servers_tools_are_discovered_registered_and_callable() {
     // point at a subprocess that is gone.
     mcp::shutdown(&reg);
     assert!(reg.get("mcp_fake_echo").is_none());
-    assert!(reg.get("shell").is_some(), "built-ins survive a reload");
+    assert!(reg.get("powershell").is_some(), "built-ins survive a reload");
     let _ = std::fs::remove_dir_all(&ws);
 }
 

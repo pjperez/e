@@ -40,6 +40,14 @@ pub struct SessionMeta {
     pub provider: String,
     #[serde(default)]
     pub state: String,
+    /// True only for worktrees created and owned by e. User-selected folders are
+    /// never deleted when a task is removed.
+    #[serde(default)]
+    pub managed_worktree: bool,
+    #[serde(default)]
+    pub worktree_base: String,
+    #[serde(default)]
+    pub worktree_branch: String,
 }
 
 /// File-backed store: ~/.e/sessions/<id>.json (history) + index.json.
@@ -281,12 +289,17 @@ impl SessionStore {
         let name = proj.map(|p| p.name.clone()).unwrap_or_default();
         let proj_ws = proj.map(|p| p.workspace.clone()).unwrap_or_default();
         let workspace = self.resolved_workspace(id);
+        let managed_base = sess
+            .filter(|s| s.managed_worktree)
+            .map(|s| s.worktree_base.trim())
+            .unwrap_or("");
         // Chats survive the deletion of their project: they are refiled under
         // whichever one remains but keep their own folder. Reporting the name of
         // that fallback project would then be a plain lie, so flag the mismatch
         // and let the prompt describe the folder instead of the label.
+        let compared_workspace = if managed_base.is_empty() { workspace.as_str() } else { managed_base };
         let detached = !proj_ws.trim().is_empty()
-            && std::path::Path::new(&workspace) != std::path::Path::new(proj_ws.trim());
+            && std::path::Path::new(compared_workspace) != std::path::Path::new(proj_ws.trim());
         ProjectContext {
             scratch: is_scratch(&workspace),
             detached,
@@ -398,7 +411,7 @@ impl SessionStore {
             return false;
         };
         p.workspace = ws.clone();
-        for s in self.sessions.iter_mut().filter(|s| s.project == id) {
+        for s in self.sessions.iter_mut().filter(|s| s.project == id && !s.managed_worktree) {
             s.workspace = ws.clone();
         }
         self.save_index();
@@ -488,6 +501,9 @@ impl SessionStore {
             model: model.trim().to_string(),
             provider: provider.trim().to_string(),
             state: String::new(),
+            managed_worktree: false,
+            worktree_base: String::new(),
+            worktree_branch: String::new(),
         };
         self.set_history(&id, Vec::new());
         self.sessions.push(meta.clone());
@@ -511,6 +527,7 @@ impl SessionStore {
                     "project": s.project,
                     "model": s.model,
                     "state": s.state,
+                    "managed_worktree": s.managed_worktree,
                     "detached": self.project_context(&s.id).detached,
                 })
             })
@@ -535,6 +552,27 @@ impl SessionStore {
             }
         }
         false
+    }
+
+    pub fn session(&self, id: &str) -> Option<SessionMeta> {
+        self.sessions.iter().find(|s| s.id == id).cloned()
+    }
+
+    pub fn set_managed_worktree(
+        &mut self,
+        id: &str,
+        workspace: &str,
+        base: &str,
+        branch: &str,
+    ) -> Option<SessionMeta> {
+        let session = self.sessions.iter_mut().find(|s| s.id == id)?;
+        session.workspace = workspace.to_string();
+        session.managed_worktree = true;
+        session.worktree_base = base.to_string();
+        session.worktree_branch = branch.to_string();
+        let result = session.clone();
+        self.save_index();
+        Some(result)
     }
 
     /// Non-summarising fallback: keep system + the most recent messages. Only a
@@ -587,11 +625,18 @@ impl SessionStore {
                 name.trim().to_string()
             },
             created: now_ms(),
-            workspace: src.workspace,
+            workspace: if src.managed_worktree {
+                src.worktree_base.clone()
+            } else {
+                src.workspace
+            },
             project: src.project,
             model: src.model,
             provider: src.provider,
             state: src.state,
+            managed_worktree: false,
+            worktree_base: String::new(),
+            worktree_branch: String::new(),
         };
         self.set_history(&meta.id, history);
         self.sessions.push(meta.clone());
@@ -644,6 +689,9 @@ mod tests {
             model: String::new(),
             provider: String::new(),
             state: String::new(),
+            managed_worktree: false,
+            worktree_base: String::new(),
+            worktree_branch: String::new(),
         }
     }
 

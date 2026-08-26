@@ -61,7 +61,7 @@ across concurrently running sessions behind a mutex, and lookups clone the
 `Arc<dyn Tool>` out before the tool runs, so a slow tool never blocks another
 session.
 
-Built-ins: `shell`, `read_file`, `write_file`, `list_dir`, `skills`. See
+Built-ins: `powershell`, `read_file`, `write_file`, `list_dir`, `skills`. See
 [EXTENDING.md](EXTENDING.md) for the trait and a worked example.
 
 ## Plugins
@@ -157,7 +157,7 @@ exception, since their modules need the WebView. See
   its source; unticking it is one click and is remembered.
 - **Skills are instructions the model may act on.** They are prompt content, not
   sandboxed code, and deserve the same review as any prompt you would paste in.
-- **Risky tools are gated.** `shell` and `write_file` require explicit approval
+- **Risky tools are gated.** `powershell` and `write_file` require explicit approval
   unless YOLO mode is on, and a plugin guard can refuse a call before the prompt
   is even shown.
 - **MCP servers are separate processes** with their own stdio, their own `env`,

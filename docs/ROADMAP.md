@@ -12,7 +12,7 @@ easier to follow or safer to trust don't earn their bytes.
 
 **Legibility — you can see what it's doing**
 
-- Live activity strip: current phase (`thinking…`, `running shell`), step
+- Live activity strip: current phase (`thinking…`, `running powershell`), step
   counter, and elapsed timer, pinned above the composer so tool cards never push
   it off-screen.
 - Streaming tokens and reasoning, with collapsible thinking panels.
@@ -23,7 +23,7 @@ easier to follow or safer to trust don't earn their bytes.
 
 **Control — you can steer it**
 
-- Approval gates: `shell` and `write_file` pause the run for an inline
+- Approval gates: `powershell` and `write_file` pause the run for an inline
   Approve/Deny, unless YOLO mode is on.
 - Stop at any point, mid-stream, without losing what was already produced.
 - Revert: restore the workspace to its pre-run state from the summary card.
@@ -56,9 +56,9 @@ easier to follow or safer to trust don't earn their bytes.
 
 ## Planned
 
-**Streaming tool output.** Long `shell` runs currently show a spinner until they
+**Streaming tool output.** Long `powershell` runs currently show a spinner until they
 finish. The `Emitter::tool_delta` hook exists but nothing calls it; wiring it up
-needs the shell tool to read stdout/stderr incrementally.
+needs the PowerShell tool to read stdout/stderr incrementally.
 
 **Plan preview.** Render the intended sequence of tool calls as an expandable
 card with per-step status, so the trajectory is visible before it executes

@@ -203,13 +203,37 @@ fn save_config(state: tauri::State<AppState>, config: Config) -> Result<(), Stri
             config.api_key = cur.api_key;
         }
         if config.model.trim().is_empty() {
-            config.model = cur.model;
-            config.provider_id = cur.provider_id;
+            config.model = cur.model.clone();
+            config.provider_id = cur.provider_id.clone();
         }
         // Which plugins are off is owned by `set_plugin_enabled`, not by this
         // form. Taking it from the payload would clear the list every time
         // Settings was saved, quietly re-enabling a plugin the user rejected.
         config.disabled_plugins = cur.disabled_plugins;
+        // Persist provider secrets before replacing the live config. Deleting a
+        // provider removes its credential too, so the OS vault cannot collect
+        // orphaned keys forever.
+        let env_key = std::env::var("E_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        for provider in &config.providers {
+            // `get_config` includes the process-local override so requests and
+            // model refreshes use it. A Settings round trip must not turn that
+            // temporary value into a permanent credential.
+            let is_env_override = provider.id == cur.provider_id
+                && env_key.as_deref() == Some(provider.api_key.as_str());
+            if !is_env_override {
+                engine::credentials::save(&provider.id, &provider.api_key)?;
+            }
+        }
+        for provider in cur
+            .providers
+            .iter()
+            .filter(|old| !config.providers.iter().any(|new| new.id == old.id))
+        {
+            engine::credentials::delete(&provider.id)?;
+        }
     }
     config.normalize();
     if let Ok(mut c) = state.config.lock() {
@@ -530,7 +554,172 @@ fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: O
         st.project_switch(p.trim());
     }
     let meta = st.create(&name.unwrap_or_default(), &workspace.unwrap_or_default(), &model, &provider);
+    let use_worktree = state.config().task_worktrees;
+    drop(st);
+    let meta = provision_session_worktree(&state, meta, use_worktree)?;
     serde_json::to_value(&meta).map_err(|e| e.to_string())
+}
+
+struct TaskWorktree {
+    workspace: String,
+    base: String,
+    branch: String,
+}
+
+fn worktrees_root() -> std::path::PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".e").join("worktrees")
+}
+
+/// Create a worktree only when the selected project folder belongs to a Git
+/// repository. Non-Git projects continue to use their own folder directly.
+fn create_task_worktree(base: &str, session_id: &str) -> Result<Option<TaskWorktree>, String> {
+    create_task_worktree_in(base, session_id, &worktrees_root())
+}
+
+fn create_task_worktree_in(
+    base: &str,
+    session_id: &str,
+    root: &std::path::Path,
+) -> Result<Option<TaskWorktree>, String> {
+    let base_path = std::path::Path::new(base);
+    if !base_path.is_dir() || engine::sessions::is_scratch(base) {
+        return Ok(None);
+    }
+    let repo = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(base_path)
+        .output()
+        .map_err(|e| format!("could not start git while creating the task worktree: {e}"))?;
+    if !repo.status.success() {
+        return Ok(None);
+    }
+    let repo = String::from_utf8_lossy(&repo.stdout).trim().to_string();
+    if repo.is_empty() {
+        return Ok(None);
+    }
+
+    std::fs::create_dir_all(root)
+        .map_err(|e| format!("could not create the worktree folder '{}': {e}", root.display()))?;
+    let path = root.join(session_id);
+    if path.exists() {
+        return Err(format!("task worktree already exists: {}", path.display()));
+    }
+    let branch = format!("e/{session_id}");
+    let out = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&path)
+        .arg("HEAD")
+        .current_dir(&repo)
+        .output()
+        .map_err(|e| format!("could not start git while creating the task worktree: {e}"))?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let _ = std::fs::remove_dir_all(&path);
+        return Err(format!(
+            "could not create a Git worktree for this task{}",
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ));
+    }
+    Ok(Some(TaskWorktree {
+        workspace: path.to_string_lossy().to_string(),
+        base: repo,
+        branch,
+    }))
+}
+
+fn provision_session_worktree(
+    state: &tauri::State<AppState>,
+    meta: engine::sessions::SessionMeta,
+    enabled: bool,
+) -> Result<engine::sessions::SessionMeta, String> {
+    if !enabled {
+        return Ok(meta);
+    }
+    match create_task_worktree(&meta.workspace, &meta.id) {
+        Ok(Some(worktree)) => {
+            let mut managed = meta.clone();
+            managed.workspace = worktree.workspace.clone();
+            managed.managed_worktree = true;
+            managed.worktree_base = worktree.base.clone();
+            managed.worktree_branch = worktree.branch.clone();
+            let saved = state.store.lock().map_err(|_| "lock".to_string()).and_then(|mut store| {
+                store.set_managed_worktree(
+                    &meta.id,
+                    &worktree.workspace,
+                    &worktree.base,
+                    &worktree.branch,
+                )
+                .ok_or_else(|| "task disappeared while its worktree was being created".to_string())
+            });
+            if saved.is_err() {
+                let _ = remove_task_worktree(&managed);
+            }
+            saved
+        }
+        Ok(None) => Ok(meta),
+        Err(e) => {
+            if let Ok(mut store) = state.store.lock() {
+                store.remove(&meta.id);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn remove_task_worktree(meta: &engine::sessions::SessionMeta) -> Result<(), String> {
+    remove_task_worktree_in(meta, &worktrees_root())
+}
+
+fn remove_task_worktree_in(
+    meta: &engine::sessions::SessionMeta,
+    root: &std::path::Path,
+) -> Result<(), String> {
+    if !meta.managed_worktree {
+        return Ok(());
+    }
+    let path = std::path::PathBuf::from(&meta.workspace);
+    let expected = root.join(&meta.id);
+    if path != expected {
+        return Err(format!(
+            "refusing to delete a worktree whose path does not match its task id (expected '{}', got '{}')",
+            expected.display(),
+            path.display()
+        ));
+    }
+    let base = std::path::Path::new(&meta.worktree_base);
+    if path.exists() {
+        if !base.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("could not delete task worktree '{}': {e}", path.display()))?;
+        } else {
+            let out = std::process::Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&path)
+                .current_dir(base)
+                .output()
+                .map_err(|e| format!("could not start git while deleting the task worktree: {e}"))?;
+            if !out.status.success() {
+                let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(format!(
+                    "could not delete task worktree '{}'{}",
+                    path.display(),
+                    if detail.is_empty() { String::new() } else { format!(": {detail}") }
+                ));
+            }
+        }
+    } else if base.is_dir() {
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(base)
+            .output();
+    }
+    if base.is_dir() && !meta.worktree_branch.is_empty() {
+        let _ = std::process::Command::new("git")
+            .args(["branch", "-D", &meta.worktree_branch])
+            .current_dir(base)
+            .output();
+    }
+    Ok(())
 }
 
 /// Drop the snapshot stashes `workspace_snapshot` left in the user's own
@@ -577,15 +766,18 @@ fn delete_session(state: tauri::State<AppState>, id: String) -> Result<(), Strin
     // Stop the run first: otherwise it keeps streaming into a chat that is gone
     // and re-creates its history file on the next save.
     state.cancel(&id);
-    // Read the folder before the chat goes, and let the lock go before shelling
+    engine::pty::kill_session(&id);
+    // Read metadata before the chat goes, and let the lock go before shelling
     // out to git so a slow repo cannot block every other chat.
-    let ws = {
-        let mut st = state.store.lock().map_err(|_| "lock")?;
-        let ws = st.resolved_workspace(&id);
-        st.remove(&id);
-        ws
-    };
-    drop_snapshot_stashes(&ws, &id);
+    let meta = state
+        .store
+        .lock()
+        .map_err(|_| "lock")?
+        .session(&id)
+        .ok_or_else(|| "session not found".to_string())?;
+    drop_snapshot_stashes(&meta.workspace, &id);
+    remove_task_worktree(&meta)?;
+    state.store.lock().map_err(|_| "lock")?.remove(&id);
     Ok(())
 }
 
@@ -593,6 +785,9 @@ fn delete_session(state: tauri::State<AppState>, id: String) -> Result<(), Strin
 fn fork_session(state: tauri::State<AppState>, id: String, name: Option<String>) -> Result<serde_json::Value, String> {
     let mut st = state.store.lock().map_err(|_| "lock")?;
     let meta = st.fork(&id, &name.unwrap_or_default()).ok_or("session not found")?;
+    let use_worktree = state.config().task_worktrees;
+    drop(st);
+    let meta = provision_session_worktree(&state, meta, use_worktree)?;
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }
 
@@ -1252,5 +1447,64 @@ mod stash_tests {
     fn a_missing_folder_is_not_an_error() {
         drop_snapshot_stashes("C:/definitely/not/here", "s1");
         drop_snapshot_stashes("", "s1");
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::{create_task_worktree_in, remove_task_worktree_in};
+    use crate::engine::sessions::SessionMeta;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().expect("git");
+        assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn managed_worktree_is_created_and_removed_with_its_branch() {
+        let temp = std::env::temp_dir().join(format!(
+            "e-worktree-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = temp.join("repo");
+        let worktrees = temp.join("worktrees");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        git(&repo, &["config", "user.email", "e-tests@example.invalid"]);
+        git(&repo, &["config", "user.name", "e tests"]);
+        std::fs::write(repo.join("README.md"), "test").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let task = create_task_worktree_in(repo.to_str().unwrap(), "s-test", &worktrees)
+            .unwrap()
+            .expect("Git project");
+        assert!(Path::new(&task.workspace).is_dir());
+        assert!(git(&repo, &["branch", "--list", "e/s-test"]).contains("e/s-test"));
+
+        let meta = SessionMeta {
+            id: "s-test".into(),
+            name: "test".into(),
+            created: 0,
+            workspace: task.workspace.clone(),
+            project: "p1".into(),
+            model: String::new(),
+            provider: String::new(),
+            state: String::new(),
+            managed_worktree: true,
+            worktree_base: task.base,
+            worktree_branch: task.branch,
+        };
+        remove_task_worktree_in(&meta, &worktrees).unwrap();
+        assert!(!Path::new(&task.workspace).exists());
+        assert!(git(&repo, &["branch", "--list", "e/s-test"]).is_empty());
+        let _ = std::fs::remove_dir_all(temp);
     }
 }

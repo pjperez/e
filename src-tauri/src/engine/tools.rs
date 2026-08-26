@@ -80,7 +80,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn new() -> Self {
         let r = ToolRegistry { tools: Mutex::new(HashMap::new()), plugin_tools: Mutex::new(Vec::new()) };
-        r.register(ShellTool);
+        r.register(PowerShellTool);
         r.register(ReadFileTool);
         r.register(WriteFileTool);
         r.register(ListDirTool);
@@ -101,7 +101,10 @@ impl ToolRegistry {
             let raw = d.name.clone();
             d.name = Self::sanitize_tool_name(&d.name);
             let owner = if d.plugin.is_empty() { "a plugin".to_string() } else { format!("'{}'", d.plugin) };
-            if self.get(&d.name).is_some() {
+            // `shell` stays reserved even though it is no longer a built-in:
+            // otherwise a plugin could quietly put a Bash-capable generic shell
+            // back into the agent's advertised tool set.
+            if self.get(&d.name).is_some() || d.name == "shell" {
                 refused.push(format!("{owner}: tool '{}' is already a built-in tool", d.name));
                 continue;
             }
@@ -238,19 +241,19 @@ impl Default for ToolRegistry {
 // Built-in tools
 // ---------------------------------------------------------------------------
 
-pub struct ShellTool;
-impl Tool for ShellTool {
+pub struct PowerShellTool;
+impl Tool for PowerShellTool {
     fn name(&self) -> &str {
-        "shell"
+        "powershell"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the session workspace and return stdout, stderr and exit code."
+        "Run a PowerShell command in the session workspace and return stdout, stderr and exit code. Bash, cmd.exe, and POSIX shell syntax are not supported."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The shell command to execute." }
+                "command": { "type": "string", "description": "The PowerShell command to execute." }
             },
             "required": ["command"]
         })
@@ -269,15 +272,9 @@ impl Tool for ShellTool {
         let (tx, rx) = mpsc::channel();
         let cwd = ctx.dir()?;
         std::thread::spawn(move || {
-            let mut c = if cfg!(windows) {
-                let mut c = Command::new("cmd");
-                c.args(["/C", &cmd]);
-                c
-            } else {
-                let mut c = Command::new("sh");
-                c.arg("-c").arg(&cmd);
-                c
-            };
+            let executable = if cfg!(windows) { "powershell.exe" } else { "pwsh" };
+            let mut c = Command::new(executable);
+            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &cmd]);
             c.current_dir(&cwd);
             let _ = tx.send(c.output());
         });
@@ -542,11 +539,17 @@ mod tests {
     #[test]
     fn a_plugin_tool_cannot_shadow_a_built_in() {
         let reg = ToolRegistry::new();
-        let refused = reg.set_plugin_tools(vec![plugin_tool("sneaky", "shell"), plugin_tool("ok", "say_hi")]);
+        let refused = reg.set_plugin_tools(vec![
+            plugin_tool("sneaky", "powershell"),
+            plugin_tool("bash-backdoor", "shell"),
+            plugin_tool("ok", "say_hi"),
+        ]);
 
-        assert_eq!(refused.len(), 1, "{refused:?}");
-        assert!(refused[0].contains("shell"), "{refused:?}");
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(refused.iter().any(|r| r.contains("powershell")), "{refused:?}");
+        assert!(refused.iter().any(|r| r.contains("shell")), "{refused:?}");
         assert!(!reg.has_plugin_tool("shell"));
+        assert!(!reg.has_plugin_tool("powershell"));
         assert!(reg.has_plugin_tool("say_hi"));
 
         let names: Vec<String> = reg
@@ -554,8 +557,8 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
             .collect();
-        let shells = names.iter().filter(|n| *n == "shell").count();
-        assert_eq!(shells, 1, "duplicate tool name in schema: {names:?}");
+        assert!(!names.iter().any(|n| n == "shell"), "generic shell leaked into schema: {names:?}");
+        assert_eq!(names.iter().filter(|n| *n == "powershell").count(), 1, "duplicate tool name: {names:?}");
     }
 
     #[test]
@@ -590,6 +593,6 @@ mod tests {
         assert!(reg.names().iter().any(|n| n.starts_with("mcp_")));
         reg.unregister_prefix("mcp_");
         assert!(!reg.names().iter().any(|n| n.starts_with("mcp_")));
-        assert!(reg.get("shell").is_some(), "built-ins must survive");
+        assert!(reg.get("powershell").is_some(), "built-ins must survive");
     }
 }

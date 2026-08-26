@@ -21,7 +21,7 @@ frontend. No Electron, no framework — the whole renderer is ~20 KB.
 |                                                |
 |   ▸ e                                          |
 |   Reading the repo…                            |
-|   [list_dir]  [read_file]  [shell]             |
+|   [list_dir]  [read_file]  [powershell]        |
 |   ┌──────────────────────────────────────┐    |
 |   │ Ask e to do something…          (➤)   │    |
 |   └──────────────────────────────────────┘    |
@@ -30,7 +30,7 @@ frontend. No Electron, no framework — the whole renderer is ~20 KB.
 
 ## What it does
 
-- **A real harness, not a wrapper.** The model calls tools — shell, read/write
+- **A real harness, not a wrapper.** The model calls tools — PowerShell, read/write
   files, list dir — and the results feed back until the task is done, bounded to
   25 steps and cancellable with **Esc**.
 - **Any OpenAI-compatible provider.** OpenAI, Ollama, LM Studio, vLLM, Together,
@@ -38,6 +38,8 @@ frontend. No Electron, no framework — the whole renderer is ~20 KB.
 - **Chats and projects.** Conversations persist, fork, and carry their own model,
   workspace and token budget. History is summarised automatically when a chat
   approaches its model's context window.
+- **Isolated tasks.** Git projects use an app-managed worktree per new task by
+  default; deleting the task removes that worktree from disk.
 - **Streaming everything.** Tokens, reasoning, tool cards, and live token and
   cost counters as the run happens.
 - **Extensible.** Add a tool by implementing one trait — see
@@ -76,13 +78,13 @@ Environment variables override the active provider for a launch: `E_BASE_URL`,
 
 | tool         | purpose                                        |
 |--------------|------------------------------------------------|
-| `shell`      | run a command in the workspace (120 s timeout)  |
+| `powershell` | run PowerShell in the workspace (120 s timeout) |
 | `read_file`  | read a text file (truncated if huge)            |
 | `write_file` | write a file, creating parents                  |
 | `list_dir`   | list a directory                                |
 | `skills`     | load a `SKILL.md` on demand                     |
 
-The **workspace** — where `shell` runs and relative paths resolve — belongs to
+The **workspace** — where `powershell` runs and relative paths resolve — belongs to
 the chat's project and is set in the sidebar (✎).
 
 ## Add a tool
@@ -148,7 +150,7 @@ Two things worth knowing:
 - `ctx.dir()?` resolves the chat's workspace and returns a readable error if it
   is unset or missing, so a tool never runs somewhere unexpected.
 - `run()` is synchronous and runs on a worker thread. For anything long-running,
-  apply your own timeout (the `shell` tool uses `mpsc::recv_timeout`).
+  apply your own timeout (the `powershell` tool uses `mpsc::recv_timeout`).
 
 ## Extensions
 
@@ -180,7 +182,7 @@ A plugin declares what it may touch — `tools`, `commands`, `events`, `ui`,
 `network`, `session-read` — and gets exactly that; anything it did not declare
 is refused out loud. A plugin listening for `tool_call` can also refuse a call
 before it runs, which is how a guard stops `git push --force` reaching the
-shell.
+PowerShell tool.
 
 **Settings (⚙) → Extensions**, or `/extensions`, lists everything found: scope,
 capabilities, the tools and commands each plugin registered, MCP server state,
@@ -254,7 +256,6 @@ only if you want to.
       "id": "openai",
       "name": "OpenAI",
       "base_url": "https://api.openai.com/v1",
-      "api_key": "",              // or set E_API_KEY
       "enabled": true,            // off hides its models but keeps the key
       "context_window": null,     // provider-wide fallback; null = global
       "models": ["gpt-4.1-mini", "gpt-4.1"],
@@ -273,18 +274,20 @@ only if you want to.
       "id": "ollama",
       "name": "Ollama",
       "base_url": "http://localhost:11434/v1",
-      "api_key": "",
       "enabled": true,
       "models": ["qwen3-coder:30b"],
       "disabled_models": []
     }
   ],
+  "task_worktrees": true,               // isolate each new Git task by default
   "disabled_plugins": ["noisy-plugin"]  // unticked in Settings → Extensions
 }
 ```
 
-Top-level `base_url`, `api_key` and `models` are derived — the connection `e`
-uses is always the one belonging to the provider serving the selected model.
+Top-level `base_url` and `models` are derived — the connection `e` uses is always
+the one belonging to the provider serving the selected model. API keys never go
+in this file: on Windows they are stored in Windows Credential Manager. Existing
+plaintext keys are migrated and removed from `config.json` on startup.
 
 **Context window** resolves per model, then the provider's fallback, then the
 global default; it is what compaction is budgeted against. **Reasoning level**

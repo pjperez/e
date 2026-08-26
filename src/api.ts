@@ -63,8 +63,10 @@ export type Config = {
   temperature: number;
   system: string;
   workspace: string;
-  /** Auto-approve risky tools (shell, write_file) instead of prompting. */
+  /** Auto-approve risky tools (powershell, write_file) instead of prompting. */
   yolo: boolean;
+  /** Create an app-managed Git worktree for each new task. */
+  task_worktrees: boolean;
   models: string[];
   /** Usable context window in tokens for the active model. */
   context_window: number;
@@ -113,7 +115,7 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 export async function getConfig(): Promise<Config> {
-  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, models: [], context_window: 1_000_000, provider_id: "", providers: [] };
+  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, task_worktrees: true, models: [], context_window: 1_000_000, provider_id: "", providers: [] };
   return invoke<Config>("get_config");
 }
 
@@ -278,6 +280,8 @@ export type SessionMetaItem = {
   /// was deleted, or it was pointed elsewhere. Computed by the backend so the
   /// sidebar and the agent's own context can never disagree.
   detached?: boolean;
+  /** True when e owns this task's Git worktree and will remove it on delete. */
+  managed_worktree?: boolean;
 };
 
 export async function listSessions(): Promise<{ sessions: SessionMetaItem[]; current: string; running: string[] }> {

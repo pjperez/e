@@ -281,6 +281,48 @@ pub fn kill(sid: &str, id: &str) -> Result<(), String> {
     }
 }
 
+/// Stop and forget every terminal owned by one chat before its managed
+/// worktree is removed. On Windows, even an idle PowerShell process keeps its
+/// working directory open and makes `git worktree remove` fail.
+pub fn kill_session(sid: &str) {
+    let ids = {
+        let mut map = match PTYS.lock() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, pty)| pty.sid == sid)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            if let Some(pty) = map.get_mut(id) {
+                let _ = pty.killer.kill();
+            }
+        }
+        ids
+    };
+    // Child termination and release of its current-directory handle are
+    // asynchronous on Windows. The waiter removes each registry entry only
+    // after `child.wait()` completes, which gives deletion a reliable barrier.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let alive = PTYS
+            .lock()
+            .map(|map| ids.iter().any(|id| map.contains_key(id)))
+            .unwrap_or(false);
+        if !alive {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if let Ok(mut map) = PTYS.lock() {
+        for id in ids {
+            map.remove(&id);
+        }
+    }
+}
+
 fn remove(id: &str) {
     if let Ok(mut map) = PTYS.lock() {
         map.remove(id);

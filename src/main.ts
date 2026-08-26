@@ -42,7 +42,7 @@ const actSteer = document.getElementById("act-steer") as HTMLButtonElement;
 
 function hostOf(u: string): string { try { return new URL(u).host; } catch { return u; } }
 
-/// YOLO disables the approval prompt for shell/write_file, so it gets a
+/// YOLO disables the approval prompt for powershell/write_file, so it gets a
 /// permanent badge rather than living only in the settings modal.
 function setYoloIndicator(on: boolean): void {
   sbYolo.hidden = !on;
@@ -746,7 +746,7 @@ async function expandAttachments(text: string): Promise<string> {
   return ctx;
 }
 
-const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/extensions\` — plugins, skills and MCP servers\n- \`/reload\` — re-read extensions (no restart)\n- \`/yolo [on|off]\` — auto-approve risky tools (shell, write_file)\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
+const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/extensions\` — plugins, skills and MCP servers\n- \`/reload\` — re-read extensions (no restart)\n- \`/yolo [on|off]\` — auto-approve risky tools (powershell, write_file)\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
 
 /// Single source of truth for YOLO: the settings checkbox reads the same saved
 /// config, so the two controls cannot drift apart.
@@ -757,7 +757,7 @@ async function toggleYolo(arg: string): Promise<void> {
     cfg.yolo = next;
     await api.saveConfig(cfg);
     setYoloIndicator(next);
-    notify(next ? "YOLO mode ON — shell & write_file run without asking" : "YOLO mode OFF — risky tools ask first", next ? "error" : "info");
+    notify(next ? "YOLO mode ON — powershell & write_file run without asking" : "YOLO mode OFF — risky tools ask first", next ? "error" : "info");
   } catch (e) {
     notify(String(e), "error");
   }
@@ -1715,7 +1715,10 @@ function renderSessions(): void {
               label: "Close",
               danger: true,
               run: () => void (async () => {
-                if (!(await confirmModal("Close chat \"" + s.name + "\"? Its history is deleted."))) return;
+                const cleanup = s.managed_worktree
+                  ? " Its history and Git worktree, including uncommitted changes, are deleted."
+                  : " Its history is deleted.";
+                if (!(await confirmModal("Close chat \"" + s.name + "\"?" + cleanup))) return;
                 const wasCurrent = s.id === currentSession;
                 await api.deleteSession(s.id);
                 chatUI.delete(s.id);
@@ -2195,7 +2198,8 @@ overlay.innerHTML = `
       <summary>Behavior</summary>
             <label class="lbl">Temperature</label><input id="cfg-temp" type="number" step="0.1" min="0" max="2"/>
       <label class="lbl">System prompt</label><textarea id="cfg-sys" rows="3"></textarea>
-      <label class="lbl cfg-check"><input id="cfg-yolo" type="checkbox"/> YOLO mode — run shell &amp; write_file without asking</label>
+      <label class="lbl cfg-check"><input id="cfg-yolo" type="checkbox"/> YOLO mode — run powershell &amp; write_file without asking</label>
+      <label class="lbl cfg-check"><input id="cfg-worktrees" type="checkbox"/> Use a separate Git worktree for each new task</label>
     </details>
     <details class="field bhr" id="cfg-ext">
       <summary>Extensions</summary>
@@ -2203,7 +2207,7 @@ overlay.innerHTML = `
       <div id="ext-body"></div>
       <div class="prov-row"><button id="cfg-extreload" type="button">Reload extensions</button></div>
     </details>
-    <p class="note">Stored in <code>~/.e/config.json</code>. &ldquo;Refresh&rdquo; fetches <code>&lt;base&gt;/models</code>.</p>
+    <p class="note">Settings are stored in <code>~/.e/config.json</code>; API keys are stored in Windows Credential Manager. &ldquo;Refresh&rdquo; fetches <code>&lt;base&gt;/models</code>.</p>
     <div class="modal-actions">
       <button id="cfg-cancel">Cancel</button>
       <button id="cfg-save" class="primary">Save</button>
@@ -2539,6 +2543,7 @@ async function openSettings(extensions = false): Promise<void> {
   el<HTMLInputElement>("#cfg-temp").value = String(cfg.temperature);
   el<HTMLTextAreaElement>("#cfg-sys").value = cfg.system;
   el<HTMLInputElement>("#cfg-yolo").checked = !!cfg.yolo;
+  el<HTMLInputElement>("#cfg-worktrees").checked = cfg.task_worktrees !== false;
   renderProviderList();
   const ext = el<HTMLDetailsElement>("#cfg-ext");
   ext.open = extensions;
@@ -2713,6 +2718,7 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
   const temperature = parseFloat(el<HTMLInputElement>("#cfg-temp").value) || 1;
   const system = el<HTMLTextAreaElement>("#cfg-sys").value;
   const yolo = el<HTMLInputElement>("#cfg-yolo").checked;
+  const taskWorktrees = el<HTMLInputElement>("#cfg-worktrees").checked;
   const cfg: Config = {
     // Settings decides what is *available*; the picker decides what is in use.
     // Leaving the connection and the selection empty tells the backend to keep
@@ -2725,6 +2731,7 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
     system,
     temperature,
     yolo,
+    task_worktrees: taskWorktrees,
     models: [],
     context_window: defaultCtxWindow,
     providers: draft,

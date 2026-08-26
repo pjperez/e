@@ -24,6 +24,7 @@ dirs = "6"
 # Real pseudo-terminals for the right pane's terminal tabs: ConPTY on Windows,
 # openpty elsewhere, behind one API.
 portable-pty = "0.9"
+keyring = { version = "3", features = ["windows-native"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

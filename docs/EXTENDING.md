@@ -47,11 +47,11 @@ pub trait Tool: Send + Sync {
   rather than silently falling back to the process's current directory.
 
 `run()` is synchronous, on a worker thread. Bound anything long-running
-yourself — `ShellTool` shows the `mpsc::recv_timeout` pattern.
+yourself — `PowerShellTool` shows the `mpsc::recv_timeout` pattern.
 
 ### Approval
 
-`shell` and `write_file` prompt the user before running unless YOLO mode is on.
+`powershell` and `write_file` prompt the user before running unless YOLO mode is on.
 The list is `RISKY` in [`engine/agent.rs`](../src-tauri/src/engine/agent.rs) —
 add your tool's name there to require the same confirmation. The prompt
 mechanism itself is in
@@ -74,7 +74,7 @@ Environment variables override the active provider for one launch:
 | `E_BASE_URL`   | e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1` |
 | `E_API_KEY`    | bearer key (optional for local servers)                      |
 | `E_MODEL`      | model id                                                     |
-| `E_WORKSPACE`  | working dir for `shell` and relative paths                   |
+| `E_WORKSPACE`  | working dir for `powershell` and relative paths              |
 
 For a different *protocol*, implement a client returning
 [`Completion`](../src-tauri/src/engine/mod.rs) and swap it into
@@ -383,4 +383,3 @@ have the same tools the GUI does.
 | terminal wraps its own prompt | the view never called `pty.resize`, so the shell still believes the old size |
 | pane tabs vanished | `/reload` closes them: a view outliving its module would keep running the code you just edited away |
 | changed a file, nothing happened | `/reload` (plugins, MCP). Skills need no reload |
-
