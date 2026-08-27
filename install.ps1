@@ -119,6 +119,7 @@ if ($release.prerelease -and -not $AllowPrerelease) {
 }
 
 $stagingDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "e-install-$([Guid]::NewGuid())"
+$installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\e'
 $stateDirectory = Join-Path $env:LOCALAPPDATA 'e-harness'
 $statePath = Join-Path $stateDirectory 'install-state.json'
 
@@ -225,12 +226,20 @@ try {
         throw "The installer has an invalid Authenticode status: $($authenticode.Status)."
     }
 
-    Write-Host "Verified e $releaseVersion. Starting the current-user installer..."
+    Write-Host "Verified e $releaseVersion. Installing to '$installDirectory'..."
     $process = if ($Quiet) {
-        Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait -PassThru
+        Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList @('/S', "/D=$installDirectory") `
+            -Wait `
+            -PassThru
     }
     else {
-        Start-Process -FilePath $installerPath -Wait -PassThru
+        Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList "/D=$installDirectory" `
+            -Wait `
+            -PassThru
     }
     if ($process.ExitCode -ne 0) {
         throw "The installer exited with code $($process.ExitCode)."

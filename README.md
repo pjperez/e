@@ -58,7 +58,8 @@ irm https://eharness.dev/install.ps1 -OutFile $env:TEMP\e.ps1; pwsh -NoProfile -
 
 The bootstrapper selects the x64 or Arm64 installer, verifies its SHA-256
 digest against a separately signed release manifest, and then starts the
-installer. Pass `-Quiet` for an unattended current-user install.
+installer in `%LOCALAPPDATA%\Programs\e`. Pass `-Quiet` for an unattended
+current-user install.
 
 ## Build from source
 
