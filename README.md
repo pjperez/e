@@ -49,7 +49,26 @@ frontend. No Electron, no framework — the whole renderer is ~20 KB.
 
 ## Install
 
-Prerequisites: Node.js ≥ 18, Rust (stable), and your platform's
+Windows releases install per-user and do not need Node.js, Rust, or an
+administrator shell. Download the bootstrapper first so you can inspect it,
+then run it with PowerShell 7:
+
+```powershell
+irm https://eharness.dev/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+pwsh -NoProfile -File .\install.ps1
+```
+
+The bootstrapper selects the x64 or Arm64 installer, verifies its SHA-256
+digest against a separately signed release manifest, and then starts the
+installer. Pass `-Quiet` for an unattended current-user install.
+
+Do not pipe the script directly into PowerShell. Saving it first makes the
+code inspectable and preserves a file that security tools can scan.
+
+## Build from source
+
+Source builds require Node.js ≥ 18, Rust (stable), and your platform's
 [Tauri prerequisites](https://tauri.app/start/prerequisites/) (on Windows:
 WebView2 runtime + MSVC toolchain).
 
