@@ -29,6 +29,11 @@ struct AppState {
     /// shows on the same activity strip. It needs its own cancel flag or Stop
     /// has nothing to set while a compaction is backing off.
     compactions: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// One lock per task guarding the creation of its worktree. A task's
+    /// checkout is started speculatively as soon as it is opened, so its first
+    /// run can arrive while that is still in flight; without a gate the two
+    /// would race into a second `git worktree add` on the same path.
+    worktree_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Set once the frontend has registered its close handler. Until then the
     /// close button must behave normally: preventing close while nothing can
     /// draw the confirmation would leave the app impossible to quit.
@@ -42,6 +47,21 @@ struct AppState {
 impl AppState {
     fn config(&self) -> Config {
         self.config.lock().map(|c| c.clone()).unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// The lock covering one task's worktree creation. A poisoned gate is
+    /// reused deliberately: it only ever guards a git call, and refusing to
+    /// build the worktree because an unrelated thread panicked would leave the
+    /// task unusable.
+    fn worktree_gate(&self, sid: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.worktree_gates.lock().unwrap_or_else(|e| e.into_inner());
+        gates.entry(sid.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    }
+
+    fn forget_worktree_gate(&self, sid: &str) {
+        if let Ok(mut gates) = self.worktree_gates.lock() {
+            gates.remove(sid);
+        }
     }
 
     fn is_running(&self, sid: &str) -> bool {
@@ -542,7 +562,7 @@ fn running_sessions(state: tauri::State<AppState>) -> Vec<String> {
 /// the main thread: a command without `async` runs on the UI thread, where any
 /// wait — a slow disk, a network share, git — freezes the whole window.
 #[tauri::command(async)]
-fn new_session(state: tauri::State<'_, AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>, project: Option<String>) -> Result<serde_json::Value, String> {
+fn new_session(app: tauri::AppHandle, state: tauri::State<'_, AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>, project: Option<String>) -> Result<serde_json::Value, String> {
     // Resolve the provider up front so a chat started on a model from a
     // non-default provider keeps that connection on its first run.
     let model = model.unwrap_or_default();
@@ -559,8 +579,9 @@ fn new_session(state: tauri::State<'_, AppState>, name: Option<String>, workspac
     }
     // The worktree is only *promised* here. Checking out a copy of the project
     // takes seconds on a large repository, and doing it before returning is
-    // what made opening a task look like the app had hung. It is built on the
-    // task's first real use instead.
+    // what made opening a task look like the app had hung. The build starts in
+    // the background instead, so it is usually finished by the time the first
+    // message is sent, and the first run waits for it if it is not.
     let meta = st.create(
         &name.unwrap_or_default(),
         &workspace.unwrap_or_default(),
@@ -568,6 +589,10 @@ fn new_session(state: tauri::State<'_, AppState>, name: Option<String>, workspac
         &provider,
         state.config().task_worktrees,
     );
+    drop(st);
+    if meta.worktree_pending {
+        start_task_worktree(&app, &meta.id);
+    }
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }
 
@@ -640,26 +665,69 @@ fn create_task_worktree_in(
 
 /// Build the managed worktree a task was promised, if it is still owed one.
 ///
-/// Called from background work (a run, or opening a pane), never from the click
-/// that creates the task: `git worktree add` is a full checkout and blocks for
-/// as long as the project is large.
+/// Called from background work (the speculative build started when a task is
+/// opened, a run, or a pane), never from the click that creates the task:
+/// `git worktree add` is a full checkout and blocks for as long as the project
+/// is large. Callers arriving while a build is already in flight wait for it
+/// and then find the work done.
 fn ensure_task_worktree(state: &AppState, id: &str) -> Result<(), String> {
+    if !task_owes_a_worktree(state, id)? {
+        return Ok(());
+    }
+    let gate = state.worktree_gate(id);
+    let _building = gate.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-read under the gate: a speculative build may have finished while we
+    // were queued behind it, and starting a second `git worktree add` on the
+    // same path would fail outright.
+    if !task_owes_a_worktree(state, id)? {
+        return Ok(());
+    }
     let Some(meta) = state.store.lock().map_err(|_| "lock")?.session(id) else {
         return Ok(());
     };
+    provision_session_worktree(state, meta)?;
+    Ok(())
+}
+
+/// Whether this task still needs a worktree built. The setting can have been
+/// turned off since it was created; that answer is recorded so the question is
+/// not asked again on every run.
+fn task_owes_a_worktree(state: &AppState, id: &str) -> Result<bool, String> {
+    let Some(meta) = state.store.lock().map_err(|_| "lock")?.session(id) else {
+        return Ok(false);
+    };
     if !meta.worktree_pending || meta.managed_worktree {
-        return Ok(());
+        return Ok(false);
     }
-    // The setting can have been turned off since the task was created; honour
-    // the current answer and stop asking.
     if !state.config().task_worktrees {
         if let Ok(mut store) = state.store.lock() {
             store.set_worktree_pending(id, false);
         }
-        return Ok(());
+        return Ok(false);
     }
-    provision_session_worktree(state, meta)?;
-    Ok(())
+    Ok(true)
+}
+
+/// Start a task's checkout in the background as soon as it is opened.
+///
+/// Nothing waits on this: the point is that the worktree is usually ready by
+/// the time the user has finished typing their first message, while the click
+/// that opened the task returns immediately either way. A failure is left for
+/// the first run to report, which is the first moment it matters.
+fn start_task_worktree(app: &tauri::AppHandle, id: &str) {
+    let app = app.clone();
+    let id = id.to_string();
+    let _ = std::thread::Builder::new().name(format!("e-worktree-{id}")).spawn(move || {
+        let state = app.state::<AppState>();
+        match ensure_task_worktree(&state, &id) {
+            // The task now runs somewhere else than the sidebar last heard, and
+            // closing it now destroys a worktree, so let the UI catch up.
+            Ok(()) => {
+                let _ = app.emit("e:sessions_changed", serde_json::json!({ "sid": id }));
+            }
+            Err(e) => eprintln!("e: could not prepare a worktree for task {id}: {e}"),
+        }
+    });
 }
 
 fn provision_session_worktree(
@@ -817,6 +885,10 @@ fn delete_session(state: tauri::State<'_, AppState>, id: String) -> Result<(), S
         .session(&id)
         .ok_or_else(|| "session not found".to_string())?;
     state.store.lock().map_err(|_| "lock")?.remove(&id);
+    // A speculative build may still be in flight. It finds the task gone when
+    // it tries to record itself and removes what it just made, so the gate is
+    // no longer of any use to anyone.
+    state.forget_worktree_gate(&id);
     std::thread::Builder::new()
         .name(format!("e-close-{id}"))
         .spawn(move || {
@@ -890,10 +962,14 @@ fn worktree_base_of(path: &std::path::Path) -> Option<String> {
 }
 
 #[tauri::command(async)]
-fn fork_session(state: tauri::State<'_, AppState>, id: String, name: Option<String>) -> Result<serde_json::Value, String> {
+fn fork_session(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String, name: Option<String>) -> Result<serde_json::Value, String> {
     let pending = state.config().task_worktrees;
     let mut st = state.store.lock().map_err(|_| "lock")?;
     let meta = st.fork(&id, &name.unwrap_or_default(), pending).ok_or("session not found")?;
+    drop(st);
+    if meta.worktree_pending {
+        start_task_worktree(&app, &meta.id);
+    }
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }
 
@@ -1021,10 +1097,19 @@ fn context_budget(state: tauri::State<AppState>, sid: Option<String>) -> u64 {
     }
 }
 
-#[tauri::command]
-fn switch_session(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
-    let mut st = state.store.lock().map_err(|_| "lock")?;
-    Ok(st.switch(&id))
+/// Opening an existing task is also a chance to get its checkout out of the
+/// way: one created while worktrees were switched off, or left pending by a
+/// build that failed, is retried here rather than waiting for the next run.
+#[tauri::command(async)]
+fn switch_session(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    let switched = {
+        let mut st = state.store.lock().map_err(|_| "lock")?;
+        st.switch(&id)
+    };
+    if switched && task_owes_a_worktree(&state, &id).unwrap_or(false) {
+        start_task_worktree(&app, &id);
+    }
+    Ok(switched)
 }
 
 #[tauri::command]
@@ -1428,6 +1513,7 @@ pub fn run() {
         store: Mutex::new(engine::sessions::SessionStore::new()),
         runs: Mutex::new(HashMap::new()),
         compactions: Mutex::new(HashMap::new()),
+        worktree_gates: Mutex::new(HashMap::new()),
         ui_ready: AtomicBool::new(false),
         close_pending: AtomicBool::new(false),
     };

@@ -384,6 +384,19 @@ export function onCloseRequested(cb: (running: string[]) => void): Unlisten {
   return () => un();
 }
 
+/// A task's folder changed underneath the sidebar — its worktree finished
+/// building in the background, so it now runs somewhere else and closing it
+/// destroys real work. The list has to be re-read rather than trusted.
+export function onSessionsChanged(cb: () => void): Unlisten {
+  if (!inTauri) return () => undefined;
+  let un: Unlisten = () => undefined;
+  void (async () => {
+    const evt = await import("@tauri-apps/api/event");
+    un = await evt.listen("e:sessions_changed", () => cb());
+  })();
+  return () => un();
+}
+
 export async function confirmClose(): Promise<void> {
   if (!inTauri) return;
   await invoke("confirm_close");

@@ -61,7 +61,7 @@ no framework.
 | **A harness, not a wrapper** | The model calls real tools — PowerShell, read, write, list, skills — and reads their real output until the task is done. Bounded to 25 steps, cancellable with <kbd>Esc</kbd>. |
 | **Your models, your keys** | OpenAI, Ollama, LM Studio, vLLM, Together, OpenRouter or your own gateway. Keep several configured and switch per chat. |
 | **Chats and projects that hold** | Conversations persist and fork, each carrying its own model, workspace and token budget. History summarises itself as a chat approaches the context window. |
-| **Tasks stay isolated** | Git projects get an app-managed worktree per task by default, checked out the first time the task runs rather than when you open it. Delete the task and the worktree goes with it. |
+| **Tasks stay isolated** | Git projects get an app-managed worktree per task by default, prepared in the background as you open it rather than in front of the click. Delete the task and the worktree goes with it. |
 | **Nothing is hidden** | Tokens, reasoning, tool cards and live token and cost counters all stream as the run happens. |
 | **Yours** | Settings live in `~/.e/config.json`. API keys go to Windows Credential Manager, never into the repo. |
 

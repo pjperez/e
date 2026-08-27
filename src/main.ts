@@ -3472,6 +3472,11 @@ function confirmModal(msg: string, title = "Confirm", yesLabel = "Yes", noLabel 
   });
 }
 
+/// A task's worktree finishes building after the task was opened, which moves
+/// the folder it runs in and makes closing it destructive. Re-read the list so
+/// the sidebar — and the confirmation it shows on Close — tell the truth.
+api.onSessionsChanged(() => void refreshSessions());
+
 /// The window's close button is intercepted in Rust so quitting always asks
 /// first — closing mid-run loses the work in flight and used to leave that
 /// chat's history in a state the provider rejects outright.
