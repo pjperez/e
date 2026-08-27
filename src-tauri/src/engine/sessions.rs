@@ -206,6 +206,19 @@ impl SessionStore {
                     .and_then(|a| a.as_array())
                     .map(|a| a.iter().filter_map(|m| serde_json::from_value(m.clone()).ok()).collect())
                     .unwrap_or_default();
+                // Nothing can be running at load: the run table is built fresh
+                // every boot. A persisted "busy" means a previous app session
+                // was killed mid-run and never got to write back an end state,
+                // so it is stale by definition. Left alone it renders as a chat
+                // that is forever working, with a Stop button that cannot do
+                // anything — there is no run to cancel and no in-memory flag to
+                // clear. Settle it here, at the source, rather than leaving
+                // every reader to second-guess the field.
+                for s in &mut self.sessions {
+                    if s.state == "busy" {
+                        s.state = "error".to_string();
+                    }
+                }
                 self.projects = v
                     .get("projects")
                     .and_then(|a| a.as_array())
@@ -821,6 +834,24 @@ mod tests {
         st.migrate();
         assert!(!st.project_context("s1").detached);
         assert!(!st.project_context("s2").detached);
+    }
+
+    /// A chat left mid-run by a crash used to come back "busy" forever: nothing
+    /// was running, so Stop had no flag to set and the chat could never be
+    /// settled by hand either.
+    #[test]
+    fn a_chat_left_busy_by_a_crash_does_not_come_back_running() {
+        let mut st = store(vec![project("p1", "Tasks", "")], vec![session("s1", "p1", "")]);
+        st.set_state("s1", "busy");
+        st.save_index();
+
+        let mut reloaded = store(Vec::new(), Vec::new());
+        reloaded.index_file = st.index_file.clone();
+        reloaded.load();
+
+        let state = &reloaded.sessions.iter().find(|s| s.id == "s1").expect("chat survives").state;
+        assert_ne!(state, "busy", "a run cannot outlive the process that owned it");
+        assert_eq!(state, "error", "the interrupted run should be visible as one");
     }
 
     /// Deleting a project must not disturb the open chat; chats survive it.

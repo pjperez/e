@@ -21,6 +21,50 @@ const BACKOFF_STEPS: [Duration; 4] = [
 /// this via `Retry-After` isn't throttling us for a moment, it's shut for the
 /// hour — waiting it out silently would look like a hang, so we surface it.
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// How long a connected-but-silent provider is given before we call it dead.
+/// `connect_timeout` only covers getting the socket up; once a provider has
+/// accepted the connection nothing else bounds how long it may say nothing,
+/// and a stall there used to hang the run forever.
+const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often a pending network await is interrupted to look at the cancel
+/// flag. Short enough that Stop feels immediate, long enough to be free.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Outcome of awaiting a network future that must stay interruptible.
+enum Guarded<T> {
+    Ready(T),
+    /// The user pressed Stop while we were waiting.
+    Cancelled,
+    /// Nothing arrived for [`STALL_TIMEOUT`].
+    Stalled,
+}
+
+/// Await `fut`, but wake up regularly to honour Stop and to notice a provider
+/// that has gone silent.
+///
+/// A bare `.await` on a network future is uninterruptible: the cancel flag is
+/// only ever read between chunks, so a connection that accepts and then says
+/// nothing pins the run thread indefinitely and makes Stop a no-op. The future
+/// is pinned once and polled in slices, so this neither drops nor restarts the
+/// request — it just refuses to wait blindly.
+async fn guarded<F: std::future::Future>(fut: F, cancelled: &AtomicBool) -> Guarded<F::Output> {
+    tokio::pin!(fut);
+    let mut waited = Duration::ZERO;
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            return Guarded::Cancelled;
+        }
+        match tokio::time::timeout(POLL_INTERVAL, &mut fut).await {
+            Ok(v) => return Guarded::Ready(v),
+            Err(_) => {
+                waited += POLL_INTERVAL;
+                if waited >= STALL_TIMEOUT {
+                    return Guarded::Stalled;
+                }
+            }
+        }
+    }
+}
 
 /// A throttled attempt that is about to be slept off, reported so the UI can
 /// say what is happening and how long the wait is instead of freezing on
@@ -226,7 +270,18 @@ impl ChatProvider {
                 req = req.bearer_auth(&self.api_key);
             }
 
-            let resp = req.json(&body).send().await.map_err(|e| format!("request failed: {e}"))?;
+            let resp = match guarded(req.json(&body).send(), cancelled).await {
+                Guarded::Ready(r) => r.map_err(|e| format!("request failed: {e}"))?,
+                Guarded::Cancelled => {
+                    return Ok(Completion { text: String::new(), tool_calls: Vec::new(), usage: (0, 0), cost: None, reasoning: String::new() })
+                }
+                Guarded::Stalled => {
+                    return Err(format!(
+                        "provider did not respond within {}s",
+                        STALL_TIMEOUT.as_secs()
+                    ))
+                }
+            };
             let status = resp.status();
             if status.is_success() {
                 break resp;
@@ -282,10 +337,19 @@ impl ChatProvider {
         let mut tc_tmp: std::collections::HashMap<usize, (Option<String>, Option<String>, String)> =
             std::collections::HashMap::new();
 
-        while let Some(chunk) = stream.next().await {
-            if cancelled.load(Ordering::SeqCst) {
-                break;
+        while let Some(chunk) = match guarded(stream.next(), cancelled).await {
+            Guarded::Ready(item) => item,
+            // Stop pressed mid-response: keep whatever has already been shown.
+            Guarded::Cancelled => None,
+            // The provider is holding the connection open but has stopped
+            // sending. Surfacing this beats streaming half an answer forever.
+            Guarded::Stalled => {
+                return Err(format!(
+                    "provider stopped responding after {}s",
+                    STALL_TIMEOUT.as_secs()
+                ))
             }
+        } {
             let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
             buf.extend_from_slice(&chunk);
             loop {
