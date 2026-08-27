@@ -282,6 +282,8 @@ export type SessionMetaItem = {
   detached?: boolean;
   /** True when e owns this task's Git worktree and will remove it on delete. */
   managed_worktree?: boolean;
+  /** True when the task is owed a worktree that is built on its first run. */
+  worktree_pending?: boolean;
 };
 
 export async function listSessions(): Promise<{ sessions: SessionMetaItem[]; current: string; running: string[] }> {
