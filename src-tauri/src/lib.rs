@@ -251,8 +251,8 @@ fn list_models(state: tauri::State<AppState>) -> Vec<engine::agent::ModelChoice>
     state.config().model_catalog()
 }
 
-#[tauri::command]
-fn read_attachment(state: tauri::State<AppState>, path: String) -> Result<serde_json::Value, String> {
+#[tauri::command(async)]
+fn read_attachment(state: tauri::State<'_, AppState>, path: String) -> Result<serde_json::Value, String> {
     // Resolve relative to the active chat's own project folder, so `@file`
     // means the same thing as the tools' cwd.
     let ws = state
@@ -311,7 +311,7 @@ fn set_project_workspace(state: tauri::State<AppState>, id: String, workspace: S
 /// A relative path counts as unusable even when it happens to resolve from
 /// here: the tools refuse it (see `ToolContext::dir`), so the sidebar has to
 /// flag it too rather than showing a folder that looks fine.
-#[tauri::command]
+#[tauri::command(async)]
 fn path_is_dir(path: String) -> bool {
     let p = path.trim();
     !p.is_empty() && std::path::Path::new(p).is_absolute() && std::path::Path::new(p).is_dir()
@@ -335,8 +335,8 @@ fn set_session_model(state: tauri::State<AppState>, id: String, model: String, p
 
 /// Plugins visible from this chat's project, with the ones the user switched
 /// off already marked — the frontend never has to re-derive that.
-#[tauri::command]
-fn list_plugins(state: tauri::State<AppState>, workspace: Option<String>) -> Vec<engine::plugins::PluginInfo> {
+#[tauri::command(async)]
+fn list_plugins(state: tauri::State<'_, AppState>, workspace: Option<String>) -> Vec<engine::plugins::PluginInfo> {
     let off = state.config().disabled_plugins;
     plugins::discover(workspace.as_deref())
         .into_iter()
@@ -347,7 +347,7 @@ fn list_plugins(state: tauri::State<AppState>, workspace: Option<String>) -> Vec
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_plugin(name: String, workspace: Option<String>) -> Result<serde_json::Value, String> {
     plugins::get_plugin(&name, workspace.as_deref())
         .map(|(info, src)| serde_json::json!({ "manifest": info, "source": src }))
@@ -402,8 +402,8 @@ fn list_mcp_servers() -> Vec<engine::mcp::McpStatus> {
 
 /// Re-scan every extension surface. MCP servers are restarted here; plugins
 /// and skills are re-read by the frontend, which owns their runtime.
-#[tauri::command]
-fn reload_extensions(state: tauri::State<AppState>, workspace: Option<String>) {
+#[tauri::command(async)]
+fn reload_extensions(state: tauri::State<'_, AppState>, workspace: Option<String>) {
     engine::mcp::load(state.tools.clone(), workspace);
 }
 
@@ -418,8 +418,8 @@ fn project_remove(state: tauri::State<AppState>, id: String) -> Result<bool, Str
     Ok(st.project_remove(&id))
 }
 
-#[tauri::command]
-fn workspace_snapshot(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
+#[tauri::command(async)]
+fn workspace_snapshot(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
     let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&id);
     if ws.is_empty() {
         return Ok(false);
@@ -444,8 +444,8 @@ fn workspace_snapshot(state: tauri::State<AppState>, id: String) -> Result<bool,
     Ok(false)
 }
 
-#[tauri::command]
-fn workspace_revert(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
+#[tauri::command(async)]
+fn workspace_revert(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
     let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&id);
     if ws.is_empty() {
         return Ok(false);
@@ -474,8 +474,8 @@ fn snippet_around(text: &str, pos: usize, len: usize) -> String {
     text[start..end].to_string()
 }
 
-#[tauri::command]
-fn search_sessions(state: tauri::State<AppState>, query: String) -> Result<serde_json::Value, String> {
+#[tauri::command(async)]
+fn search_sessions(state: tauri::State<'_, AppState>, query: String) -> Result<serde_json::Value, String> {
     let st = state.store.lock().map_err(|_| "lock")?;
     let q = query.trim().to_lowercase();
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -509,12 +509,12 @@ fn search_sessions(state: tauri::State<AppState>, query: String) -> Result<serde
     Ok(serde_json::json!({ "results": results }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_skills(workspace: Option<String>) -> Vec<engine::skills::SkillMeta> {
     SkillStore::for_workspace(&workspace.unwrap_or_default()).list()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_skill(name: String, workspace: Option<String>) -> Result<String, String> {
     SkillStore::for_workspace(&workspace.unwrap_or_default())
         .get(&name)
@@ -537,8 +537,12 @@ fn running_sessions(state: tauri::State<AppState>) -> Vec<String> {
     state.runs.lock().map(|r| r.keys().cloned().collect()).unwrap_or_default()
 }
 
-#[tauri::command]
-fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>, project: Option<String>) -> Result<serde_json::Value, String> {
+/// Session commands write the index and history files, and closing one starts
+/// the cleanup of a task's worktree. That is all disk work, so it is kept off
+/// the main thread: a command without `async` runs on the UI thread, where any
+/// wait — a slow disk, a network share, git — freezes the whole window.
+#[tauri::command(async)]
+fn new_session(state: tauri::State<'_, AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>, project: Option<String>) -> Result<serde_json::Value, String> {
     // Resolve the provider up front so a chat started on a model from a
     // non-default provider keeps that connection on its first run.
     let model = model.unwrap_or_default();
@@ -795,8 +799,8 @@ fn drop_snapshot_stashes(ws: &str, id: &str) {
     }
 }
 
-#[tauri::command]
-fn delete_session(state: tauri::State<AppState>, id: String) -> Result<(), String> {
+#[tauri::command(async)]
+fn delete_session(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     // Stop the run first: otherwise it keeps streaming into a chat that is gone
     // and re-creates its history file on the next save.
     state.cancel(&id);
@@ -885,8 +889,8 @@ fn worktree_base_of(path: &std::path::Path) -> Option<String> {
     repo.is_dir().then(|| repo.to_string_lossy().to_string())
 }
 
-#[tauri::command]
-fn fork_session(state: tauri::State<AppState>, id: String, name: Option<String>) -> Result<serde_json::Value, String> {
+#[tauri::command(async)]
+fn fork_session(state: tauri::State<'_, AppState>, id: String, name: Option<String>) -> Result<serde_json::Value, String> {
     let pending = state.config().task_worktrees;
     let mut st = state.store.lock().map_err(|_| "lock")?;
     let meta = st.fork(&id, &name.unwrap_or_default(), pending).ok_or("session not found")?;
