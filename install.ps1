@@ -239,14 +239,19 @@ try {
     }
 
     Write-Host "Verified e $releaseVersion. Starting the installer (Windows will ask for approval)..."
+    # Deliberately not -Wait: that waits for the process *and its descendants*,
+    # so the installer's "Run e" finish option would keep this script blocked
+    # for as long as the app stays open. Wait for the installer alone.
     $process = if ($Quiet) {
-        Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait -PassThru
+        Start-Process -FilePath $installerPath -ArgumentList '/S' -PassThru
     }
     else {
-        Start-Process -FilePath $installerPath -Wait -PassThru
+        Start-Process -FilePath $installerPath -PassThru
     }
+    $process.WaitForExit()
+
     if ($process.ExitCode -ne 0) {
-        throw "The installer exited with code $($process.ExitCode)."
+        throw "The installer exited with code $($process.ExitCode). If you cancelled it, run this script again to retry."
     }
 
     New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
