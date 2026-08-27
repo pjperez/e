@@ -31,6 +31,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Invoke-WebRequest renders a progress bar that can slow a download to a crawl
+# in an interactive console, and it makes the script look wedged.
+$ProgressPreference = 'SilentlyContinue'
 
 $PublicKey = @'
 -----BEGIN PUBLIC KEY-----
@@ -58,12 +61,15 @@ function Invoke-Download {
         [hashtable] $Headers
     )
 
+    # Without an explicit timeout a stalled connection hangs the install
+    # forever, so bound every request and let the retry handle a bad socket.
     Invoke-WebRequest `
         -Uri $Uri `
         -OutFile $Destination `
         -Headers $Headers `
-        -MaximumRetryCount 2 `
-        -RetryIntervalSec 2
+        -TimeoutSec 120 `
+        -MaximumRetryCount 3 `
+        -RetryIntervalSec 3
 }
 
 function Get-SemanticVersion {
@@ -95,6 +101,11 @@ $apiHeaders = @{
     'X-GitHub-Api-Version' = '2022-11-28'
     'User-Agent' = 'e-release-installer'
 }
+# Release assets are binaries, not API documents.
+$assetHeaders = @{
+    Accept = 'application/octet-stream'
+    'User-Agent' = 'e-release-installer'
+}
 $repositoryApi = 'https://api.github.com/repos/pjperez/e'
 $releaseUri = if ($Version) {
     "$repositoryApi/releases/tags/v$Version"
@@ -104,7 +115,12 @@ else {
 }
 
 Write-Host 'Resolving the e release...'
-$release = Invoke-RestMethod -Uri $releaseUri -Headers $apiHeaders -MaximumRetryCount 2
+$release = Invoke-RestMethod `
+    -Uri $releaseUri `
+    -Headers $apiHeaders `
+    -TimeoutSec 60 `
+    -MaximumRetryCount 3 `
+    -RetryIntervalSec 3
 if ($release.draft) {
     throw "Release '$($release.tag_name)' is still a draft."
 }
@@ -132,8 +148,8 @@ try {
 
     $manifestPath = Join-Path $stagingDirectory 'checksums.json'
     $signaturePath = Join-Path $stagingDirectory 'checksums.json.sig'
-    Invoke-Download -Uri $manifestAsset[0].browser_download_url -Destination $manifestPath -Headers $apiHeaders
-    Invoke-Download -Uri $signatureAsset[0].browser_download_url -Destination $signaturePath -Headers $apiHeaders
+    Invoke-Download -Uri $manifestAsset[0].browser_download_url -Destination $manifestPath -Headers $assetHeaders
+    Invoke-Download -Uri $signatureAsset[0].browser_download_url -Destination $signaturePath -Headers $assetHeaders
 
     $rsa = [System.Security.Cryptography.RSA]::Create()
     try {
@@ -191,8 +207,11 @@ try {
     }
 
     $installerPath = Join-Path $stagingDirectory $artifact[0].name
-    Write-Host "Downloading e $releaseVersion for Windows $architecture..."
-    Invoke-Download -Uri $releaseAsset[0].browser_download_url -Destination $installerPath -Headers $apiHeaders
+    $hasSize = $artifact[0].PSObject.Properties.Name -contains 'size'
+    $scale = if ($hasSize) { " ($([math]::Round($artifact[0].size / 1MB, 1)) MB)" } else { '' }
+    Write-Host "Downloading e $releaseVersion for Windows $architecture$scale..."
+    Invoke-Download -Uri $releaseAsset[0].browser_download_url -Destination $installerPath -Headers $assetHeaders
+    Write-Host 'Verifying the download...'
 
     $actualHash = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $expectedHash = ([string]$artifact[0].sha256).ToLowerInvariant()
