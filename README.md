@@ -49,17 +49,17 @@ frontend. No Electron, no framework — the whole renderer is ~20 KB.
 
 ## Install
 
-Windows releases install per-user and do not need Node.js, Rust, or an
-administrator shell. Run this from PowerShell:
+Windows releases need no Node.js, Rust, or build toolchain. Run this from
+PowerShell:
 
 ```powershell
 irm https://eharness.dev/install.ps1 -OutFile $env:TEMP\e.ps1; pwsh -NoProfile -File $env:TEMP\e.ps1
 ```
 
 The bootstrapper selects the x64 or Arm64 installer, verifies its SHA-256
-digest against a separately signed release manifest, and then starts the
-installer in `%LOCALAPPDATA%\Programs\e`. Pass `-Quiet` for an unattended
-current-user install.
+digest against a separately signed release manifest, and starts the installer.
+`e` installs to `C:\Program Files\e`, so Windows shows the usual approval
+prompt. Pass `-Quiet` for an unattended install.
 
 ## Build from source
 

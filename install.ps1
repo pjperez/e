@@ -6,8 +6,8 @@ Installs a verified Windows release of the e agent harness.
 
 .DESCRIPTION
 Downloads an immutable GitHub release, verifies its signed manifest and
-installer SHA-256 digest, then starts the current-user NSIS installer.
-This script never elevates, changes execution policy, or installs build tools.
+installer SHA-256 digest, then starts the installer. Windows asks for the
+usual approval because e installs into Program Files.
 
 .PARAMETER Version
 Install a specific release version instead of the latest stable release.
@@ -82,12 +82,6 @@ if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     throw 'This installer currently supports Windows only.'
 }
 
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
-if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Run install.ps1 from a non-elevated PowerShell window. e installs for the current user.'
-}
-
 $architecture = switch (
     [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 ) {
@@ -119,7 +113,6 @@ if ($release.prerelease -and -not $AllowPrerelease) {
 }
 
 $stagingDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "e-install-$([Guid]::NewGuid())"
-$installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\e'
 $stateDirectory = Join-Path $env:LOCALAPPDATA 'e-harness'
 $statePath = Join-Path $stateDirectory 'install-state.json'
 
@@ -226,20 +219,12 @@ try {
         throw "The installer has an invalid Authenticode status: $($authenticode.Status)."
     }
 
-    Write-Host "Verified e $releaseVersion. Installing to '$installDirectory'..."
+    Write-Host "Verified e $releaseVersion. Starting the installer (Windows will ask for approval)..."
     $process = if ($Quiet) {
-        Start-Process `
-            -FilePath $installerPath `
-            -ArgumentList @('/S', "/D=$installDirectory") `
-            -Wait `
-            -PassThru
+        Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait -PassThru
     }
     else {
-        Start-Process `
-            -FilePath $installerPath `
-            -ArgumentList "/D=$installDirectory" `
-            -Wait `
-            -PassThru
+        Start-Process -FilePath $installerPath -Wait -PassThru
     }
     if ($process.ExitCode -ne 0) {
         throw "The installer exited with code $($process.ExitCode)."
