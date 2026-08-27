@@ -113,7 +113,6 @@ if ($release.prerelease -and -not $AllowPrerelease) {
 }
 
 $stagingDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "e-install-$([Guid]::NewGuid())"
-$installDirectory = Join-Path $env:LOCALAPPDATA 'Programs\e'
 $stateDirectory = Join-Path $env:LOCALAPPDATA 'e-harness'
 $statePath = Join-Path $stateDirectory 'install-state.json'
 
@@ -222,18 +221,10 @@ try {
 
     Write-Host "Verified e $releaseVersion. Starting the installer (Windows will ask for approval)..."
     $process = if ($Quiet) {
-        Start-Process `
-            -FilePath $installerPath `
-            -ArgumentList @('/S', "/D=$installDirectory") `
-            -Wait `
-            -PassThru
+        Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait -PassThru
     }
     else {
-        Start-Process `
-            -FilePath $installerPath `
-            -ArgumentList "/D=$installDirectory" `
-            -Wait `
-            -PassThru
+        Start-Process -FilePath $installerPath -Wait -PassThru
     }
     if ($process.ExitCode -ne 0) {
         throw "The installer exited with code $($process.ExitCode)."
