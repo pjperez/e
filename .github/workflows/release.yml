@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example, v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+
+      - name: Verify release version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
+            throw "Invalid release tag."
+          }
+          $tagVersion = $Matches.version
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (
+            Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"'
+          ).Matches[0].Groups[1].Value
+          if (@($packageVersion, $tauriVersion, $cargoVersion) | Where-Object { $_ -ne $tagVersion }) {
+            throw "Tag v$tagVersion must match package.json, tauri.conf.json, and Cargo.toml."
+          }
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Verify Cargo lockfile
+        run: cargo fetch --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Build NSIS installer
+        run: npm run tauri build -- --bundles nsis --target ${{ matrix.target }} --ci
+
+      - name: Normalize installer name
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $bundleDirectory = 'src-tauri/target/${{ matrix.target }}/release/bundle/nsis'
+          $installers = @(Get-ChildItem -Path $bundleDirectory -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected one NSIS installer in '$bundleDirectory', found $($installers.Count)."
+          }
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          Copy-Item $installers[0].FullName "release-assets/e_${version}_${{ matrix.arch }}-setup.exe"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: installer-${{ matrix.arch }}
+          path: release-assets/*-setup.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Sign and publish release
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download installers
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify tag is the protected main commit
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            throw 'Invalid release tag.'
+          }
+          git fetch origin "refs/tags/$($env:RELEASE_TAG):refs/tags/$($env:RELEASE_TAG)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag '$($env:RELEASE_TAG)' does not exist."
+          }
+          $tagCommit = git rev-parse "$($env:RELEASE_TAG)^{commit}"
+          $mainCommit = git rev-parse HEAD
+          if ($tagCommit -ne $mainCommit) {
+            throw "Release tag must point exactly at the current protected main commit."
+          }
+
+      - name: Sign release manifest
+        shell: pwsh
+        env:
+          INSTALL_MANIFEST_PRIVATE_KEY: ${{ secrets.INSTALL_MANIFEST_PRIVATE_KEY }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if (-not $env:INSTALL_MANIFEST_PRIVATE_KEY) {
+            throw 'INSTALL_MANIFEST_PRIVATE_KEY is not configured.'
+          }
+          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
+            throw 'Invalid release tag.'
+          }
+          $version = $Matches.version
+          ./scripts/New-ReleaseManifest.ps1 `
+            -ArtifactDirectory release-assets `
+            -Version $version `
+            -Tag $env:RELEASE_TAG `
+            -PrivateKey $env:INSTALL_MANIFEST_PRIVATE_KEY
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: |
+            release-assets/*
+            checksums.json
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') {
+            throw 'Invalid release tag.'
+          }
+          $version = $Matches.version
+          $assets = @(
+            Get-ChildItem -Path release-assets -Filter '*-setup.exe' -File |
+              Sort-Object Name |
+              ForEach-Object FullName
+          )
+          $arguments = @(
+            'release', 'create', $env:RELEASE_TAG
+          ) + $assets + @(
+            (Resolve-Path checksums.json).Path,
+            (Resolve-Path checksums.json.sig).Path,
+            (Resolve-Path install.ps1).Path,
+            '--repo', $env:REPOSITORY,
+            '--verify-tag',
+            '--title', "e $version",
+            '--generate-notes'
+          )
+          if ($version.Contains('-')) {
+            $arguments += '--prerelease'
+          }
+          gh @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release create failed with exit code $LASTEXITCODE."
+          }
