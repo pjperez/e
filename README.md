@@ -10,32 +10,6 @@
   <a href="https://tauri.app"><img alt="Rust and Tauri 2" src="https://img.shields.io/badge/Rust-Tauri%202-8b5cf6?style=flat-square"></a>
 </p>
 
-<p align="center">
-  Connect an OpenAI-compatible model to local projects, tools, and extensions<br>
-  in one native Windows application.
-</p>
-
-## What is e?
-
-`e` is a minimal, expandable agent harness for Windows. It gives an
-OpenAI-compatible model a conversation, a project directory, and tools it can
-call. Tool results are returned to the model so it can inspect a project, make
-changes, run commands, and complete multi-step work.
-
-The application has a Rust core and a native Tauri 2 WebView written in vanilla
-TypeScript. The core handles model streaming, tool execution, approvals,
-projects, and persistent conversations. The interface shows responses,
-reasoning, tool calls, results, retries, and context usage as they happen.
-
-The base harness includes PowerShell, file reading and writing, directory
-listing, and skill loading. It can be expanded with compiled Rust tools,
-on-demand `SKILL.md` instruction packages, ES module plugins, and tools from
-stdio MCP servers. Plugins can also add commands, event handlers, tool guards,
-notifications, project views, file browsers, and terminal sessions.
-
-Providers, models, projects, chats, and extensions are configured locally.
-Prompts and tool results are sent only to the provider selected for each chat.
-
 ## At a glance
 
 | Area | Current behavior |
