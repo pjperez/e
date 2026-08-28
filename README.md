@@ -2,7 +2,7 @@
   <img src="design/brand/e-banner.svg" alt="e - agent harness" width="760">
 </p>
 
-<h3 align="center">The agent loop, made visible.</h3>
+<h3 align="center">A minimal, expandable agent harness.</h3>
 
 <p align="center">
   <a href="https://github.com/pjperez/e/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/pjperez/e?style=flat-square&label=release&color=8b5cf6"></a>
@@ -11,25 +11,30 @@
 </p>
 
 <p align="center">
-  Bring an OpenAI-compatible model. Give it a project and real tools.<br>
-  Watch it reason, act, and respond from one local Windows app.
+  Connect an OpenAI-compatible model to local projects, tools, and extensions<br>
+  in one native Windows application.
 </p>
 
 ## What is e?
 
-`e` is a desktop agent harness: the part between a model and your machine that
-turns a chat response into an actual working loop.
+`e` is a minimal, expandable agent harness for Windows. It gives an
+OpenAI-compatible model a conversation, a project directory, and tools it can
+call. Tool results are returned to the model so it can inspect a project, make
+changes, run commands, and complete multi-step work.
 
-Choose a model from any configured OpenAI-compatible provider, attach the chat
-to a project, and ask for work. The model can inspect files, run PowerShell,
-write changes, load skills, and call plugin or MCP tools. `e` feeds every result
-back to the model and keeps going until the model is finished.
+The application has a Rust core and a native Tauri 2 WebView written in vanilla
+TypeScript. The core handles model streaming, tool execution, approvals,
+projects, and persistent conversations. The interface shows responses,
+reasoning, tool calls, results, retries, and context usage as they happen.
 
-That loop is visible and controllable. Text and reasoning stream as they arrive;
-tool calls show their inputs, progress, and results; risky built-in tools pause
-for approval; and a run can be stopped or steered without leaving the chat.
-Projects, conversations, configuration, and tool execution are managed locally.
-Prompts and tool results are sent to the provider you choose.
+The base harness includes PowerShell, file reading and writing, directory
+listing, and skill loading. It can be expanded with compiled Rust tools,
+on-demand `SKILL.md` instruction packages, ES module plugins, and tools from
+stdio MCP servers. Plugins can also add commands, event handlers, tool guards,
+notifications, project views, file browsers, and terminal sessions.
+
+Providers, models, projects, chats, and extensions are configured locally.
+Prompts and tool results are sent only to the provider selected for each chat.
 
 ## At a glance
 
