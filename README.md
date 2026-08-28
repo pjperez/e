@@ -31,14 +31,11 @@ for approval; and a run can be stopped or steered without leaving the chat.
 Projects, conversations, configuration, and tool execution are managed locally.
 Prompts and tool results are sent to the provider you choose.
 
-There is **no fixed step limit**. A run ends when the model returns no more tool
-calls, you stop it, or the provider request fails.
-
 ## At a glance
 
 | Area | Current behavior |
 |---|---|
-| Agent loop | Streaming chat completions, multiple tool calls per response, no hard iteration cap, and cancellation during generation or provider backoff |
+| Agent loop | Streaming chat completions, repeated model-requested tool calls, and cancellation during generation or provider backoff |
 | Providers | Multiple saved providers, a combined model picker, `/models` refresh, manually added model IDs, per-model context windows, and reasoning-effort settings |
 | Conversations | Persistent named chats, per-chat model/provider selection, forking, search over names and transcript text, background runs, and model-backed context compaction |
 | Projects | Chats grouped by project folder, plus a separate scratch `Tasks` area |
@@ -51,11 +48,12 @@ calls, you stop it, or the provider request fails.
 ## Install
 
 Official releases currently target Windows x64 and Arm64. They are packaged as
-per-machine NSIS installers and require PowerShell 7 for the bootstrap script.
+per-machine NSIS installers. The bootstrap script runs in Windows PowerShell 5.1,
+which is included with Windows 11.
 
 ```powershell
 irm https://eharness.dev/install.ps1 -OutFile $env:TEMP\e.ps1
-pwsh -NoProfile -File $env:TEMP\e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\e.ps1
 ```
 
 The bootstrapper selects the installer for the current architecture, verifies a
@@ -103,7 +101,7 @@ be added manually. Selecting a model also selects the provider that owns it.
 
 When advertised by the provider, `e` records model context windows and supported
 reasoning levels. Both can be overridden in Settings. Context compaction uses
-the selected model's effective window; it does not impose a step limit.
+the selected model's effective window.
 
 Temporary process-level overrides are available:
 
@@ -293,7 +291,7 @@ TypeScript UI
   | Tauri commands and events
   v
 Rust core
-  agent.rs      conversation and uncapped tool loop
+  agent.rs      conversation and tool loop
   provider.rs   OpenAI-compatible HTTP/SSE client
   tools.rs      tool trait, registry, and built-ins
   sessions.rs   projects, chats, and file-backed persistence
