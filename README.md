@@ -1,329 +1,129 @@
-# e
-
 <p align="center">
-  <img src="design/brand/e-banner.svg" alt="e — agent harness" width="760">
+  <img src="design/brand/e-banner.svg" alt="e - agent harness" width="760">
 </p>
 
-**e** is a minimalist, fast, extensible **agent harness** with a native GUI —
-the inner loop of an agent coding tool (converse → call tools → apply → repeat)
-without the terminal. A slim Rust core drives the agent and its tools; a tiny
-hand-tuned webview renders the conversation.
+<h3 align="center">A minimal, expandable agent harness.</h3>
 
-Built on **Tauri v2** (Rust + the OS WebView) with a vanilla TypeScript
-frontend. No Electron, no framework — the whole renderer is ~20 KB.
+<p align="center">
+  Your models. Your keys. Your tools.<br>
+  A fast native workspace for agents you can see, steer, and extend.
+</p>
 
-```
-.______________________________.
-|  e                      4 tools  ⟂ ⚙  gpt-4.1-mini |
-|                — — — — — — — — —             |
-|   ▸ you                                        |
-|   What can we ship?                            |
-|                                                |
-|   ▸ e                                          |
-|   Reading the repo…                            |
-|   [list_dir]  [read_file]  [powershell]        |
-|   ┌──────────────────────────────────────┐    |
-|   │ Ask e to do something…          (➤)   │    |
-|   └──────────────────────────────────────┘    |
-'______________________________'
-```
+<p align="center">
+  <a href="https://github.com/pjperez/e/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/pjperez/e?style=flat-square&label=release&color=8b5cf6"></a>
+  <a href="https://eharness.dev"><img alt="Windows x64 and Arm64" src="https://img.shields.io/badge/Windows-x64%20%7C%20Arm64-8b5cf6?style=flat-square"></a>
+  <a href="https://eharness.dev"><img alt="eharness.dev" src="https://img.shields.io/badge/%E2%86%92-eharness.dev-8b5cf6?style=flat-square"></a>
+</p>
 
-## What it does
+<p align="center">
+  <a href="#why-e">Why e</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#extend-e">Extend</a> ·
+  <a href="#trust">Trust</a> ·
+  <a href="#develop">Develop</a>
+</p>
 
-- **A real harness, not a wrapper.** The model calls tools — PowerShell, read/write
-  files, list dir — and the results feed back until the task is done, bounded to
-  25 steps and cancellable with **Esc**.
-- **Any OpenAI-compatible provider.** OpenAI, Ollama, LM Studio, vLLM, Together,
-  OpenRouter, or your own gateway. Keep several at once and switch per chat.
-- **Chats and projects.** Conversations persist, fork, and carry their own model,
-  workspace and token budget. History is summarised automatically when a chat
-  approaches its model's context window.
-- **Isolated tasks.** Git projects use an app-managed worktree per new task by
-  default; deleting the task removes that worktree from disk.
-- **Streaming everything.** Tokens, reasoning, tool cards, and live token and
-  cost counters as the run happens.
-- **Extensible.** Add a tool by implementing one trait — see
-  [Add a tool](#add-a-tool) — or drop a folder in `~/.e/` for a plugin, a skill
-  or an MCP server, no rebuild. See [Extensions](#extensions).
-- **Yours.** Keys and settings live in `~/.e/config.json`, never in the repo.
+## Why e
+
+`e` keeps the agent workspace focused: connect a model, open a project, and get
+to work.
+
+| | |
+|---|---|
+| **Bring the model you want** | Use OpenAI, Ollama, LM Studio, vLLM, Together, OpenRouter, or any compatible endpoint. Keep several providers and switch models per chat. |
+| **Watch the work happen** | Follow responses, reasoning, tool calls, results, and retries as they happen, with session token, context, and reported-cost counters. |
+| **Stay in control** | Approve built-in command and file-writing tools, stop a run at any point, or steer it with a new instruction. Other chats can keep working in the background. |
+| **Keep projects clean** | Organize persistent chats by project. Fork and search conversations, and optionally give new Git tasks their own managed worktree. |
+| **Make it yours** | Add reusable skills, JavaScript plugins, MCP servers, custom tools, commands, guards, file browsers, terminals, and side-pane views. |
+
+No `e` account is required. Add your provider, choose a folder, and start.
 
 ## Install
 
-Windows releases need no Node.js, Rust, or build toolchain. Run this from
-PowerShell:
+Windows x64 or Arm64, using the built-in Windows PowerShell 5.1:
 
 ```powershell
-irm https://eharness.dev/install.ps1 -OutFile $env:TEMP\e.ps1; pwsh -NoProfile -File $env:TEMP\e.ps1
+irm https://eharness.dev/install.ps1 -OutFile $env:TEMP\e.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\e.ps1
 ```
 
-The bootstrapper selects the x64 or Arm64 installer, verifies its SHA-256
-digest against a separately signed release manifest, and starts the installer.
-`e` installs to `C:\Program Files\e`, so Windows shows the usual approval
-prompt. Pass `-Quiet` for an unattended install.
+The bootstrapper selects the right installer and verifies it against the signed
+release manifest before launch.
 
-## Build from source
+> The installer is not yet Authenticode-signed, so Windows shows an unknown
+> publisher.
 
-Source builds require Node.js ≥ 18, Rust (stable), and your platform's
-[Tauri prerequisites](https://tauri.app/start/prerequisites/) (on Windows:
-WebView2 runtime + MSVC toolchain).
+## Get started
 
-```bash
-npm install
-npm run tauri dev        # dev server + native window, hot reload
-npm run tauri build      # single native executable in src-tauri/target/release/
+1. Open **Settings** and add an OpenAI-compatible provider URL and, if needed,
+   its key.
+2. Refresh its model list or add a model ID manually.
+3. Create a project from any folder and choose a model.
+4. Ask `e` to investigate, build, fix, review, or automate.
+
+PowerShell, file reading and writing, directory listing, and skill loading are
+ready immediately. Press <kbd>Esc</kbd> to stop, <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
+to steer, type `@path` to include a file, paste an image, or use `/help` to see
+the available commands.
+
+## Extend e
+
+Start small and add only what your workflow needs:
+
+- **Skills** package repeatable instructions in `SKILL.md` and load only when
+  needed.
+- **Plugins** add tools, commands, safety guards, notifications, project views,
+  file browsers, and terminals.
+- **MCP servers** bring external tools into the same model-facing tool set.
+
+Extensions can be global or live with a project. Reload plugins and MCP servers
+without restarting `e`; skill edits are available on the next turn.
+
+Working examples include a custom tool, Git guard, project browser, terminal,
+skill, and MCP configuration:
+
+- [`examples/`](examples)
+- [Extension guide](docs/EXTENDING.md)
+
+`e-rpc` provides a headless JSONL interface for editors, automation, and
+embedding.
+
+## Trust
+
+- Chats, projects, settings, and extension configuration stay on your machine.
+- Provider keys are stored in Windows Credential Manager.
+- Prompts and tool results go to the provider selected for that chat.
+- Built-in PowerShell and `write_file` calls ask for approval unless YOLO mode
+  is enabled.
+- Local tools run with your Windows user permissions.
+- Plugins and MCP servers are code you choose to run; install only what you
+  trust.
+
+## Develop
+
+<details>
+<summary><b>Build from source</b></summary>
+
+Requires Node.js 18 or newer, Rust stable, MSVC build tools, and WebView2.
+
+```powershell
+npm ci
+npm run tauri dev
 ```
 
-## First run
+Create a release build:
 
-`e` ships with **no provider configured**. Open **Settings (⚙)** and add one:
-
-1. **+ Add provider** — give it a name, a base URL (e.g.
-   `https://api.openai.com/v1`, or `http://localhost:11434/v1` for Ollama) and a
-   key if it needs one.
-2. **Refresh** pulls the model list from `<base_url>/models`, or add model ids by
-   hand for gateways that don't list everything they serve.
-3. Pick a model from the title bar. A model carries its provider with it, so
-   choosing one selects the base URL, key and context window too.
-
-Environment variables override the active provider for a launch: `E_BASE_URL`,
-`E_API_KEY`, `E_MODEL`, `E_WORKSPACE`.
-
-## Built-in tools
-
-| tool         | purpose                                        |
-|--------------|------------------------------------------------|
-| `powershell` | run PowerShell in the workspace (120 s timeout) |
-| `read_file`  | read a text file (truncated if huge)            |
-| `write_file` | write a file, creating parents                  |
-| `list_dir`   | list a directory                                |
-| `skills`     | load a `SKILL.md` on demand                     |
-
-The **workspace** — where `powershell` runs and relative paths resolve — belongs to
-the chat's project and is set in the sidebar (✎).
-
-## Add a tool
-
-A tool is a struct implementing one trait. Here is a complete, working one:
-
-```rust
-// src-tauri/src/engine/tools.rs
-use serde_json::{json, Value};
-
-pub struct GitStatusTool;
-
-impl Tool for GitStatusTool {
-    fn name(&self) -> &str {
-        "git_status"
-    }
-
-    fn description(&self) -> &str {
-        "Show the working tree status of the workspace's git repository."
-    }
-
-    /// JSON Schema for `arguments`. This is what the model is shown.
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "short": { "type": "boolean", "description": "Use --short output." }
-            }
-        })
-    }
-
-    fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        let short = args.get("short").and_then(|s| s.as_bool()).unwrap_or(true);
-
-        let mut cmd = std::process::Command::new("git");
-        cmd.current_dir(ctx.dir()?).arg("status");
-        if short {
-            cmd.arg("--short");
-        }
-
-        let out = cmd.output().map_err(|e| format!("git: {e}"))?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
-    }
-}
+```powershell
+npm run tauri build
 ```
 
-Register it in `ToolRegistry::new()`:
+</details>
 
-```rust
-r.register(GitStatusTool);
-```
+<br>
 
-That is the whole surface. `parameters()` is sent to the model, `run()` receives
-whatever the model passed, and the returned `Ok`/`Err` string is fed back into
-the conversation — the agent loop, the tool card in the UI, and the approval
-prompt all work automatically.
-
-Two things worth knowing:
-
-- `ctx.dir()?` resolves the chat's workspace and returns a readable error if it
-  is unset or missing, so a tool never runs somewhere unexpected.
-- `run()` is synchronous and runs on a worker thread. For anything long-running,
-  apply your own timeout (the `powershell` tool uses `mpsc::recv_timeout`).
-
-## Extensions
-
-Three drop-in folders, no rebuild and no restart — `/reload`, or Settings (⚙) →
-Extensions → **Reload extensions**:
-
-```
-~/.e/plugins/<name>/plugin.json + index.js   tools, /commands, event guards
-~/.e/skills/<name>/SKILL.md                  prompt packages, loaded on demand
-~/.e/mcp.json                                MCP servers; their tools merge in
-```
-
-Each has a project form — `<project>/.e/plugins`, `.e/skills`, `.e/mcp.json` —
-that applies to that project only and shadows a global one of the same name.
-
-```js
-// ~/.e/plugins/hello/index.js
-export default function (e) {
-  e.registerTool({
-    name: "say_hi",
-    description: "Greet someone by name.",
-    parameters: { type: "object", properties: { name: { type: "string" } } },
-    async run(args) { return "hi " + (args.name || "there"); },
-  });
-}
-```
-
-A plugin declares what it may touch — `tools`, `commands`, `events`, `ui`,
-`network`, `session-read` — and gets exactly that; anything it did not declare
-is refused out loud. A plugin listening for `tool_call` can also refuse a call
-before it runs, which is how a guard stops `git push --force` reaching the
-PowerShell tool.
-
-**Settings (⚙) → Extensions**, or `/extensions`, lists everything found: scope,
-capabilities, the tools and commands each plugin registered, MCP server state,
-and why anything failed. Untick a plugin to keep it off for good.
-
-Copy-paste starting points are in [`examples/`](examples); the full reference is
-[EXTENDING.md](docs/EXTENDING.md).
-
-## Documentation
-
-| doc | what's in it |
-|-----|--------------|
-| [EXTENDING.md](docs/EXTENDING.md) | adding tools, providers, skills, plugins, MCP servers; the headless RPC binary |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the core and its extension surfaces fit together |
-| [DESIGN.md](docs/DESIGN.md) | design tokens, themes, layout and typography |
-| [ROADMAP.md](docs/ROADMAP.md) | what's shipped, what's planned, what's deliberately out of scope |
-
-## How it works
-
-```
-Tauri frontend (TypeScript)          Rust core (src-tauri/src)
-────────────────────────────         ──────────────────────────
-  composer ──send_text()──▶            engine::agent::Agent.run()
-  streaming tokens ◀─e:token──        engine::provider  (OpenAI-compatible, SSE)
-  tool cards     ◀─e:tool_call──      engine::tools     (registry + built-ins)
-  tool results   ◀─e:tool_result──    loop: model → run tools → model …
-  done           ◀─e:done──
-```
-
-The engine owns a `Vec<Msg>` conversation, calls the provider, executes any
-requested tools, injects the results, and repeats until the model stops
-requesting tools.
-
-```
-src-tauri/src/
-  main.rs            desktop entry point
-  lib.rs             Tauri app, commands, event bridge
-  bin/e-rpc.rs       the same engine, headless over JSONL
-  engine/
-    mod.rs           message/tool-call model + Emitter trait
-    provider.rs      OpenAI-compatible streaming client
-    tools.rs         Tool trait, registry, built-in tools
-    agent.rs         config + the agent loop
-    sessions.rs      chats, projects, persistence
-    approval.rs      human approval for risky tools
-    skills.rs        SKILL.md discovery
-    mcp.rs           MCP client
-    plugins.rs       plugin discovery + the bridge to the host
-src/
-  main.ts            UI controller + plugin host
-  api.ts             typed bridge to the Rust backend
-  markdown.ts        tiny XSS-safe markdown renderer
-  copy.ts            copy-to-clipboard buttons
-  style.css          all styling
-```
-
-## Configuration
-
-Settings live in `~/.e/config.json` and are written by the GUI — edit by hand
-only if you want to.
-
-```jsonc
-{
-  "temperature": 0.7,
-  "system": "You are e, a fast, capable agent…",
-  "workspace": "C:/src/work",
-  "model": "gpt-4.1-mini",     // the picked model…
-  "provider_id": "openai",     // …and who serves it
-  "providers": [
-    {
-      "id": "openai",
-      "name": "OpenAI",
-      "base_url": "https://api.openai.com/v1",
-      "enabled": true,            // off hides its models but keeps the key
-      "context_window": null,     // provider-wide fallback; null = global
-      "models": ["gpt-4.1-mini", "gpt-4.1"],
-      "model_meta": {             // per model: learned on Refresh, tuned by you
-        "gpt-4.1": {
-          "advertised_window": 272000,   // what /models said
-          "window_override": null,       // your number; beats the above
-          "reasoning": true,             // takes a reasoning level
-          "reasoning_efforts": ["low", "medium", "high"],
-          "reasoning_effort": "high"     // the level to ask for
-        }
-      },
-      "disabled_models": ["gpt-4.1"]     // hidden from the picker
-    },
-    {
-      "id": "ollama",
-      "name": "Ollama",
-      "base_url": "http://localhost:11434/v1",
-      "enabled": true,
-      "models": ["qwen3-coder:30b"],
-      "disabled_models": []
-    }
-  ],
-  "task_worktrees": true,               // isolate each new Git task by default
-  "disabled_plugins": ["noisy-plugin"]  // unticked in Settings → Extensions
-}
-```
-
-Top-level `base_url` and `models` are derived — the connection `e` uses is always
-the one belonging to the provider serving the selected model. API keys never go
-in this file: on Windows they are stored in Windows Credential Manager. Existing
-plaintext keys are migrated and removed from `config.json` on startup.
-
-**Context window** resolves per model, then the provider's fallback, then the
-global default; it is what compaction is budgeted against. **Reasoning level**
-is `auto · min · low · med · high`, or exactly the levels the provider
-enumerated — `auto` sends no `reasoning_effort` field at all.
-
-## Brand
-
-<p align="center">
-  <img src="design/brand/e-construction.svg" alt="the mark's construction" width="440">
-</p>
-
-The mark is a lowercase **e** whose bowl is a true logarithmic spiral,
-`r(θ) = r₀·e^(bθ)`, tuned so the radius grows by exactly φ across the sweep. It
-is generated, not drawn: [`design/logo.py`](design/logo.py) emits every asset
-from the same equations.
-
-```bash
-python design/logo.py            # writes design/brand/* and public/e.svg
-python design/logo.py --review   # contact sheet of the alternate cuts
-npm run tauri -- icon design/brand/e-tile.svg   # platform icon set
-```
-
-`public/e.svg` is the single source of truth for the in-app mark: the title bar
-and empty state tint it with a CSS mask, so it follows the theme for free.
+| Documentation | |
+|---|---|
+| [Extending e](docs/EXTENDING.md) | Tools, skills, plugins, MCP, and `e-rpc` |
+| [Architecture](docs/ARCHITECTURE.md) | Core boundaries and extension surfaces |
+| [Design](docs/DESIGN.md) | Visual system and interface principles |
+| [Roadmap](docs/ROADMAP.md) | Shipped work and what comes next |
