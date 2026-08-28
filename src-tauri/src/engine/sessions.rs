@@ -48,6 +48,12 @@ pub struct SessionMeta {
     pub worktree_base: String,
     #[serde(default)]
     pub worktree_branch: String,
+    /// A managed worktree was promised for this task but has not been created
+    /// yet. Creating one is a full checkout, so it is deferred until the task
+    /// is actually used: opening a task has to stay instant even on a repo
+    /// where the checkout takes seconds.
+    #[serde(default)]
+    pub worktree_pending: bool,
 }
 
 /// File-backed store: ~/.e/sessions/<id>.json (history) + index.json.
@@ -127,7 +133,7 @@ impl SessionStore {
         }
         st.migrate();
         if st.sessions.is_empty() {
-            st.create("Chat 1", "", "", "");
+            st.create("Chat 1", "", "", "", false);
         }
         st
     }
@@ -492,7 +498,17 @@ impl SessionStore {
     /// Create a chat in the current project. It copies the project's folder up
     /// front so the chat is pinned to it: an unresolved workspace would be
     /// filled in later from global config, i.e. from the wrong project.
-    pub fn create(&mut self, name: &str, workspace: &str, model: &str, provider: &str) -> SessionMeta {
+    ///
+    /// `worktree_pending` records that this task should get its own managed
+    /// worktree. The worktree itself is built later, on first use.
+    pub fn create(
+        &mut self,
+        name: &str,
+        workspace: &str,
+        model: &str,
+        provider: &str,
+        worktree_pending: bool,
+    ) -> SessionMeta {
         let id = format!("s{}", now_ms());
         let ws = if workspace.trim().is_empty() {
             let p = self.current_project_workspace();
@@ -517,6 +533,7 @@ impl SessionStore {
             managed_worktree: false,
             worktree_base: String::new(),
             worktree_branch: String::new(),
+            worktree_pending,
         };
         self.set_history(&id, Vec::new());
         self.sessions.push(meta.clone());
@@ -541,6 +558,7 @@ impl SessionStore {
                     "model": s.model,
                     "state": s.state,
                     "managed_worktree": s.managed_worktree,
+                    "worktree_pending": s.worktree_pending,
                     "detached": self.project_context(&s.id).detached,
                 })
             })
@@ -583,9 +601,26 @@ impl SessionStore {
         session.managed_worktree = true;
         session.worktree_base = base.to_string();
         session.worktree_branch = branch.to_string();
+        session.worktree_pending = false;
         let result = session.clone();
         self.save_index();
         Some(result)
+    }
+
+    /// Record whether this task is still owed a managed worktree. Cleared once
+    /// one exists, and also when the answer is settled the other way (the
+    /// project is not a Git repository, or worktrees have been turned off), so
+    /// the check is not repeated on every run.
+    pub fn set_worktree_pending(&mut self, id: &str, pending: bool) -> bool {
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if session.worktree_pending == pending {
+            return true;
+        }
+        session.worktree_pending = pending;
+        self.save_index();
+        true
     }
 
     /// Non-summarising fallback: keep system + the most recent messages. Only a
@@ -627,7 +662,7 @@ impl SessionStore {
         self.save_index();
     }
 
-    pub fn fork(&mut self, id: &str, name: &str) -> Option<SessionMeta> {
+    pub fn fork(&mut self, id: &str, name: &str, worktree_pending: bool) -> Option<SessionMeta> {
         let src = self.sessions.iter().find(|s| s.id == id).cloned()?;
         let history = self.get_history(id);
         let meta = SessionMeta {
@@ -650,6 +685,7 @@ impl SessionStore {
             managed_worktree: false,
             worktree_base: String::new(),
             worktree_branch: String::new(),
+            worktree_pending,
         };
         self.set_history(&meta.id, history);
         self.sessions.push(meta.clone());
@@ -705,6 +741,7 @@ mod tests {
             managed_worktree: false,
             worktree_base: String::new(),
             worktree_branch: String::new(),
+            worktree_pending: false,
         }
     }
 
@@ -872,8 +909,26 @@ mod tests {
     fn a_new_chat_inherits_the_current_projects_folder() {
         let mut st = store(vec![project("p2", "mascot", "C:/src/mascot")], vec![]);
         st.current_project = "p2".into();
-        let meta = st.create("", "", "", "");
+        let meta = st.create("", "", "", "", false);
         assert_eq!(meta.project, "p2");
         assert_eq!(st.resolved_workspace(&meta.id), "C:/src/mascot");
+    }
+
+    /// A task promised a worktree starts out owed one and pointed at the
+    /// project folder: nothing is checked out until it is first used.
+    #[test]
+    fn a_promised_worktree_is_recorded_rather_than_built() {
+        let mut st = store(vec![project("p2", "mascot", "C:/src/mascot")], vec![]);
+        st.current_project = "p2".into();
+        let meta = st.create("", "", "", "", true);
+        assert!(meta.worktree_pending);
+        assert!(!meta.managed_worktree);
+        assert_eq!(meta.workspace, "C:/src/mascot");
+
+        st.set_managed_worktree(&meta.id, "C:/wt/s1", "C:/src/mascot", "e/s1");
+        let after = st.session(&meta.id).unwrap();
+        assert!(!after.worktree_pending, "the promise is kept once, not every run");
+        assert!(after.managed_worktree);
+        assert_eq!(st.resolved_workspace(&meta.id), "C:/wt/s1");
     }
 }

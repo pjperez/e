@@ -29,6 +29,11 @@ struct AppState {
     /// shows on the same activity strip. It needs its own cancel flag or Stop
     /// has nothing to set while a compaction is backing off.
     compactions: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// One lock per task guarding the creation of its worktree. A task's
+    /// checkout is started speculatively as soon as it is opened, so its first
+    /// run can arrive while that is still in flight; without a gate the two
+    /// would race into a second `git worktree add` on the same path.
+    worktree_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Set once the frontend has registered its close handler. Until then the
     /// close button must behave normally: preventing close while nothing can
     /// draw the confirmation would leave the app impossible to quit.
@@ -42,6 +47,21 @@ struct AppState {
 impl AppState {
     fn config(&self) -> Config {
         self.config.lock().map(|c| c.clone()).unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// The lock covering one task's worktree creation. A poisoned gate is
+    /// reused deliberately: it only ever guards a git call, and refusing to
+    /// build the worktree because an unrelated thread panicked would leave the
+    /// task unusable.
+    fn worktree_gate(&self, sid: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.worktree_gates.lock().unwrap_or_else(|e| e.into_inner());
+        gates.entry(sid.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    }
+
+    fn forget_worktree_gate(&self, sid: &str) {
+        if let Ok(mut gates) = self.worktree_gates.lock() {
+            gates.remove(sid);
+        }
     }
 
     fn is_running(&self, sid: &str) -> bool {
@@ -251,8 +271,8 @@ fn list_models(state: tauri::State<AppState>) -> Vec<engine::agent::ModelChoice>
     state.config().model_catalog()
 }
 
-#[tauri::command]
-fn read_attachment(state: tauri::State<AppState>, path: String) -> Result<serde_json::Value, String> {
+#[tauri::command(async)]
+fn read_attachment(state: tauri::State<'_, AppState>, path: String) -> Result<serde_json::Value, String> {
     // Resolve relative to the active chat's own project folder, so `@file`
     // means the same thing as the tools' cwd.
     let ws = state
@@ -311,7 +331,7 @@ fn set_project_workspace(state: tauri::State<AppState>, id: String, workspace: S
 /// A relative path counts as unusable even when it happens to resolve from
 /// here: the tools refuse it (see `ToolContext::dir`), so the sidebar has to
 /// flag it too rather than showing a folder that looks fine.
-#[tauri::command]
+#[tauri::command(async)]
 fn path_is_dir(path: String) -> bool {
     let p = path.trim();
     !p.is_empty() && std::path::Path::new(p).is_absolute() && std::path::Path::new(p).is_dir()
@@ -335,8 +355,8 @@ fn set_session_model(state: tauri::State<AppState>, id: String, model: String, p
 
 /// Plugins visible from this chat's project, with the ones the user switched
 /// off already marked — the frontend never has to re-derive that.
-#[tauri::command]
-fn list_plugins(state: tauri::State<AppState>, workspace: Option<String>) -> Vec<engine::plugins::PluginInfo> {
+#[tauri::command(async)]
+fn list_plugins(state: tauri::State<'_, AppState>, workspace: Option<String>) -> Vec<engine::plugins::PluginInfo> {
     let off = state.config().disabled_plugins;
     plugins::discover(workspace.as_deref())
         .into_iter()
@@ -347,7 +367,7 @@ fn list_plugins(state: tauri::State<AppState>, workspace: Option<String>) -> Vec
         .collect()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_plugin(name: String, workspace: Option<String>) -> Result<serde_json::Value, String> {
     plugins::get_plugin(&name, workspace.as_deref())
         .map(|(info, src)| serde_json::json!({ "manifest": info, "source": src }))
@@ -402,8 +422,8 @@ fn list_mcp_servers() -> Vec<engine::mcp::McpStatus> {
 
 /// Re-scan every extension surface. MCP servers are restarted here; plugins
 /// and skills are re-read by the frontend, which owns their runtime.
-#[tauri::command]
-fn reload_extensions(state: tauri::State<AppState>, workspace: Option<String>) {
+#[tauri::command(async)]
+fn reload_extensions(state: tauri::State<'_, AppState>, workspace: Option<String>) {
     engine::mcp::load(state.tools.clone(), workspace);
 }
 
@@ -418,8 +438,8 @@ fn project_remove(state: tauri::State<AppState>, id: String) -> Result<bool, Str
     Ok(st.project_remove(&id))
 }
 
-#[tauri::command]
-fn workspace_snapshot(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
+#[tauri::command(async)]
+fn workspace_snapshot(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
     let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&id);
     if ws.is_empty() {
         return Ok(false);
@@ -444,8 +464,8 @@ fn workspace_snapshot(state: tauri::State<AppState>, id: String) -> Result<bool,
     Ok(false)
 }
 
-#[tauri::command]
-fn workspace_revert(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
+#[tauri::command(async)]
+fn workspace_revert(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
     let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&id);
     if ws.is_empty() {
         return Ok(false);
@@ -474,8 +494,8 @@ fn snippet_around(text: &str, pos: usize, len: usize) -> String {
     text[start..end].to_string()
 }
 
-#[tauri::command]
-fn search_sessions(state: tauri::State<AppState>, query: String) -> Result<serde_json::Value, String> {
+#[tauri::command(async)]
+fn search_sessions(state: tauri::State<'_, AppState>, query: String) -> Result<serde_json::Value, String> {
     let st = state.store.lock().map_err(|_| "lock")?;
     let q = query.trim().to_lowercase();
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -509,12 +529,12 @@ fn search_sessions(state: tauri::State<AppState>, query: String) -> Result<serde
     Ok(serde_json::json!({ "results": results }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_skills(workspace: Option<String>) -> Vec<engine::skills::SkillMeta> {
     SkillStore::for_workspace(&workspace.unwrap_or_default()).list()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_skill(name: String, workspace: Option<String>) -> Result<String, String> {
     SkillStore::for_workspace(&workspace.unwrap_or_default())
         .get(&name)
@@ -537,8 +557,12 @@ fn running_sessions(state: tauri::State<AppState>) -> Vec<String> {
     state.runs.lock().map(|r| r.keys().cloned().collect()).unwrap_or_default()
 }
 
-#[tauri::command]
-fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>, project: Option<String>) -> Result<serde_json::Value, String> {
+/// Session commands write the index and history files, and closing one starts
+/// the cleanup of a task's worktree. That is all disk work, so it is kept off
+/// the main thread: a command without `async` runs on the UI thread, where any
+/// wait — a slow disk, a network share, git — freezes the whole window.
+#[tauri::command(async)]
+fn new_session(app: tauri::AppHandle, state: tauri::State<'_, AppState>, name: Option<String>, workspace: Option<String>, model: Option<String>, provider: Option<String>, project: Option<String>) -> Result<serde_json::Value, String> {
     // Resolve the provider up front so a chat started on a model from a
     // non-default provider keeps that connection on its first run.
     let model = model.unwrap_or_default();
@@ -553,10 +577,22 @@ fn new_session(state: tauri::State<AppState>, name: Option<String>, workspace: O
     if let Some(p) = project.filter(|p| !p.trim().is_empty()) {
         st.project_switch(p.trim());
     }
-    let meta = st.create(&name.unwrap_or_default(), &workspace.unwrap_or_default(), &model, &provider);
-    let use_worktree = state.config().task_worktrees;
+    // The worktree is only *promised* here. Checking out a copy of the project
+    // takes seconds on a large repository, and doing it before returning is
+    // what made opening a task look like the app had hung. The build starts in
+    // the background instead, so it is usually finished by the time the first
+    // message is sent, and the first run waits for it if it is not.
+    let meta = st.create(
+        &name.unwrap_or_default(),
+        &workspace.unwrap_or_default(),
+        &model,
+        &provider,
+        state.config().task_worktrees,
+    );
     drop(st);
-    let meta = provision_session_worktree(&state, meta, use_worktree)?;
+    if meta.worktree_pending {
+        start_task_worktree(&app, &meta.id);
+    }
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }
 
@@ -627,14 +663,77 @@ fn create_task_worktree_in(
     }))
 }
 
-fn provision_session_worktree(
-    state: &tauri::State<AppState>,
-    meta: engine::sessions::SessionMeta,
-    enabled: bool,
-) -> Result<engine::sessions::SessionMeta, String> {
-    if !enabled {
-        return Ok(meta);
+/// Build the managed worktree a task was promised, if it is still owed one.
+///
+/// Called from background work (the speculative build started when a task is
+/// opened, a run, or a pane), never from the click that creates the task:
+/// `git worktree add` is a full checkout and blocks for as long as the project
+/// is large. Callers arriving while a build is already in flight wait for it
+/// and then find the work done.
+fn ensure_task_worktree(state: &AppState, id: &str) -> Result<(), String> {
+    if !task_owes_a_worktree(state, id)? {
+        return Ok(());
     }
+    let gate = state.worktree_gate(id);
+    let _building = gate.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-read under the gate: a speculative build may have finished while we
+    // were queued behind it, and starting a second `git worktree add` on the
+    // same path would fail outright.
+    if !task_owes_a_worktree(state, id)? {
+        return Ok(());
+    }
+    let Some(meta) = state.store.lock().map_err(|_| "lock")?.session(id) else {
+        return Ok(());
+    };
+    provision_session_worktree(state, meta)?;
+    Ok(())
+}
+
+/// Whether this task still needs a worktree built. The setting can have been
+/// turned off since it was created; that answer is recorded so the question is
+/// not asked again on every run.
+fn task_owes_a_worktree(state: &AppState, id: &str) -> Result<bool, String> {
+    let Some(meta) = state.store.lock().map_err(|_| "lock")?.session(id) else {
+        return Ok(false);
+    };
+    if !meta.worktree_pending || meta.managed_worktree {
+        return Ok(false);
+    }
+    if !state.config().task_worktrees {
+        if let Ok(mut store) = state.store.lock() {
+            store.set_worktree_pending(id, false);
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Start a task's checkout in the background as soon as it is opened.
+///
+/// Nothing waits on this: the point is that the worktree is usually ready by
+/// the time the user has finished typing their first message, while the click
+/// that opened the task returns immediately either way. A failure is left for
+/// the first run to report, which is the first moment it matters.
+fn start_task_worktree(app: &tauri::AppHandle, id: &str) {
+    let app = app.clone();
+    let id = id.to_string();
+    let _ = std::thread::Builder::new().name(format!("e-worktree-{id}")).spawn(move || {
+        let state = app.state::<AppState>();
+        match ensure_task_worktree(&state, &id) {
+            // The task now runs somewhere else than the sidebar last heard, and
+            // closing it now destroys a worktree, so let the UI catch up.
+            Ok(()) => {
+                let _ = app.emit("e:sessions_changed", serde_json::json!({ "sid": id }));
+            }
+            Err(e) => eprintln!("e: could not prepare a worktree for task {id}: {e}"),
+        }
+    });
+}
+
+fn provision_session_worktree(
+    state: &AppState,
+    meta: engine::sessions::SessionMeta,
+) -> Result<engine::sessions::SessionMeta, String> {
     match create_task_worktree(&meta.workspace, &meta.id) {
         Ok(Some(worktree)) => {
             let mut managed = meta.clone();
@@ -656,13 +755,20 @@ fn provision_session_worktree(
             }
             saved
         }
-        Ok(None) => Ok(meta),
-        Err(e) => {
+        // Not a Git project, so this task simply works in the project folder.
+        // Settled for good: there is nothing to retry on the next run.
+        Ok(None) => {
+            let mut settled = meta.clone();
+            settled.worktree_pending = false;
             if let Ok(mut store) = state.store.lock() {
-                store.remove(&meta.id);
+                store.set_worktree_pending(&meta.id, false);
             }
-            Err(e)
+            Ok(settled)
         }
+        // The task keeps its promise of a worktree and stays pending: the run
+        // that triggered this is refused rather than quietly redirected into
+        // the user's own checkout.
+        Err(e) => Err(e),
     }
 }
 
@@ -761,33 +867,109 @@ fn drop_snapshot_stashes(ws: &str, id: &str) {
     }
 }
 
-#[tauri::command]
-fn delete_session(state: tauri::State<AppState>, id: String) -> Result<(), String> {
+#[tauri::command(async)]
+fn delete_session(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     // Stop the run first: otherwise it keeps streaming into a chat that is gone
     // and re-creates its history file on the next save.
     state.cancel(&id);
-    engine::pty::kill_session(&id);
-    // Read metadata before the chat goes, and let the lock go before shelling
-    // out to git so a slow repo cannot block every other chat.
+    // Read metadata before the chat goes, then drop it from the index straight
+    // away. Everything left is disk work — killing terminals waits on the
+    // children, and `git worktree remove` on a large task is seconds of I/O —
+    // so it happens on its own thread instead of freezing the window behind a
+    // click on Close. A crash mid-clean leaves the worktree behind; the sweep
+    // on the next start collects it.
     let meta = state
         .store
         .lock()
         .map_err(|_| "lock")?
         .session(&id)
         .ok_or_else(|| "session not found".to_string())?;
-    drop_snapshot_stashes(&meta.workspace, &id);
-    remove_task_worktree(&meta)?;
     state.store.lock().map_err(|_| "lock")?.remove(&id);
+    // A speculative build may still be in flight. It finds the task gone when
+    // it tries to record itself and removes what it just made, so the gate is
+    // no longer of any use to anyone.
+    state.forget_worktree_gate(&id);
+    std::thread::Builder::new()
+        .name(format!("e-close-{id}"))
+        .spawn(move || {
+            engine::pty::kill_session(&id);
+            drop_snapshot_stashes(&meta.workspace, &id);
+            if let Err(e) = remove_task_worktree(&meta) {
+                eprintln!("e: could not clean up task {id}: {e}");
+            }
+        })
+        .map_err(|e| format!("could not start cleanup: {e}"))?;
     Ok(())
 }
 
-#[tauri::command]
-fn fork_session(state: tauri::State<AppState>, id: String, name: Option<String>) -> Result<serde_json::Value, String> {
+/// Delete worktrees left behind by tasks that no longer exist.
+///
+/// Closing a task cleans up in the background, so a crash or a kill between
+/// removing the chat and removing its checkout would otherwise leak a folder
+/// and a branch that nothing owns any more.
+fn sweep_orphan_worktrees(state: &AppState) {
+    let live: Vec<String> = match state.store.lock() {
+        Ok(store) => store.sessions.iter().map(|s| s.id.clone()).collect(),
+        Err(_) => return,
+    };
+    sweep_orphan_worktrees_in(&worktrees_root(), &live);
+}
+
+fn sweep_orphan_worktrees_in(root: &std::path::Path, live: &[String]) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if live.iter().any(|s| *s == id) {
+            continue;
+        }
+        let meta = engine::sessions::SessionMeta {
+            id: id.clone(),
+            name: String::new(),
+            created: 0,
+            workspace: path.to_string_lossy().to_string(),
+            project: String::new(),
+            model: String::new(),
+            provider: String::new(),
+            state: String::new(),
+            managed_worktree: true,
+            worktree_base: worktree_base_of(&path).unwrap_or_default(),
+            worktree_branch: format!("e/{id}"),
+            worktree_pending: false,
+        };
+        if let Err(e) = remove_task_worktree_in(&meta, root) {
+            eprintln!("e: could not clean up orphaned worktree '{}': {e}", path.display());
+        }
+    }
+}
+
+/// The repository a worktree belongs to, read from the `gitdir:` pointer git
+/// leaves in the worktree's own `.git` file.
+fn worktree_base_of(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path.join(".git")).ok()?;
+    let gitdir = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?.trim();
+    // <repo>/.git/worktrees/<name> -> <repo>
+    let admin = std::path::Path::new(gitdir);
+    let repo = admin.parent()?.parent()?.parent()?;
+    repo.is_dir().then(|| repo.to_string_lossy().to_string())
+}
+
+#[tauri::command(async)]
+fn fork_session(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String, name: Option<String>) -> Result<serde_json::Value, String> {
+    let pending = state.config().task_worktrees;
     let mut st = state.store.lock().map_err(|_| "lock")?;
-    let meta = st.fork(&id, &name.unwrap_or_default()).ok_or("session not found")?;
-    let use_worktree = state.config().task_worktrees;
+    let meta = st.fork(&id, &name.unwrap_or_default(), pending).ok_or("session not found")?;
     drop(st);
-    let meta = provision_session_worktree(&state, meta, use_worktree)?;
+    if meta.worktree_pending {
+        start_task_worktree(&app, &meta.id);
+    }
     serde_json::to_value(&meta).map_err(|e| e.to_string())
 }
 
@@ -915,10 +1097,19 @@ fn context_budget(state: tauri::State<AppState>, sid: Option<String>) -> u64 {
     }
 }
 
-#[tauri::command]
-fn switch_session(state: tauri::State<AppState>, id: String) -> Result<bool, String> {
-    let mut st = state.store.lock().map_err(|_| "lock")?;
-    Ok(st.switch(&id))
+/// Opening an existing task is also a chance to get its checkout out of the
+/// way: one created while worktrees were switched off, or left pending by a
+/// build that failed, is retried here rather than waiting for the next run.
+#[tauri::command(async)]
+fn switch_session(app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    let switched = {
+        let mut st = state.store.lock().map_err(|_| "lock")?;
+        st.switch(&id)
+    };
+    if switched && task_owes_a_worktree(&state, &id).unwrap_or(false) {
+        start_task_worktree(&app, &id);
+    }
+    Ok(switched)
 }
 
 #[tauri::command]
@@ -1019,6 +1210,20 @@ fn get_status(state: tauri::State<AppState>) -> Status {
     }
 }
 
+/// End a run that never got as far as the agent, leaving the chat in the same
+/// state a failed run would: not running, marked errored, with the reason on
+/// screen instead of a silently idle chat.
+fn abort_run(handle: &tauri::AppHandle, sid: &str, message: &str) {
+    let state = handle.state::<AppState>();
+    state.end_run(sid);
+    if let Ok(mut st) = state.store.lock() {
+        st.set_state(sid, "error");
+    }
+    let emit = AppEmitter { handle: handle.clone(), session: sid.to_string() };
+    emit.error(message);
+    emit.done(false);
+}
+
 #[tauri::command]
 async fn send_text(
     app: tauri::AppHandle,
@@ -1044,38 +1249,11 @@ async fn send_text(
 
     let cancelled = state.begin_run(&session).ok_or("this chat is already running")?;
 
-    let mut config = state.config();
-    let (history, session_ws, session_model, session_prov, project) = match state.store.lock() {
-        Ok(st) => (
-            st.get_history(&session),
-            st.resolved_workspace(&session),
-            st.model(&session),
-            st.provider(&session),
-            st.project_context(&session),
-        ),
-        Err(_) => {
-            state.end_run(&session);
-            return Err("internal lock".into());
-        }
-    };
-    // The chat's own project decides where tools run. Falling back to the
-    // global setting here is what let a chat in one project (or in the
-    // project-less Tasks area) operate on an unrelated project's folder.
-    if !session_ws.is_empty() {
-        config.workspace = session_ws;
-    }
-    if !session_model.is_empty() {
-        // Follow the model to its provider: a chat can be on a model from any
-        // enabled provider, so its base URL and key have to move with it.
-        config.use_model(&session_model, &session_prov);
-    }
-
     if let Ok(mut st) = state.store.lock() {
         st.set_state(&session, "busy");
     }
 
     let images = images.unwrap_or_default();
-    let tools = state.tools.clone();
     let handle = app.clone();
     let save_handle = app.clone();
     let save_sess = session.clone();
@@ -1087,14 +1265,58 @@ async fn send_text(
     std::thread::Builder::new()
         .name(format!("e-run-{session}"))
         .spawn(move || {
+            // Everything the run needs is gathered in this block so the borrow
+            // of `handle` ends before the async body takes ownership of it.
+            let prepared = {
+                let state = handle.state::<AppState>();
+
+                // The task's own worktree is built here, on its first run, not
+                // when it was opened: a checkout of a large project takes
+                // seconds, and that cost belongs behind a chat that is visibly
+                // working rather than in front of the click that created it.
+                match ensure_task_worktree(&state, &run_sess) {
+                    Ok(()) => state
+                        .store
+                        .lock()
+                        .map(|st| {
+                            (
+                                state.config(),
+                                state.tools.clone(),
+                                st.get_history(&run_sess),
+                                st.resolved_workspace(&run_sess),
+                                st.model(&run_sess),
+                                st.provider(&run_sess),
+                                st.project_context(&run_sess),
+                            )
+                        })
+                        .map_err(|_| "internal lock".to_string()),
+                    Err(e) => Err(e),
+                }
+            };
+            let (mut config, tools, history, session_ws, session_model, session_prov, project) =
+                match prepared {
+                    Ok(p) => p,
+                    Err(e) => {
+                        abort_run(&handle, &run_sess, &e);
+                        return;
+                    }
+                };
+            // The chat's own project decides where tools run. Falling back to the
+            // global setting here is what let a chat in one project (or in the
+            // project-less Tasks area) operate on an unrelated project's folder.
+            if !session_ws.is_empty() {
+                config.workspace = session_ws;
+            }
+            if !session_model.is_empty() {
+                // Follow the model to its provider: a chat can be on a model from
+                // any enabled provider, so its base URL and key have to move with
+                // it.
+                config.use_model(&session_model, &session_prov);
+            }
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let state = handle.state::<AppState>();
-                    state.end_run(&run_sess);
-                    let emit = AppEmitter { handle: handle.clone(), session: run_sess.clone() };
-                    emit.error(&format!("could not start run: {e}"));
-                    emit.done(false);
+                    abort_run(&handle, &run_sess, &format!("could not start run: {e}"));
                     return;
                 }
             };
@@ -1124,6 +1346,9 @@ async fn send_text(
         })
         .map_err(|e| {
             state.end_run(&session);
+            if let Ok(mut st) = state.store.lock() {
+                st.set_state(&session, "error");
+            }
             format!("could not start run: {e}")
         })?;
 
@@ -1203,6 +1428,12 @@ fn pane_sid(state: &tauri::State<'_, AppState>, sid: Option<String>) -> Result<S
 /// folder, refusing the empty, relative and missing cases with the same advice
 /// the tools give.
 fn pane_root(state: &tauri::State<'_, AppState>, sid: &str) -> Result<std::path::PathBuf, String> {
+    // A pane is a way into the task's folder, so the task has to have its own
+    // one by now: browsing or running a shell in the project checkout instead
+    // would touch the very files the worktree exists to keep separate. These
+    // commands all run off the UI thread, so building it here costs nothing
+    // visible.
+    ensure_task_worktree(state, sid)?;
     let ws = {
         let store = state.store.lock().map_err(|_| "lock")?;
         store.resolved_workspace(sid)
@@ -1282,6 +1513,7 @@ pub fn run() {
         store: Mutex::new(engine::sessions::SessionStore::new()),
         runs: Mutex::new(HashMap::new()),
         compactions: Mutex::new(HashMap::new()),
+        worktree_gates: Mutex::new(HashMap::new()),
         ui_ready: AtomicBool::new(false),
         close_pending: AtomicBool::new(false),
     };
@@ -1314,6 +1546,13 @@ pub fn run() {
             plugins::init(app.handle().clone());
             approval::init(app.handle().clone());
             engine::pty::init(app.handle().clone());
+            // Closing a task cleans up in the background, so anything a crash
+            // interrupted is still on disk. Collect it now, off the startup
+            // path so a slow repository cannot delay the window.
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || sweep_orphan_worktrees(&h.state::<AppState>()));
+            }
             // MCP servers start against the chat's project folder, so a
             // server told to serve "." serves the project rather than
             // wherever the app was launched from.
@@ -1452,7 +1691,7 @@ mod stash_tests {
 
 #[cfg(test)]
 mod worktree_tests {
-    use super::{create_task_worktree_in, remove_task_worktree_in};
+    use super::{create_task_worktree_in, remove_task_worktree_in, sweep_orphan_worktrees_in, worktree_base_of};
     use crate::engine::sessions::SessionMeta;
     use std::path::Path;
     use std::process::Command;
@@ -1501,10 +1740,57 @@ mod worktree_tests {
             managed_worktree: true,
             worktree_base: task.base,
             worktree_branch: task.branch,
+            worktree_pending: false,
         };
         remove_task_worktree_in(&meta, &worktrees).unwrap();
         assert!(!Path::new(&task.workspace).exists());
         assert!(git(&repo, &["branch", "--list", "e/s-test"]).is_empty());
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    /// A close that was interrupted before its background cleanup finished
+    /// leaves a worktree owned by nobody. The next start has to collect it,
+    /// branch included, without touching the worktrees of live tasks.
+    #[test]
+    fn the_sweep_collects_worktrees_whose_task_is_gone() {
+        let temp = std::env::temp_dir().join(format!(
+            "e-worktree-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = temp.join("repo");
+        let worktrees = temp.join("worktrees");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        git(&repo, &["config", "user.email", "e-tests@example.invalid"]);
+        git(&repo, &["config", "user.name", "e tests"]);
+        std::fs::write(repo.join("README.md"), "test").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "--quiet", "-m", "initial"]);
+
+        let orphan = create_task_worktree_in(repo.to_str().unwrap(), "s-orphan", &worktrees)
+            .unwrap()
+            .expect("Git project");
+        let live = create_task_worktree_in(repo.to_str().unwrap(), "s-live", &worktrees)
+            .unwrap()
+            .expect("Git project");
+
+        // The repository is found from the worktree's own `.git` pointer: the
+        // index entry that knew it is exactly what has been lost.
+        assert_eq!(
+            worktree_base_of(Path::new(&orphan.workspace)).as_deref(),
+            Some(orphan.base.as_str())
+        );
+
+        sweep_orphan_worktrees_in(&worktrees, &["s-live".to_string()]);
+
+        assert!(!Path::new(&orphan.workspace).exists(), "orphan is collected");
+        assert!(git(&repo, &["branch", "--list", "e/s-orphan"]).is_empty(), "its branch goes too");
+        assert!(Path::new(&live.workspace).is_dir(), "a live task is left alone");
+        assert!(git(&repo, &["branch", "--list", "e/s-live"]).contains("e/s-live"));
         let _ = std::fs::remove_dir_all(temp);
     }
 }
