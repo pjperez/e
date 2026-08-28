@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -287,7 +287,7 @@ fn spawn(conf: &ServerConf, workspace: Option<&str>) -> Result<Arc<McpServer>, S
     if conf.command.trim().is_empty() {
         return Err("no \"command\" in mcp.json".to_string());
     }
-    let mut cmd = Command::new(&conf.command);
+    let mut cmd = crate::engine::quiet_command(&conf.command);
     cmd.args(&conf.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     for (k, v) in &conf.env {
         cmd.env(k, v);

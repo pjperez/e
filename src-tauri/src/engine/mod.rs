@@ -12,6 +12,29 @@ pub mod sessions;
 pub mod skills;
 pub mod tools;
 
+/// A `Command` for a child process that must stay invisible.
+///
+/// `e` is a GUI app, so when it starts a console program on Windows —
+/// `powershell`, `git`, an MCP server — the child is handed a brand-new
+/// console, which flashes a window on screen for as long as it runs. Asking
+/// for CREATE_NO_WINDOW suppresses that allocation; the pipes attached for
+/// stdout/stderr are unaffected, so captured output is identical. Every
+/// child the engine starts goes through here so no code path can
+/// reintroduce the flash.
+pub fn quiet_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)] // the mut only matters where creation_flags exists
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// CREATE_NO_WINDOW, from the process-creation-flags documentation.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+
 /// One tool invocation requested by the model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
