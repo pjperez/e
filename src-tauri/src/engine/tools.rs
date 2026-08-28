@@ -259,7 +259,6 @@ impl Tool for PowerShellTool {
         })
     }
     fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        use std::process::Command;
         let cmd = args
             .get("command")
             .and_then(|c| c.as_str())
@@ -273,7 +272,7 @@ impl Tool for PowerShellTool {
         let cwd = ctx.dir()?;
         std::thread::spawn(move || {
             let executable = if cfg!(windows) { "powershell.exe" } else { "pwsh" };
-            let mut c = Command::new(executable);
+            let mut c = crate::engine::quiet_command(executable);
             c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &cmd]);
             c.current_dir(&cwd);
             let _ = tx.send(c.output());

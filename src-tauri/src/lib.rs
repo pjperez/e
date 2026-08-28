@@ -8,7 +8,6 @@ use engine::tools::ToolRegistry;
 use engine::{Emitter, Part, RunSummary, ToolCall, COMPACTION_MARKER, KEEP_RECENT, MIN_COMPACT_GAIN};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter as _, Manager as _};
@@ -132,19 +131,6 @@ impl AppState {
             }
         }
     }
-}
-
-/// Child console programs launched by the GUI must stay invisible on Windows.
-/// Without this flag, each background Git operation briefly opens a cmd window.
-fn hidden_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    command
 }
 
 struct AppEmitter {
@@ -459,7 +445,7 @@ fn workspace_snapshot(state: tauri::State<'_, AppState>, id: String) -> Result<b
         return Ok(false);
     }
     // Use git if available, otherwise skip
-    let out = hidden_command("git")
+    let out = engine::quiet_command("git")
         .args(["stash", "create"])
         .current_dir(&ws)
         .output();
@@ -467,7 +453,7 @@ fn workspace_snapshot(state: tauri::State<'_, AppState>, id: String) -> Result<b
         if o.status.success() {
             let sha = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if !sha.is_empty() {
-                let _ = hidden_command("git")
+                let _ = engine::quiet_command("git")
                     .args(["stash", "store", "-m", &format!("e-snapshot-{id}"), &sha])
                     .current_dir(&ws)
                     .output();
@@ -484,7 +470,7 @@ fn workspace_revert(state: tauri::State<'_, AppState>, id: String) -> Result<boo
     if ws.is_empty() {
         return Ok(false);
     }
-    let out = hidden_command("git")
+    let out = engine::quiet_command("git")
         .args(["checkout", "--", "."])
         .current_dir(&ws)
         .output();
@@ -635,7 +621,7 @@ fn create_task_worktree_in(
     if !base_path.is_dir() || engine::sessions::is_scratch(base) {
         return Ok(None);
     }
-    let repo = hidden_command("git")
+    let repo = engine::quiet_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(base_path)
         .output()
@@ -655,7 +641,7 @@ fn create_task_worktree_in(
         return Err(format!("task worktree already exists: {}", path.display()));
     }
     let branch = format!("e/{session_id}");
-    let out = hidden_command("git")
+    let out = engine::quiet_command("git")
         .args(["worktree", "add", "-b", &branch])
         .arg(&path)
         .arg("HEAD")
@@ -835,7 +821,7 @@ fn remove_task_worktree_in(
             std::fs::remove_dir_all(&path)
                 .map_err(|e| format!("could not delete task worktree '{}': {e}", path.display()))?;
         } else {
-            let out = hidden_command("git")
+            let out = engine::quiet_command("git")
                 .args(["worktree", "remove", "--force"])
                 .arg(&path)
                 .current_dir(base)
@@ -851,13 +837,13 @@ fn remove_task_worktree_in(
             }
         }
     } else if base.is_dir() {
-        let _ = hidden_command("git")
+        let _ = engine::quiet_command("git")
             .args(["worktree", "prune"])
             .current_dir(base)
             .output();
     }
     if base.is_dir() && !meta.worktree_branch.is_empty() {
-        let _ = hidden_command("git")
+        let _ = engine::quiet_command("git")
             .args(["branch", "-D", &meta.worktree_branch])
             .current_dir(base)
             .output();
@@ -878,7 +864,7 @@ fn drop_snapshot_stashes(ws: &str, id: &str) {
         return;
     }
     let tag = format!("e-snapshot-{id}");
-    let Ok(out) = hidden_command("git")
+    let Ok(out) = engine::quiet_command("git")
         .args(["stash", "list", "--format=%gd %gs"])
         .current_dir(ws)
         .output()
@@ -897,7 +883,7 @@ fn drop_snapshot_stashes(ws: &str, id: &str) {
         .collect();
     refs.reverse();
     for r in refs {
-        let _ = hidden_command("git")
+        let _ = engine::quiet_command("git")
             .args(["stash", "drop", r])
             .current_dir(ws)
             .output();
