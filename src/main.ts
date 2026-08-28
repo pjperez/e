@@ -54,6 +54,7 @@ function setYoloIndicator(on: boolean): void {
 // spinner, timer, token counters and queued message into the new one — leaving
 // the new chat stuck in a fake busy state.
 type Approval = { id: string; tool: string; preview: string };
+type WorktreeProgress = { phase: "preparing" | "error"; message: string };
 type ChatUI = {
   running: boolean;
   /** Message typed while this chat was busy; sent to *this* chat when it frees up. */
@@ -90,6 +91,8 @@ type ChatUI = {
   stopping: boolean;
   /** True while history is being summarised, so the UI can say so. */
   compacting: boolean;
+  /** Background checkout progress shown in the chat instead of an OS console. */
+  worktree: WorktreeProgress | null;
   /**
    * A throttled provider call being backed off. Held as a deadline rather than
    * a formatted string so the strip can count the wait down live: a silent
@@ -107,7 +110,8 @@ function ui(sid: string): ChatUI {
       running: false, queued: "", startedAt: 0, activityText: "", activityStep: "",
       liveText: "", liveReason: "",
       baseIn: 0, baseOut: 0, liveIn: 0, liveOut: 0, ctxIn: 0, money: 0, costKnown: false,
-      approval: null, errored: false, sending: false, stopping: false, compacting: false, retry: null,
+      approval: null, errored: false, sending: false, stopping: false, compacting: false,
+      worktree: null, retry: null,
     };
     chatUI.set(sid, s);
   }
@@ -659,12 +663,17 @@ function renderActivity(): void {
   const running = !!s && s.running;
   const approval = s ? s.approval : null;
   const retry = s && !approval ? s.retry : null;
+  const worktree = s && !approval ? s.worktree : null;
 
-  activity.hidden = !running && !approval;
+  activity.hidden = !running && !approval && !worktree;
   if (approval) {
     actText.textContent = `allow ${approval.tool}?`;
     actStep.textContent = approval.preview || "";
     actStep.title = approval.preview || "";
+  } else if (worktree) {
+    actText.textContent = worktree.message;
+    actStep.textContent = "";
+    actStep.title = "";
   } else {
     actText.textContent = retry ? retryLabel(retry) : s ? s.activityText || "thinking…" : "";
     actStep.textContent = s ? s.activityStep : "";
@@ -675,6 +684,7 @@ function renderActivity(): void {
   actSteer.hidden = !running;
   activity.classList.toggle("awaiting", !!approval);
   activity.classList.toggle("retrying", !!retry);
+  activity.classList.toggle("failed", worktree?.phase === "error");
 
   tickTimer();
   if (running && !actTimer) actTimer = window.setInterval(tickTimer, 1000);
@@ -701,10 +711,11 @@ function applyChatUI(): void {
   renderQueued();
   updateInputState();
   updateEmpty();
-  setBusy(isRunning());
+  const preparing = cur().worktree?.phase === "preparing";
+  setBusy(isRunning() || preparing);
   const s = currentSession ? cur() : null;
   statusWrap.classList.toggle("error", !!s && s.errored && !s.running);
-  statusText.textContent = !s ? "ready" : s.running ? "working" : s.errored ? "error" : "ready";
+  statusText.textContent = !s ? "ready" : preparing ? "preparing" : s.running ? "working" : s.errored ? "error" : "ready";
   sbUpdate();
 }
 
@@ -1769,6 +1780,11 @@ async function refreshSessions(): Promise<void> {
   const live = new Set(r.running);
   for (const s of sessions) {
     const u = ui(s.id);
+    // Pending means a worktree is still owed, not that Git is running now. The
+    // backend event is the source of truth for visible provisioning progress.
+    if (!s.worktree_pending) {
+      u.worktree = null;
+    }
     if (u.sending) continue; // send in flight, not registered yet
     u.running = live.has(s.id);
     if (!u.running && u.startedAt) {
@@ -1789,6 +1805,7 @@ async function refreshSessions(): Promise<void> {
   for (const id of [...chatUI.keys()]) if (!alive.has(id)) chatUI.delete(id);
 
   renderSessions();
+  if (currentSession) renderActivity();
   await updateWorkspaceLabel();
 }
 
@@ -3476,6 +3493,22 @@ function confirmModal(msg: string, title = "Confirm", yesLabel = "Yes", noLabel 
 /// the folder it runs in and makes closing it destructive. Re-read the list so
 /// the sidebar — and the confirmation it shows on Close — tell the truth.
 api.onSessionsChanged(() => void refreshSessions());
+
+api.onWorktreeStatus((status) => {
+  const s = ui(status.sid);
+  s.worktree = status.phase === "ready"
+    ? null
+    : { phase: status.phase, message: status.message };
+  if (status.sid === currentSession) {
+    renderActivity();
+    updateEmpty();
+    const preparing = s.worktree?.phase === "preparing";
+    setBusy(s.running || preparing);
+    statusText.textContent = preparing ? "preparing" : s.errored ? "error" : s.running ? "working" : "ready";
+  } else if (status.phase === "error") {
+    notify(`“${sessionName(status.sid)}”: ${status.message}`, "error");
+  }
+});
 
 /// The window's close button is intercepted in Rust so quitting always asks
 /// first — closing mid-run loses the work in flight and used to leave that

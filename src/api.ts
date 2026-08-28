@@ -286,6 +286,12 @@ export type SessionMetaItem = {
   worktree_pending?: boolean;
 };
 
+export type WorktreeStatus = {
+  sid: string;
+  phase: "preparing" | "ready" | "error";
+  message: string;
+};
+
 export async function listSessions(): Promise<{ sessions: SessionMetaItem[]; current: string; running: string[] }> {
   if (!inTauri) return { sessions: [], current: "", running: [] };
   const r = await invoke<{ sessions: SessionMetaItem[]; current: string; running?: string[] }>("list_sessions");
@@ -393,6 +399,16 @@ export function onSessionsChanged(cb: () => void): Unlisten {
   void (async () => {
     const evt = await import("@tauri-apps/api/event");
     un = await evt.listen("e:sessions_changed", () => cb());
+  })();
+  return () => un();
+}
+
+export function onWorktreeStatus(cb: (status: WorktreeStatus) => void): Unlisten {
+  if (!inTauri) return () => undefined;
+  let un: Unlisten = () => undefined;
+  void (async () => {
+    const evt = await import("@tauri-apps/api/event");
+    un = await evt.listen<WorktreeStatus>("e:worktree_status", (e) => cb(e.payload));
   })();
   return () => un();
 }

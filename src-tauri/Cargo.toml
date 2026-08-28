@@ -1,6 +1,6 @@
 [package]
 name = "e"
-version = "0.1.1"
+version = "0.1.2"
 description = "e — a minimalist, fast, extensible agent harness GUI"
 edition = "2021"
 default-run = "e"
