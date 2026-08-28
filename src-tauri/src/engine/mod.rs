@@ -4,6 +4,7 @@ pub mod agent;
 pub mod approval;
 pub mod browse;
 pub mod credentials;
+pub mod jobs;
 pub mod mcp;
 pub mod plugins;
 pub mod provider;

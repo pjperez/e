@@ -1,7 +1,17 @@
 use serde_json::{json, Value};
+use std::time::Duration;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
+use crate::engine::jobs;
+
+/// Upper bound on how much captured output one synchronous command returns.
+/// The old implementation returned everything it printed; a chatty build
+/// could drown the transcript. 100k chars matches the read_file cap's order
+/// of magnitude, and anything bigger genuinely needs the background path.
+const SYNC_MAX: usize = 100_000;
 
 /// Minimal context handed to every tool when it runs.
 #[derive(Clone)]
@@ -81,6 +91,8 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let r = ToolRegistry { tools: Mutex::new(HashMap::new()), plugin_tools: Mutex::new(Vec::new()) };
         r.register(PowerShellTool);
+        r.register(ProcessPollTool);
+        r.register(ProcessKillTool);
         r.register(ReadFileTool);
         r.register(WriteFileTool);
         r.register(ListDirTool);
@@ -241,19 +253,44 @@ impl Default for ToolRegistry {
 // Built-in tools
 // ---------------------------------------------------------------------------
 
+/// Format captured stdout/stderr for a synchronous command result, keeping
+/// the shape the model already knows: stdout, an optional [stderr] section,
+/// then the exit code. Oversized output is trimmed at the front with a note.
+fn format_sync_output(out: &jobs::Taken, err: &jobs::Taken, code: i32) -> String {
+    let mut m = String::new();
+    if !out.text.trim().is_empty() {
+        m.push_str(&out.text);
+    }
+    if !err.text.trim().is_empty() {
+        m.push_str(&format!("\n[stderr]\n{}", err.text.trim_end()));
+    }
+    if m.trim().is_empty() {
+        m = "(no output)".to_string();
+    }
+    if out.skipped > 0 {
+        m = format!("[… truncated {} earlier bytes of stdout]\n{}", out.skipped, m);
+    }
+    if err.skipped > 0 {
+        m.push_str(&format!("\n[… {} earlier bytes of stderr were truncated]", err.skipped));
+    }
+    m.push_str(&format!("\n[exit code {code}]"));
+    m
+}
+
 pub struct PowerShellTool;
 impl Tool for PowerShellTool {
     fn name(&self) -> &str {
         "powershell"
     }
     fn description(&self) -> &str {
-        "Run a PowerShell command in the session workspace and return stdout, stderr and exit code. Bash, cmd.exe, and POSIX shell syntax are not supported."
+        "Run a PowerShell command in the session workspace and return stdout, stderr and exit code. Blocks at most 120s; pass background:true for anything that may run longer (builds, deploys, dev servers) to start it as a background job and get a job id back immediately — then poll it with process_poll. Bash, cmd.exe, and POSIX shell syntax are not supported."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "The PowerShell command to execute." }
+                "command": { "type": "string", "description": "The PowerShell command to execute." },
+                "background": { "type": "boolean", "description": "Run as a background job: return a job id immediately instead of blocking, then poll with process_poll." }
             },
             "required": ["command"]
         })
@@ -268,40 +305,137 @@ impl Tool for PowerShellTool {
         if cmd.is_empty() {
             return Err("empty command".to_string());
         }
-        let (tx, rx) = mpsc::channel();
         let cwd = ctx.dir()?;
-        std::thread::spawn(move || {
-            let executable = if cfg!(windows) { "powershell.exe" } else { "pwsh" };
-            let mut c = crate::engine::quiet_command(executable);
-            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &cmd]);
-            c.current_dir(&cwd);
-            let _ = tx.send(c.output());
-        });
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-        let out = rx
-            .recv_timeout(TIMEOUT)
-            .map_err(|_| "command timed out after 120s".to_string())?
-            .map_err(|e| format!("failed to start: {e}"))?;
+        if args.get("background").and_then(|b| b.as_bool()).unwrap_or(false) {
+            let id = jobs::start(&cwd, &cmd)?;
+            return Ok(format!(
+                "[job {id}] started in the background; the command keeps running.\nPoll with process_poll(id=\"{id}\", wait_ms=20000) for progress — its wait blocks so one long poll beats many short ones — and stop it with process_kill(id=\"{id}\") if needed."
+            ));
+        }
+        run_sync(&cwd, &cmd)
+    }
+}
 
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        let code = out.status.code().unwrap_or(-1);
-        let mut m = String::new();
-        if !stdout.trim().is_empty() {
-            m.push_str(&stdout);
+/// Run a command to completion (or 120s), capturing output as it prints so a
+/// timeout can report what the command managed to say before dying — and
+/// kill it, instead of leaving an orphan no one can account for.
+fn run_sync(cwd: &std::path::Path, cmd: &str) -> ToolResult {
+    use std::process::Stdio;
+
+    let mut c = crate::engine::quiet_command(jobs::shell_executable());
+    c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd]);
+    c.current_dir(cwd);
+    c.stdin(Stdio::null());
+    c.stdout(Stdio::piped());
+    c.stderr(Stdio::piped());
+    let mut child = c.spawn().map_err(|e| format!("failed to start: {e}"))?;
+    let stdout = child.stdout.take().ok_or("command has no stdout pipe")?;
+    let stderr = child.stderr.take().ok_or("command has no stderr pipe")?;
+    let pid = child.id();
+
+    let out_cap = Arc::new(Mutex::new(jobs::Capture::new()));
+    let err_cap = Arc::new(Mutex::new(jobs::Capture::new()));
+    let r1 = jobs::spawn_reader(stdout, out_cap.clone());
+    let r2 = jobs::spawn_reader(stderr, err_cap.clone());
+
+    // The child is waited on in a thread so this thread can bound the wait;
+    // the pid stays here so a timeout can actually kill the tree.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        let _ = tx.send(code);
+    });
+
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    match rx.recv_timeout(TIMEOUT) {
+        Ok(code) => {
+            // Join the readers with a budget: on the happy path the pipes are
+            // already at EOF and this returns at once, but a grandchild that
+            // inherited a write end must not hang the tool forever.
+            jobs::drain(vec![r1, r2], Duration::from_secs(5));
+            let out = out_cap.lock().unwrap_or_else(|e| e.into_inner()).tail(SYNC_MAX);
+            let err = err_cap.lock().unwrap_or_else(|e| e.into_inner()).tail(SYNC_MAX);
+            let m = format_sync_output(&out, &err, code);
+            if code != 0 {
+                Err(m)
+            } else {
+                Ok(m)
+            }
         }
-        if !stderr.trim().is_empty() {
-            m.push_str(&format!("\n[stderr]\n{}", stderr.trim_end()));
-        }
-        if m.trim().is_empty() {
-            m = "(no output)".to_string();
-        }
-        m.push_str(&format!("\n[exit code {}]", code));
-        if code != 0 {
+        Err(_) => {
+            jobs::kill_tree(pid);
+            // Give the pipes a moment to finish draining after the kill so
+            // the tail carries the command's last words, not everything but.
+            jobs::drain(vec![r1, r2], Duration::from_secs(5));
+            let out = out_cap.lock().unwrap_or_else(|e| e.into_inner()).tail(jobs::MAX_POLL);
+            let err = err_cap.lock().unwrap_or_else(|e| e.into_inner()).tail(jobs::MAX_POLL);
+            let mut m = format!(
+                "command timed out after 120s and was killed (process tree terminated). Output before the kill:"
+            );
+            if out.text.trim().is_empty() && err.text.trim().is_empty() {
+                m.push_str("\n(it printed nothing)");
+            } else {
+                if !out.text.trim().is_empty() {
+                    m.push_str(&format!("\n{}", out.text));
+                }
+                if !err.text.trim().is_empty() {
+                    m.push_str(&format!("\n[stderr]\n{}", err.text.trim_end()));
+                }
+            }
             Err(m)
-        } else {
-            Ok(m)
         }
+    }
+}
+
+/// Long-poll one background job: block up to `wait_ms` for new output or
+/// exit, then report status plus everything printed since the last poll.
+pub struct ProcessPollTool;
+impl Tool for ProcessPollTool {
+    fn name(&self) -> &str {
+        "process_poll"
+    }
+    fn description(&self) -> &str {
+        "Poll a background job started with powershell background:true. Blocks up to wait_ms (default 20000, max 25000) waiting for new output or exit, then returns the job's status and everything it printed since the previous poll. Prefer one long poll over repeated immediate ones, and do other work between polls instead of spinning."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Job id returned by powershell background:true." },
+                "wait_ms": { "type": "integer", "description": "How long to wait for new output or exit before reporting (ms). Default 20000, max 25000." }
+            },
+            "required": ["id"]
+        })
+    }
+    fn run(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
+        let id = args.get("id").and_then(|i| i.as_str()).ok_or("missing 'id'")?;
+        let wait_ms = args.get("wait_ms").and_then(|w| w.as_u64()).unwrap_or(20_000);
+        let wait = std::time::Duration::from_millis(wait_ms.clamp(0, jobs::MAX_WAIT.as_millis() as u64));
+        jobs::poll(id, wait)
+    }
+}
+
+/// Stop a background job's whole process tree.
+pub struct ProcessKillTool;
+impl Tool for ProcessKillTool {
+    fn name(&self) -> &str {
+        "process_kill"
+    }
+    fn description(&self) -> &str {
+        "Kill a background job started with powershell background:true — the process and everything it spawned. Use when a job is stuck, failed, or no longer needed. Poll the id afterwards to see its final output."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Job id returned by powershell background:true." }
+            },
+            "required": ["id"]
+        })
+    }
+    fn run(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
+        let id = args.get("id").and_then(|i| i.as_str()).ok_or("missing 'id'")?;
+        jobs::kill(id)
     }
 }
 
@@ -493,8 +627,20 @@ pub fn run_tool(reg: &ToolRegistry, ctx: &ToolContext, name: &str, args: Value) 
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+
     fn ctx(ws: &str) -> ToolContext {
         ToolContext { workspace: PathBuf::from(ws) }
+    }
+
+    /// Pull the job id out of the powershell background:true message. The id
+    /// sits inside "[job bg-…] started in the background", so a naive
+    /// split_whitespace picks up the trailing ']'.
+    fn extract_id(out: &str) -> String {
+        out.split_whitespace()
+            .find(|w| w.starts_with("bg-"))
+            .map(|w| w.trim_end_matches(']').to_string())
+            .expect("job id in output")
     }
 
     /// A relative workspace resolves against wherever the app happened to be
@@ -593,5 +739,124 @@ mod tests {
         reg.unregister_prefix("mcp_");
         assert!(!reg.names().iter().any(|n| n.starts_with("mcp_")));
         assert!(reg.get("powershell").is_some(), "built-ins must survive");
+    }
+
+    // -- background flag / poll / kill ---------------------------------------
+
+    #[test]
+    fn the_process_tools_are_registered() {
+        let reg = ToolRegistry::new();
+        assert!(reg.get("process_poll").is_some());
+        assert!(reg.get("process_kill").is_some());
+    }
+
+    #[test]
+    fn background_true_returns_a_job_id_without_running_the_command_to_completion() {
+        let dir = std::env::temp_dir();
+        let started = std::time::Instant::now();
+        let (ok, out) = run_tool(
+            &ToolRegistry::new(),
+            &ctx(dir.to_str().unwrap()),
+            "powershell",
+            json!({ "command": "Start-Sleep -Seconds 30", "background": true }),
+        );
+        assert!(ok, "{out}");
+        assert!(out.contains("started in the background"), "{out}");
+        let id = extract_id(&out);
+        assert!(started.elapsed() < Duration::from_secs(10), "must not block: {out}");
+        // Clean up so the test run does not leave a sleeping shell behind.
+        assert!(jobs::kill(&id).is_ok());
+    }
+
+    #[test]
+    fn the_full_background_cycle_works_end_to_end() {
+        let reg = ToolRegistry::new();
+        let dir = std::env::temp_dir();
+        let (ok, out) = run_tool(
+            &reg,
+            &ctx(dir.to_str().unwrap()),
+            "powershell",
+            json!({ "command": "Write-Output cycle-marker", "background": true }),
+        );
+        assert!(ok, "{out}");
+        let id = extract_id(&out);
+
+        // Poll blocks for new output / exit and reports both.
+        let (ok, poll_out) = run_tool(&reg, &ctx(dir.to_str().unwrap()), "process_poll", json!({ "id": id, "wait_ms": 20000 }));
+        assert!(ok, "{poll_out}");
+        assert!(poll_out.contains("exited with code 0"), "{poll_out}");
+        assert!(poll_out.contains("cycle-marker"), "{poll_out}");
+    }
+
+    #[test]
+    fn polling_a_made_up_id_fails_with_a_readable_error() {
+        let (ok, out) = run_tool(
+            &ToolRegistry::new(),
+            &ctx(std::env::temp_dir().to_str().unwrap()),
+            "process_poll",
+            json!({ "id": "bg-nope" }),
+        );
+        assert!(!ok);
+        assert!(out.contains("no such background job"), "{out}");
+    }
+
+    /// The synchronous path keeps its contract: real output, exit code, and
+    /// a non-zero exit surfaced as an error.
+    #[test]
+    fn sync_commands_still_return_output_and_exit_code() {
+        let dir = std::env::temp_dir();
+        let (ok, out) = run_tool(
+            &ToolRegistry::new(),
+            &ctx(dir.to_str().unwrap()),
+            "powershell",
+            json!({ "command": "Write-Output sync-marker; Write-Error boom -ErrorAction Continue" }),
+        );
+        assert!(!ok, "a failing command must be an Err: {out}");
+        assert!(out.contains("sync-marker"), "{out}");
+        assert!(out.contains("boom"), "stderr must be included: {out}");
+        assert!(out.contains("[exit code 1]") || out.contains("[exit code"), "{out}");
+    }
+
+    /// Output is captured as it prints, so a command that is killed at the
+    /// cap still reports what it said before dying. (Uses the same machinery
+    /// with a short timeout by going through jobs directly.)
+        /// Output that has already been read into the capture survives a kill.
+    /// A force-kill can lose output still buffered in the dying process, so
+    /// the command holds the marker long enough for the reader to drain it
+    /// before the kill lands.
+        /// Output that has already been read into the capture survives a kill.
+    /// A force-kill can lose output still buffered in the dying process, so
+    /// the command holds the marker long enough for the reader to drain it
+    /// before the kill lands. The single post-kill poll blocks until the
+    /// status flips, then renders the unconsumed marker in the same call —
+    /// a polling loop would consume the marker on an early "running" poll.
+        /// Output that has already been read into the capture survives a kill.
+    /// A force-kill can lose output still buffered in the dying process, so
+    /// the command holds the marker long enough for the reader to drain it
+    /// before the kill lands. Polls accumulate across calls, because an early
+    /// poll can consume the marker while the kill is still settling.
+    #[test]
+    fn output_printed_before_a_kill_is_not_lost() {
+        let dir = std::env::temp_dir();
+        let id = jobs::start(
+            &dir,
+            "Write-Output dying-words; Start-Sleep -Milliseconds 800; Start-Sleep -Seconds 60",
+        )
+        .expect("start");
+        // Let the reader thread drain the marker into the capture before the
+        // kill, so the assertion is on the drained tail, not a race with it.
+        std::thread::sleep(Duration::from_millis(2000));
+        let _ = jobs::kill(&id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut seen = String::new();
+        loop {
+            let out = jobs::poll(&id, Duration::from_millis(500)).expect("poll");
+            seen.push_str(&out);
+            if out.contains("killed by request") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "never killed: {out}");
+        }
+        assert!(seen.contains("dying-words"), "the tail must survive the kill: {seen}");
     }
 }

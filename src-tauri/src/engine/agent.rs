@@ -715,7 +715,7 @@ impl Agent {
     /// written before this context existed) would otherwise keep quoting the
     /// old, wrong location forever.
     fn sync_system(&mut self) {
-        let hint = format!("{}\n\n{}", platform_hint(), self.project_block());
+        let hint = format!("{}\n\n{}\n\n{}", platform_hint(), self.project_block(), crate::engine::jobs::AGENT_HINT);
         let body = if self.config.system.trim().is_empty() {
             hint
         } else {
