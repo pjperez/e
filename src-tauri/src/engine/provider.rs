@@ -24,8 +24,11 @@ const BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// How long a connected-but-silent provider is given before we call it dead.
 /// `connect_timeout` only covers getting the socket up; once a provider has
 /// accepted the connection nothing else bounds how long it may say nothing,
-/// and a stall there used to hang the run forever.
-const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// and a stall there used to hang the run forever. Generous on purpose:
+/// reasoning models can legitimately think for minutes before their first
+/// token, and that silence is indistinguishable from a dead socket until the
+/// first byte lands.
+const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often a pending network await is interrupted to look at the cancel
 /// flag. Short enough that Stop feels immediate, long enough to be free.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -76,7 +79,8 @@ pub struct RetryNotice {
     pub max_attempts: u32,
     /// How long we are about to wait before trying again.
     pub delay: Duration,
-    /// HTTP status that triggered the retry.
+    /// HTTP status that triggered the retry, or 0 when no response arrived at
+    /// all (transport failure).
     pub status: u16,
     /// Short human-readable cause, e.g. "rate limited".
     pub reason: String,
@@ -113,6 +117,12 @@ impl ChatProvider {
             reasoning_effort: reasoning_effort.map(|e| e.trim().to_string()).filter(|e| !e.is_empty()),
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
+                // Half-open pooled connections outlive the provider's NAT entry
+                // and resurface as "error sending request" on the next turn of
+                // a long session; keepalive refreshes them and the idle timeout
+                // retires them before the far end forgets they exist.
+                .tcp_keepalive(std::time::Duration::from_secs(60))
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .build()
                 .expect("reqwest client"),
         }
@@ -225,10 +235,11 @@ impl ChatProvider {
     /// Stop takes effect mid-response instead of after the model finishes; the
     /// partial text produced so far is still returned.
     ///
-    /// A throttled (429) or unavailable (5xx) provider is retried up to
-    /// [`MAX_RETRIES`] times on an escalating schedule with jitter, and each
-    /// wait is announced through `on_retry` so the caller can tell the user
-    /// what is going on rather than showing a stall.
+    /// A throttled (429), unavailable (5xx) or transport-failed (connection
+    /// reset before any body arrived) request is retried up to [`MAX_RETRIES`]
+    /// times on an escalating schedule with jitter, and each wait is announced
+    /// through `on_retry` so the caller can tell the user what is going on
+    /// rather than showing a stall.
     pub async fn chat<F, G, H>(
         &self,
         msgs: &[Msg],
@@ -271,7 +282,7 @@ impl ChatProvider {
             }
 
             let resp = match guarded(req.json(&body).send(), cancelled).await {
-                Guarded::Ready(r) => r.map_err(|e| format!("request failed: {e}"))?,
+                Guarded::Ready(r) => r,
                 Guarded::Cancelled => {
                     return Ok(Completion { text: String::new(), tool_calls: Vec::new(), usage: (0, 0), cost: None, reasoning: String::new() })
                 }
@@ -280,6 +291,32 @@ impl ChatProvider {
                         "provider did not respond within {}s",
                         STALL_TIMEOUT.as_secs()
                     ))
+                }
+            };
+            // The connection itself failed before any response arrived:
+            // reset, TLS drop, DNS blip, or a timeout between request and
+            // headers. Same transient class as a 5xx, and retry-safe for the
+            // same reason: not one byte of the response has been read. Long
+            // streaming requests to a distant edge attract these, and one
+            // blip must not kill a turn that has been running for minutes.
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt >= max_attempts {
+                        return Err(format!("request failed after {attempt} attempts: {e}"));
+                    }
+                    let delay = backoff_delay(attempt);
+                    on_retry(&RetryNotice {
+                        attempt,
+                        max_attempts,
+                        delay,
+                        status: 0,
+                        reason: "connection error".into(),
+                    });
+                    if !sleep_cancellable(delay, cancelled).await {
+                        return Ok(Completion { text: String::new(), tool_calls: Vec::new(), usage: (0, 0), cost: None, reasoning: String::new() });
+                    }
+                    continue;
                 }
             };
             let status = resp.status();
@@ -848,5 +885,65 @@ mod tests {
 
         let blank = ChatProvider::new("https://x.test/v1".into(), String::new(), "m".into(), 0.7, Some("  ".into()));
         assert!(blank.reasoning_effort.is_none(), "an empty level is no level at all");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_before_any_response_is_retried_and_the_turn_survives() {
+        // A local endpoint that kills the first connection outright and answers
+        // the second with a minimal SSE stream. This is the shape of the
+        // transport failure that used to abort a whole turn: the socket closes
+        // before a single response byte, so there is no status to branch on
+        // and not a byte of output to duplicate.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let mut s = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                if i == 0 {
+                    // Vanish before answering: the client must see a transport
+                    // error, not an HTTP status.
+                    drop(s);
+                } else {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    drop(s);
+                    break;
+                }
+            }
+        });
+
+        let retries: std::sync::Arc<std::sync::Mutex<Vec<(u16, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&retries);
+        let provider = ChatProvider::new(format!("http://{addr}"), String::new(), "m".into(), 0.7, None);
+        let out = provider
+            .chat(
+                &[Msg::text("user", "hi")],
+                &[],
+                |_| {},
+                |_| {},
+                move |n| seen.lock().expect("lock").push((n.status, n.reason.clone())),
+                &AtomicBool::new(false),
+            )
+            .await
+            .expect("turn survives a dropped connection");
+
+        assert_eq!(out.text, "hi");
+        let seen = retries.lock().expect("lock");
+        assert_eq!(seen.len(), 1, "exactly one retry for the dropped connection");
+        assert_eq!(seen[0].0, 0, "a transport failure has no HTTP status");
+        assert_eq!(seen[0].1, "connection error");
     }
 }
