@@ -1683,6 +1683,7 @@ pub fn run() {
         // operation fail for no visible reason.
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
+                engine::jobs::shutdown_all();
                 engine::pty::shutdown();
             }
         });
