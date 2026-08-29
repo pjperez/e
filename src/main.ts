@@ -291,6 +291,10 @@ function setText(t: Turn): void {
 /// stylesheet's `.think` rules instead of the three copies of inline CSS this
 /// used to carry around.
 ///
+/// The `<span class="pac">` between the label and the preview is Pac-Man: he
+/// faces the preview text — which slides leftward as reasoning is pushed in —
+/// and chomps while the panel is .live. Drawn in style.css under "Pac-Man".
+///
 /// Always starts collapsed, including while reasoning is still streaming: an
 /// open panel shoves the actual answer off screen for as long as the model
 /// thinks. The summary carries a one-line preview so a collapsed panel still
@@ -299,7 +303,7 @@ function thinkBody(t: Turn): HTMLElement {
   if (!t.thinkEl) {
     const d = document.createElement("details");
     d.className = "think live";
-    d.innerHTML = `<summary>Thinking<span class="think-preview"></span></summary><div class="think-body"></div>`;
+    d.innerHTML = `<summary>Thinking<span class="pac" aria-hidden="true"></span><span class="think-preview"></span></summary><div class="think-body"></div>`;
     t.body.insertBefore(d, t.textEl);
     t.thinkEl = d;
   }
