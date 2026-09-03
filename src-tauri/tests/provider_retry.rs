@@ -187,3 +187,65 @@ async fn stop_during_a_backoff_takes_effect_immediately() {
         started.elapsed()
     );
 }
+
+/// Identification is the whole reason a request can be refused at the door:
+/// capture the raw request line and headers of a simple call and make sure the
+/// client announces itself and its conversation.
+#[tokio::test]
+async fn every_request_identifies_itself_and_its_session() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let sink = seen.clone();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let mut buf = [0u8; 4096];
+        let mut raw = Vec::new();
+        // Consume the whole request — headers and body — before replying, the
+        // same courtesy the other servers here extend; replying early can
+        // surface as a transport error and hide what is being tested.
+        loop {
+            let done = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|h| {
+                let headers = String::from_utf8_lossy(&raw[..h]).to_ascii_lowercase();
+                let len: usize = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                raw.len() >= h + 4 + len
+            });
+            if done == Some(true) {
+                break;
+            }
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => raw.extend_from_slice(&buf[..k]),
+            }
+        }
+        *sink.lock().expect("lock") = String::from_utf8_lossy(&raw).to_string();
+        let _ = sock.write_all(streamed("ok").as_bytes());
+        let _ = sock.flush();
+    });
+
+    let never = AtomicBool::new(false);
+    let got = ChatProvider::with_session(
+        format!("http://127.0.0.1:{port}"),
+        String::new(),
+        "test-model".into(),
+        1.0,
+        None,
+        "s-chat42".into(),
+    )
+    .chat(&prompt(), &[], |_| {}, |_| {}, |_| {}, &never)
+    .await
+    .expect("the provider answers");
+    assert_eq!(got.text, "ok");
+    server.join().expect("server thread");
+
+    let raw = seen.lock().expect("lock").clone();
+    assert!(raw.to_ascii_lowercase().contains("user-agent: e/"), "request carried: {raw}");
+    assert!(
+        raw.to_ascii_lowercase().contains("x-opencode-session: s-chat42"),
+        "request carried: {raw}"
+    );
+}

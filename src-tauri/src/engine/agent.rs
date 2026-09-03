@@ -479,8 +479,20 @@ impl Config {
     }
 }
 
+/// How the model is told to identify `e`'s traffic. A gateway used through this
+/// harness (OpenCode Go among them) groups and gates requests per client, and
+/// errors requests it cannot attribute: the shell tool downloads as bare `curl`
+/// unless told otherwise, and an unnamed agent looks like exactly that.
+const IDENTIFICATION_HINT: &str = "IDENTIFICATION: identify e's traffic everywhere.
+- HTTP requests made via the powershell tool MUST carry these two headers (use Invoke-WebRequest's -Headers, curl.exe's -H):
+  - a User-Agent naming this tool: `e/{version} ({os}; {arch})` - e.g. `e/0.1.2 (windows; aarch64)`.
+  - `x-opencode-session: {session-id}` - one stable id per conversation or task, e.g. the working session's id. Never send it empty.
+- Never use curl's default identity for e's work: an unattributed request may be rejected outright by the gateway.
+- Scripts or subagents you spawn must be told the same two rules.";
+
 /// Auto-detected platform note, injected dynamically at each startup so it
 /// always matches the OS the harness is running on right now.
+
 fn platform_hint() -> String {
     let arch = std::env::consts::ARCH;
     if cfg!(windows) {
@@ -632,6 +644,9 @@ impl Agent {
     /// Build an agent that shares an existing tool registry. Used per run so
     /// concurrent sessions never fight over one mutable agent.
     pub fn with_tools(config: Config, tools: Arc<ToolRegistry>) -> Self {
+        // Built with the install-stable anonymous id; a host that runs on behalf
+        // of a chat overrides `provider.session` (see `lib.rs`) so the gateway
+        // sees one id per conversation.
         let provider = ChatProvider::new(
             config.base_url.clone(),
             config.api_key.clone(),
@@ -707,6 +722,21 @@ impl Agent {
         }
     }
 
+    /// Identification lines for the system prompt: the user agent to send and
+    /// the session header gateways expect, spelled with this process's real
+    /// values so the model copies them instead of inventing its own.
+    fn identification_hint(&self) -> String {
+        let ver = env!("CARGO_PKG_VERSION");
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        let session = crate::engine::identity::session_id(&self.provider.session);
+        IDENTIFICATION_HINT
+            .replace("{version}", ver)
+            .replace("{os}", os)
+            .replace("{arch}", arch)
+            .replace("{session-id}", session)
+    }
+
     /// Put platform + project context at the top of the conversation, replacing
     /// any earlier copy.
     ///
@@ -715,7 +745,13 @@ impl Agent {
     /// written before this context existed) would otherwise keep quoting the
     /// old, wrong location forever.
     fn sync_system(&mut self) {
-        let hint = format!("{}\n\n{}\n\n{}", platform_hint(), self.project_block(), crate::engine::jobs::AGENT_HINT);
+        let hint = format!(
+            "{}\n\n{}\n\n{}\n\n{}",
+            platform_hint(),
+            self.project_block(),
+            crate::engine::jobs::AGENT_HINT,
+            self.identification_hint()
+        );
         let body = if self.config.system.trim().is_empty() {
             hint
         } else {
@@ -1285,5 +1321,22 @@ mod tests {
         assert!(!system_of(&a).contains("somewhere-else"), "{}", system_of(&a));
         assert!(system_of(&a).contains("C:/src/mascot"));
         assert_eq!(h[1].plain_text_parts(), "hi");
+    }
+
+    /// The model's own downloads are traffic the harness cannot header
+    /// itself, so the prompt has to spell out the identity to send - with
+    /// this session's real id, not a placeholder the model must guess at.
+    #[test]
+    fn the_system_prompt_teaches_the_model_to_identify_its_requests() {
+        let mut a = agent(
+            "C:/src/mascot",
+            ProjectContext { name: "mascot".into(), scratch: false, detached: false },
+        );
+        a.provider.session = "s-chat42".into();
+        a.sync_system();
+        let s = system_of(&a);
+        assert!(s.contains("IDENTIFICATION"), "{s}");
+        assert!(s.contains("x-opencode-session: s-chat42"), "{s}");
+        assert!(s.contains("User-Agent"), "{s}");
     }
 }
