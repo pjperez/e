@@ -98,6 +98,10 @@ pub struct ChatProvider {
     /// Reasoning level to ask for. `None` leaves the field out of the request
     /// entirely, so providers that don't take one are never sent it.
     pub reasoning_effort: Option<String>,
+    /// The conversation this provider calls for, sent as a session header so a
+    /// gateway can group a chat's requests together. A stable-per-process
+    /// default covers callers that have no chat of their own.
+    pub session: String,
     pub client: reqwest::Client,
 }
 
@@ -109,14 +113,37 @@ impl ChatProvider {
         temperature: f64,
         reasoning_effort: Option<String>,
     ) -> Self {
+        Self::with_session(
+            base_url,
+            api_key,
+            model,
+            temperature,
+            reasoning_effort,
+            crate::engine::identity::anonymous_session().to_string(),
+        )
+    }
+
+    /// Like ChatProvider::new, but for a caller that knows which conversation
+    /// it serves. Every header that identifies us to the provider is set once
+    /// here, on the client, so no request path can forget one.
+    pub fn with_session(
+        base_url: String,
+        api_key: String,
+        model: String,
+        temperature: f64,
+        reasoning_effort: Option<String>,
+        session: String,
+    ) -> Self {
         ChatProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
             temperature,
             reasoning_effort: reasoning_effort.map(|e| e.trim().to_string()).filter(|e| !e.is_empty()),
+            session,
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
+                .user_agent(crate::engine::identity::agent())
                 // Half-open pooled connections outlive the provider's NAT entry
                 // and resurface as "error sending request" on the next turn of
                 // a long session; keepalive refreshes them and the idle timeout
@@ -277,6 +304,10 @@ impl ChatProvider {
         let resp = loop {
             attempt += 1;
             let mut req = self.client.post(self.url()).header("Accept", "text/event-stream");
+            // Identify the conversation on every attempt — retries included —
+            // even when this provider has no chat id of its own. The header is
+            // spelled by the gateway that requires it; see `identity`.
+            req = req.header(crate::engine::identity::SESSION_HEADER, crate::engine::identity::session_id(&self.session));
             if !self.api_key.is_empty() {
                 req = req.bearer_auth(&self.api_key);
             }

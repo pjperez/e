@@ -1048,7 +1048,7 @@ async fn compact_session(app: tauri::AppHandle, state: tauri::State<'_, AppState
 
     // Read before the config is taken apart to build the connection.
     let effort = client_cfg.active_reasoning_effort();
-    let provider = engine::provider::ChatProvider::new(
+    let provider = engine::provider::ChatProvider::with_session(
         client_cfg.base_url,
         client_cfg.api_key,
         client_cfg.model,
@@ -1056,6 +1056,7 @@ async fn compact_session(app: tauri::AppHandle, state: tauri::State<'_, AppState
         // Summarising with the chat's own model means its own reasoning level
         // too, so compaction can't fail against a model that requires one.
         effort,
+        id.clone(),
     );
     let prompt = vec![Msg::text(
         "user",
@@ -1199,9 +1200,15 @@ async fn refresh_models(
     provider: engine::agent::ProviderItem,
 ) -> Result<engine::agent::ProviderItem, String> {
     let mut provider = provider;
-    let client = reqwest::Client::new();
+    // Identified like any other call: same user agent, an install-stable id in
+    // the session header, since a listing belongs to no conversation.
+    let client = reqwest::Client::builder()
+        .user_agent(engine::identity::agent())
+        .build()
+        .map_err(|e| format!("could not build http client: {e}"))?;
     let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
     let mut req = client.get(&url);
+    req = req.header(engine::identity::SESSION_HEADER, engine::identity::anonymous_session());
     if !provider.api_key.is_empty() {
         req = req.bearer_auth(&provider.api_key);
     }
@@ -1347,6 +1354,7 @@ async fn send_text(
             rt.block_on(async move {
                 let mut agent = Agent::with_tools(config, tools);
                 agent.session = run_sess.clone();
+                agent.provider.session = run_sess.clone();
                 agent.project = project;
                 agent.set_history(history);
                 agent.save = Some(Box::new(move |msgs: &[crate::engine::Msg]| {
