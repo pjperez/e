@@ -61,8 +61,30 @@ across concurrently running sessions behind a mutex, and lookups clone the
 `Arc<dyn Tool>` out before the tool runs, so a slow tool never blocks another
 session.
 
-Built-ins: `powershell`, `read_file`, `write_file`, `list_dir`, `skills`. See
-[EXTENDING.md](EXTENDING.md) for the trait and a worked example.
+Built-ins: `powershell`, `read_file`, `write_file`, `list_dir`, `skills`,
+`codemode`. See [EXTENDING.md](EXTENDING.md) for the trait and a worked
+example.
+
+## Codemode
+
+`codemode` (in `engine/codemode.rs`, the pattern is Pi's) lets the model emit
+a JavaScript *program* instead of one tool call at a time: loops, retries,
+filtering, `Promise.all` — with only the distilled result returning to the
+conversation. One LLM round-trip replaces dozens.
+
+The script never runs in Rust. The webview is the app's only JavaScript
+runtime — the same rule plugins follow — so the tool ships the source across
+as an event (`e:codemode_run`) and blocks. The frontend runs it in a
+sandboxed iframe (`allow-scripts` only, CSP `default-src 'none'`), where the
+only capability is a `tools` proxy: no filesystem, network, timers, or
+imports. Each call the script makes round-trips back through
+`codemode_tool_call`, which authorises it against the run in flight and gates
+it exactly like a call the model made itself — plugin veto, approval for
+risky tools, then execution. A script therefore cannot do anything the model
+could not have done one call at a time; it can only do it with fewer
+round-trips. Calls to `codemode` itself are refused (no recursion), a run
+times out engine-side (600s — approvals count), and `e-rpc`, having no
+JavaScript runtime, gets a fast refusal rather than a hang.
 
 ## Plugins
 

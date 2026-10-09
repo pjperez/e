@@ -43,6 +43,9 @@ easier to follow or safer to trust don't earn their bytes.
 - Any OpenAI-compatible provider, several at once, with automatic retry on
   rate limits.
 - Image input by pasting into the composer.
+- Codemode: the agent can answer with a JavaScript program that runs its
+  tools in loops and in parallel in a sandboxed iframe — every call still
+  gated like the model's own — so one turn does the work of many.
 - Skills (`SKILL.md`), plugins, and MCP servers — all landing as tools in one
   registry, global or per project, reloadable without a restart.
 - Plugin capabilities enforced by the host, with a Settings → Extensions pane

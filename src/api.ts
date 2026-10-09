@@ -472,6 +472,46 @@ export async function searchSessions(query: string): Promise<{ results: { sessio
   return invoke("search_sessions", { query });
 }
 
+// ---------- codemode ----------
+
+/// One script the engine wants run: `sid` identifies the run (and authorises
+/// its tool calls), `session` the chat on whose behalf the calls are gated.
+export type CodemodeRun = { sid: string; session: string; code: string; timeoutMs: number };
+
+/// A tool call made from inside a running codemode script. Refusals — plugin
+/// veto, a denied approval, a failed tool — are results carrying the reason
+/// (`ok: false`), so a rejected invoke means the run itself is dead; both
+/// reject the script's promise, and must stay distinguishable.
+export async function codemodeToolCall(sid: string, session: string, name: string, args: Record<string, unknown>): Promise<{ ok: boolean; output: string }> {
+  if (!inTauri) return { ok: false, output: "not-running-in-tauri" };
+  return invoke("codemode_tool_call", { sid, session, name, arguments: args });
+}
+
+/// The run's one answer: the shaped transcript, or the failure text. Exactly
+/// once per run, on every outcome including a timeout.
+export async function codemodeResult(sid: string, ok: boolean, output: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke("codemode_result", { sid, ok, output });
+}
+
+/// The host handshake. Until it lands the engine refuses codemode outright
+/// rather than blocking a whole run budget on an event nobody answers, so it
+/// must only fire after the run listener is registered.
+export async function setCodemodeActive(active: boolean): Promise<void> {
+  if (!inTauri) return;
+  await invoke("set_codemode_active", { active });
+}
+
+export function onCodemodeRun(cb: (run: CodemodeRun) => void): Unlisten {
+  if (!inTauri) return () => undefined;
+  let un: Unlisten = () => undefined;
+  void (async () => {
+    const evt = await import("@tauri-apps/api/event");
+    un = await evt.listen<CodemodeRun>("e:codemode_run", (e) => cb(e.payload));
+  })();
+  return () => un();
+}
+
 // ---------- right pane: files ----------
 
 export type FsEntry = { name: string; path: string; dir: boolean; size: number; modified: number; symlink: boolean };

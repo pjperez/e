@@ -35,6 +35,7 @@ to work.
 | **Stay in control** | Approve built-in command and file-writing tools, stop a run at any point, or steer it with a new instruction. Other chats can keep working in the background. |
 | **Keep projects clean** | Organize persistent chats by project. Fork and search conversations, and optionally give new Git tasks their own managed worktree. |
 | **Make it yours** | Add reusable skills, JavaScript plugins, MCP servers, custom tools, commands, guards, file browsers, terminals, and side-pane views. |
+| **Do more per turn** | Codemode: the agent writes a small sandboxed JavaScript program that drives its tools in loops and in parallel — every call still approved like its own — so one turn can do the work of many. |
 
 No `e` account is required. Add your provider, choose a folder, and start.
 

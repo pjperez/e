@@ -13,10 +13,18 @@ use crate::engine::jobs;
 /// of magnitude, and anything bigger genuinely needs the background path.
 const SYNC_MAX: usize = 100_000;
 
+/// Tools that change the workspace and therefore pause for the user's
+/// approval (unless the chat runs YOLO). Shared by the agent loop and by
+/// codemode, so a script's calls are gated exactly like the model's own.
+pub const RISKY: [&str; 2] = ["powershell", "write_file"];
+
 /// Minimal context handed to every tool when it runs.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ToolContext {
     pub workspace: PathBuf,
+    /// The chat this run belongs to. Only codemode reads it today — to route
+    /// a script's own tool calls back through this chat's approvals.
+    pub session: String,
 }
 
 impl ToolContext {
@@ -97,6 +105,7 @@ impl ToolRegistry {
         r.register(WriteFileTool);
         r.register(ListDirTool);
         r.register(SkillsTool);
+        r.register(crate::engine::codemode::CodeModeTool);
         r
     }
 
@@ -630,7 +639,7 @@ mod tests {
     use std::time::Duration;
 
     fn ctx(ws: &str) -> ToolContext {
-        ToolContext { workspace: PathBuf::from(ws) }
+        ToolContext { workspace: PathBuf::from(ws), ..Default::default() }
     }
 
     /// Pull the job id out of the powershell background:true message. The id

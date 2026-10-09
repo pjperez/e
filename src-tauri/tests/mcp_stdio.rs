@@ -64,7 +64,7 @@ fn workspace(tag: &str, servers: &str) -> PathBuf {
 }
 
 fn ctx(ws: &Path) -> ToolContext {
-    ToolContext { workspace: ws.to_path_buf() }
+    ToolContext { workspace: ws.to_path_buf(), ..Default::default() }
 }
 
 /// Server status and the live-server list are process-wide, so these tests

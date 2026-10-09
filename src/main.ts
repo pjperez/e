@@ -1,6 +1,7 @@
 // e — UI controller.
 import { renderMarkdown } from "./markdown";
 import { attachTurnCopy, decorateCodeBlocks, wireCopy } from "./copy";
+import { bootCodemode } from "./codemode";
 import * as api from "./api";
 import type { Config, ProviderItem } from "./api";
 
@@ -2853,6 +2854,13 @@ async function init(): Promise<void> {
     // Plugins load once projects are known, so a project's own .e/plugins is
     // in scope rather than only the global folder.
     await loadPlugins();
+    // Codemode scripts run in this window's webview — the app's only
+    // JavaScript runtime — and every tool call they make passes the plugin
+    // veto armed just above, so the host boots with the rest of the engine
+    // wiring. The run listener is already live (registered when the codemode
+    // module loads, before init); this handshake is what tells the engine it
+    // may emit scripts at this window.
+    await bootCodemode();
   } catch (e) {
     statusWrap.classList.add("error");
     statusText.textContent = "unreachable";
