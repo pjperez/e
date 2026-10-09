@@ -11,7 +11,7 @@ use crate::engine::jobs;
 /// The old implementation returned everything it printed; a chatty build
 /// could drown the transcript. 100k chars matches the read_file cap's order
 /// of magnitude, and anything bigger genuinely needs the background path.
-const SYNC_MAX: usize = 100_000;
+pub const SYNC_MAX: usize = 100_000;
 
 /// Tools that change the workspace and therefore pause for the user's
 /// approval (unless the chat runs YOLO). Shared by the agent loop and by
@@ -25,6 +25,10 @@ pub struct ToolContext {
     /// The chat this run belongs to. Only codemode reads it today — to route
     /// a script's own tool calls back through this chat's approvals.
     pub session: String,
+    /// Run command tools inside an MXC container and hold host-side file
+    /// tools to the same fence, instead of pausing for approvals. Already
+    /// conjoined with availability by the time it reaches a tool.
+    pub sandbox: bool,
 }
 
 impl ToolContext {
@@ -265,7 +269,8 @@ impl Default for ToolRegistry {
 /// Format captured stdout/stderr for a synchronous command result, keeping
 /// the shape the model already knows: stdout, an optional [stderr] section,
 /// then the exit code. Oversized output is trimmed at the front with a note.
-fn format_sync_output(out: &jobs::Taken, err: &jobs::Taken, code: i32) -> String {
+/// Shared with the sandboxed runner so contained and plain runs render alike.
+pub(crate) fn format_sync_output(out: &jobs::Taken, err: &jobs::Taken, code: i32) -> String {
     let mut m = String::new();
     if !out.text.trim().is_empty() {
         m.push_str(&out.text);
@@ -316,10 +321,17 @@ impl Tool for PowerShellTool {
         }
         let cwd = ctx.dir()?;
         if args.get("background").and_then(|b| b.as_bool()).unwrap_or(false) {
-            let id = jobs::start(&cwd, &cmd)?;
+            let id = if ctx.sandbox {
+                jobs::start_contained(&cwd, &cmd)?
+            } else {
+                jobs::start(&cwd, &cmd)?
+            };
             return Ok(format!(
                 "[job {id}] started in the background; the command keeps running.\nPoll with process_poll(id=\"{id}\", wait_ms=20000) for progress — its wait blocks so one long poll beats many short ones — and stop it with process_kill(id=\"{id}\") if needed."
             ));
+        }
+        if ctx.sandbox {
+            return crate::engine::mxc::run_sync(&cwd, &cmd);
         }
         run_sync(&cwd, &cmd)
     }
@@ -473,6 +485,9 @@ impl Tool for ReadFileTool {
     fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         let path = args.get("path").and_then(|p| p.as_str()).ok_or("missing 'path'")?;
         let full = resolve(ctx, path)?;
+        if ctx.sandbox {
+            crate::engine::mxc::read_allowed(&crate::engine::mxc::Policy::load(&ctx.workspace)?, &full)?;
+        }
         let meta = std::fs::metadata(&full).map_err(|e| format!("{path}: {e}"))?;
         if meta.is_dir() {
             return Err(format!("{path} is a directory, use list_dir"));
@@ -510,6 +525,12 @@ impl Tool for WriteFileTool {
         let path = args.get("path").and_then(|p| p.as_str()).ok_or("missing 'path'")?.to_string();
         let content = args.get("content").and_then(|c| c.as_str()).ok_or("missing 'content'")?.to_string();
         let full = resolve(ctx, &path)?;
+        // In sandbox mode this replaces the approval prompt with the fence:
+        // the container lets spawned shells write only the workspace and
+        // temp, so the host-side write tool must hold the same line.
+        if ctx.sandbox {
+            crate::engine::mxc::write_allowed(&crate::engine::mxc::Policy::load(&ctx.workspace)?, &ctx.workspace, &full)?;
+        }
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
@@ -535,6 +556,9 @@ impl Tool for ListDirTool {
     fn run(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         let p = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
         let full = resolve(ctx, p)?;
+        if ctx.sandbox {
+            crate::engine::mxc::read_allowed(&crate::engine::mxc::Policy::load(&ctx.workspace)?, &full)?;
+        }
         let rd = std::fs::read_dir(&full).map_err(|e| format!("{p}: {e}"))?;
         let mut lines: Vec<String> = Vec::new();
         for e in rd.flatten() {

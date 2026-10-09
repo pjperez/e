@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn a_tool_call_without_code_is_refused_before_anything_runs() {
-        let ctx = ToolContext { workspace: std::path::PathBuf::from("C:/x"), session: "s1".into() };
+        let ctx = ToolContext { workspace: std::path::PathBuf::from("C:/x"), session: "s1".into(), ..Default::default() };
         assert_eq!(CodeModeTool.run(&ctx, json!({})).unwrap_err(), "missing 'code'");
         assert_eq!(
             CodeModeTool.run(&ctx, json!({ "code": "   " })).unwrap_err(),
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn without_a_javascript_runtime_the_tool_refuses_fast() {
         set_hosted(true);
-        let ctx = ToolContext { workspace: std::path::PathBuf::from("C:/x"), session: "s1".into() };
+        let ctx = ToolContext { workspace: std::path::PathBuf::from("C:/x"), session: "s1".into(), ..Default::default() };
         let err = CodeModeTool.run(&ctx, json!({ "code": "text(1)" })).unwrap_err();
         assert!(err.contains("no JavaScript runtime"), "{err}");
         set_hosted(false);

@@ -200,6 +200,10 @@ pub struct Job {
     pub cap: Arc<Mutex<Capture>>,
     pub status: Mutex<Status>,
     pub killed: AtomicBool,
+    /// Present only for sandboxed jobs: the container handle. `kill` takes it
+    /// out and kills through it; the waiter then sees `None` and knows the
+    /// killer owns the process. `None` for every plain job.
+    pub contained: Mutex<Option<mxc_sdk::v1::MxcProcess>>,
 }
 
 impl Job {
@@ -369,6 +373,7 @@ pub fn start(cwd: &Path, command: &str) -> Result<String, String> {
         cap: cap.clone(),
         status: Mutex::new(Status::Running),
         killed: AtomicBool::new(false),
+        contained: Mutex::new(None),
     });
 
     {
@@ -391,6 +396,101 @@ pub fn start(cwd: &Path, command: &str) -> Result<String, String> {
     let waiter_job = job.clone();
     std::thread::spawn(move || {
         let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        // Let the readers drain what the pipes still held after exit, so the
+        // final poll sees the command's last words, not everything but them.
+        let _ = j1.join();
+        let _ = j2.join();
+        *waiter_job.status.lock().unwrap_or_else(|e| e.into_inner()) =
+            Status::Done { code, at: Instant::now() };
+    });
+
+    Ok(id)
+}
+
+/// Start `command` in `cwd` as a background job inside an MXC container.
+///
+/// Same registry, same polling, same rendering as [`start`]; only the handle
+/// and the kill path differ. The waiter polls `try_wait` instead of blocking
+/// on `wait`, because the handle is shared with `kill` — a blocking wait here
+/// would hold the lock the killer needs.
+pub fn start_contained(cwd: &Path, command: &str) -> Result<String, String> {
+    {
+        let mut map = JOBS.lock().map_err(|_| "job registry is poisoned")?;
+        prune_locked(&mut map, MAX_JOBS - 1, RETAIN_FINISHED);
+        if map.len() >= MAX_JOBS {
+            return Err(format!(
+                "too many background jobs ({MAX_JOBS}); poll or kill the existing ones first"
+            ));
+        }
+    }
+
+    let policy = crate::engine::mxc::Policy::load(cwd)?;
+    let line = format!("{} -NoLogo -NoProfile -NonInteractive -Command {command}", shell_executable());
+    let req = crate::engine::mxc::request_for(&policy, cwd, &line);
+    let mut child = mxc_sdk::v1::spawn(req, Default::default())
+        .map_err(|e| format!("failed to start (sandbox): {e}"))?;
+    let pid = child.id();
+    // Both pipes must be drained, each on its own thread, or a child blocked
+    // on a full stderr pipe stops writing stdout entirely (mxc-spike, P5).
+    let stdout = child.take_stdout().ok_or("job has no stdout pipe")?;
+    let stderr = child.take_stderr().ok_or("job has no stderr pipe")?;
+
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!("bg-{:x}-{}", millis, SEQ.fetch_add(1, Ordering::SeqCst) + 1);
+    let cap: Arc<Mutex<Capture>> = Arc::new(Mutex::new(Capture::new()));
+    let job = Arc::new(Job {
+        id: id.clone(),
+        command: command.to_string(),
+        cwd: cwd.to_path_buf(),
+        pid,
+        started_at: Instant::now(),
+        cap: cap.clone(),
+        status: Mutex::new(Status::Running),
+        killed: AtomicBool::new(false),
+        contained: Mutex::new(Some(child)),
+    });
+
+    {
+        let mut map = JOBS.lock().map_err(|_| "job registry is poisoned")?;
+        if map.len() >= MAX_JOBS {
+            let orphan = job.contained.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(mut p) = orphan {
+                let _ = p.kill();
+            }
+            return Err(format!(
+                "too many background jobs ({MAX_JOBS}); poll or kill the existing ones first"
+            ));
+        }
+        map.insert(id.clone(), job.clone());
+    }
+
+    let j1 = spawn_reader(stdout, cap.clone());
+    let j2 = spawn_reader(stderr, cap);
+
+    let waiter_job = job.clone();
+    std::thread::spawn(move || {
+        let code = loop {
+            let answer = {
+                let mut guard = waiter_job.contained.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.as_mut() {
+                    Some(p) => match p.try_wait() {
+                        Ok(Some(code)) => Some(code),
+                        Ok(None) => None,
+                        Err(_) => Some(-1),
+                    },
+                    // The killer took the handle; its render already says
+                    // "killed by request", so the code here is a formality.
+                    None => Some(-1),
+                }
+            };
+            match answer {
+                Some(code) => break code,
+                None => std::thread::sleep(Duration::from_millis(200)),
+            }
+        };
         // Let the readers drain what the pipes still held after exit, so the
         // final poll sees the command's last words, not everything but them.
         let _ = j1.join();
@@ -431,6 +531,20 @@ pub fn poll(id: &str, wait: Duration) -> Result<String, String> {
     Ok(job.render())
 }
 
+/// Stop a job's process: through the container handle when it has one, by
+/// tree walk otherwise. Contained takes precedence — `taskkill` has no
+/// special standing with an AppContainer child the way the SDK's own kill
+/// does.
+fn stop_process(job: &Job) {
+    let taken = job.contained.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match taken {
+        Some(mut p) => {
+            let _ = p.kill();
+        }
+        None => kill_tree(job.pid),
+    }
+}
+
 /// Kill a job's whole process tree and mark it killed, so the next poll says
 /// so rather than presenting taskkill's exit code as the command's own.
 pub fn kill(id: &str) -> Result<String, String> {
@@ -442,7 +556,7 @@ pub fn kill(id: &str) -> Result<String, String> {
         return Ok(format!("[job {id}] already exited; nothing to kill"));
     }
     job.killed.store(true, Ordering::SeqCst);
-    kill_tree(job.pid);
+    stop_process(&job);
     Ok(format!(
         "[job {id}] kill signalled (process tree terminated, pid {pid}); poll to see its last output",
         pid = job.pid
@@ -463,7 +577,7 @@ pub fn shutdown_all() {
     };
     for j in jobs {
         if !j.done() {
-            kill_tree(j.pid);
+            stop_process(&j);
         }
     }
 }
@@ -619,6 +733,7 @@ mod tests {
             cap: Arc::new(Mutex::new(Capture::new())),
             status: Mutex::new(Status::Done { code: 0, at: Instant::now() - finished_ago }),
             killed: AtomicBool::new(false),
+            contained: Mutex::new(None),
         })
     }
 
@@ -638,6 +753,7 @@ mod tests {
                 cap: Arc::new(Mutex::new(Capture::new())),
                 status: Mutex::new(Status::Running),
                 killed: AtomicBool::new(false),
+                contained: Mutex::new(None),
             }),
         );
 
@@ -655,10 +771,15 @@ mod tests {
 
     fn wait_done(id: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
+        // Accumulate: the poll that observes the exit may have already
+        // consumed the output in an earlier one, and a Done report alone
+        // carries no bytes.
+        let mut seen = String::new();
         loop {
             let out = poll(id, Duration::from_millis(500)).expect("poll");
+            seen.push_str(&out);
             if out.contains("exited with code") || out.contains("killed by request") {
-                return out;
+                return seen;
             }
             assert!(Instant::now() < deadline, "job never finished: {out}");
         }
@@ -690,6 +811,33 @@ mod tests {
     fn killing_a_job_stops_it_and_says_so() {
         let id = start(&tmp(), "Start-Sleep -Seconds 60").expect("start");
         std::thread::sleep(Duration::from_millis(700));
+        let msg = kill(&id).expect("kill");
+        assert!(msg.contains("kill"), "{msg}");
+        let out = wait_done(&id, Duration::from_secs(15));
+        assert!(out.contains("killed by request"), "{out}");
+    }
+
+    /// The contained path, end to end: run, poll output, kill through the
+    /// container handle. Self-skipping on machines without process containers
+    /// so the suite stays green everywhere else.
+    #[test]
+    fn a_contained_job_runs_polls_and_kills() {
+        if !crate::engine::mxc::available() {
+            eprintln!("skipping: no process containers on this machine");
+            return;
+        }
+        let id = start_contained(&tmp(), "Write-Output contained-marker; Start-Sleep -Seconds 60")
+            .expect("contained start");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut saw_marker = false;
+        loop {
+            let out = poll(&id, Duration::from_millis(500)).expect("poll");
+            saw_marker |= out.contains("contained-marker");
+            if out.contains("running") && saw_marker {
+                break;
+            }
+            assert!(Instant::now() < deadline, "job never printed its marker: {out}");
+        }
         let msg = kill(&id).expect("kill");
         assert!(msg.contains("kill"), "{msg}");
         let out = wait_done(&id, Duration::from_secs(15));

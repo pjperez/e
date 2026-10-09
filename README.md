@@ -96,7 +96,9 @@ embedding.
 - Prompts and tool results go to the provider selected for that chat.
 - Built-in PowerShell and `write_file` calls ask for approval unless YOLO mode
   is enabled.
-- Local tools run with your Windows user permissions.
+- Local tools run with your Windows user permissions — or, in sandbox mode,
+  inside Microsoft Execution Containers: writes fenced to the workspace,
+  secrets denied, network rules per project (`.e/policy.json`).
 - Plugins and MCP servers are code you choose to run; install only what you
   trust.
 

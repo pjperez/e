@@ -440,11 +440,15 @@ fn codemode_tool_call(
         }));
     }
     let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&session);
-    let yolo = state.config().yolo;
+    let cfg = state.config();
+    let yolo = cfg.yolo;
+    // The same conjunction the agent loop uses, so a script's calls and the
+    // model's own can never be gated differently.
+    let sandboxed = cfg.sandbox && engine::mxc::available();
     if let Some(reason) = plugins::veto(&session, &name, &arguments) {
         return Ok(serde_json::json!({ "ok": false, "output": format!("Blocked by a plugin: {reason}") }));
     }
-    if engine::tools::RISKY.contains(&name.as_str()) && !yolo {
+    if engine::tools::RISKY.contains(&name.as_str()) && !yolo && !sandboxed {
         let tc = engine::ToolCall { id: String::new(), name: name.clone(), arguments: arguments.clone() };
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let preview = engine::agent::tool_preview(&tc);
@@ -452,9 +456,21 @@ fn codemode_tool_call(
             return Ok(serde_json::json!({ "ok": false, "output": "Denied by user" }));
         }
     }
-    let ctx = engine::tools::ToolContext { workspace: ws.into(), session: session.clone() };
+    let ctx = engine::tools::ToolContext {
+        workspace: ws.into(),
+        session: session.clone(),
+        sandbox: sandboxed,
+    };
     let (ok, output) = engine::tools::run_tool(&state.tools, &ctx, &name, arguments);
     Ok(serde_json::json!({ "ok": ok, "output": output }))
+}
+
+/// Whether this machine can spawn MXC process containers — what Settings
+/// shows next to the sandbox toggle, so "off because unsupported" is visible
+/// rather than mysterious.
+#[tauri::command(async)]
+fn sandbox_available() -> bool {
+    engine::mxc::available()
 }
 
 /// The frontend's answer to `e:codemode_run`: the run's shaped output.
@@ -1714,6 +1730,7 @@ pub fn run() {
             codemode_tool_call,
             codemode_result,
             set_codemode_active,
+            sandbox_available,
             set_plugin_veto,
             plugin_veto_result,
             list_mcp_servers,
