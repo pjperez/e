@@ -39,6 +39,7 @@ const sbArrows = document.getElementById("sb-arrows") as HTMLElement;
 const sbCtx = document.getElementById("sb-context") as HTMLElement;
 const sbCost = document.getElementById("sb-cost") as HTMLElement;
 const sbYolo = document.getElementById("sb-yolo") as HTMLElement;
+const sbSandbox = document.getElementById("sb-sandbox") as HTMLElement;
 const actSteer = document.getElementById("act-steer") as HTMLButtonElement;
 
 function hostOf(u: string): string { try { return new URL(u).host; } catch { return u; } }
@@ -47,6 +48,12 @@ function hostOf(u: string): string { try { return new URL(u).host; } catch { ret
 /// permanent badge rather than living only in the settings modal.
 function setYoloIndicator(on: boolean): void {
   sbYolo.hidden = !on;
+}
+
+/// Sandbox swaps that approval prompt for the MXC container boundary — same
+/// standing risk signal, same permanent badge.
+function setSandboxIndicator(on: boolean): void {
+  sbSandbox.hidden = !on;
 }
 
 // ---------- per-chat run state ----------
@@ -762,7 +769,7 @@ async function expandAttachments(text: string): Promise<string> {
   return ctx;
 }
 
-const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/extensions\` — plugins, skills and MCP servers\n- \`/reload\` — re-read extensions (no restart)\n- \`/yolo [on|off]\` — auto-approve risky tools (powershell, write_file)\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
+const HELP = `**Commands**\n- \`/new\` — new conversation\n- \`/model\` — switch model\n- \`/settings\` — open settings\n- \`/extensions\` — plugins, skills and MCP servers\n- \`/reload\` — re-read extensions (no restart)\n- \`/yolo [on|off]\` — auto-approve risky tools (powershell, write_file)\n- \`/sandbox [on|off]\` — toggle MXC sandboxing of commands\n- \`/help\` — this help\n\n**File references**\nType \`@path\` (e.g. \`fix @src/main.ts\`) to include a file in context.`;
 
 /// Single source of truth for YOLO: the settings checkbox reads the same saved
 /// config, so the two controls cannot drift apart.
@@ -774,6 +781,22 @@ async function toggleYolo(arg: string): Promise<void> {
     await api.saveConfig(cfg);
     setYoloIndicator(next);
     notify(next ? "YOLO mode ON — powershell & write_file run without asking" : "YOLO mode OFF — risky tools ask first", next ? "error" : "info");
+  } catch (e) {
+    notify(String(e), "error");
+  }
+}
+
+/// Same single source of truth for sandbox: getConfig → mutate → saveConfig,
+/// so the settings checkbox (which fills from the same file) cannot drift.
+async function toggleSandbox(arg: string): Promise<void> {
+  try {
+    const cfg = await api.getConfig();
+    const next = arg === "on" ? true : arg === "off" ? false : !cfg.sandbox;
+    cfg.sandbox = next;
+    await api.saveConfig(cfg);
+    setSandboxIndicator(next);
+    if (overlay.classList.contains("open")) el<HTMLInputElement>("#cfg-sandbox").checked = next;
+    notify(next ? "Sandbox ON — commands run in an MXC container, writes fenced to the workspace" : "Sandbox OFF — risky tools ask first");
   } catch (e) {
     notify(String(e), "error");
   }
@@ -836,6 +859,9 @@ function runSlash(cmd: string): void {
       break;
     case "/yolo":
       void toggleYolo(arg);
+      break;
+    case "/sandbox":
+      void toggleSandbox(arg);
       break;
     case "/help":
       show(HELP);
@@ -1950,6 +1976,7 @@ const BUILTIN_SLASH: SlashCmd[] = [
   { name: "/extensions", desc: "plugins, skills and MCP servers" },
   { name: "/reload", desc: "re-read plugins, skills and MCP servers" },
   { name: "/yolo", desc: "toggle auto-approval of risky tools" },
+  { name: "/sandbox", desc: "toggle MXC sandboxing of commands" },
   { name: "/help", desc: "list commands" },
 ];
 
@@ -2221,6 +2248,9 @@ overlay.innerHTML = `
             <label class="lbl">Temperature</label><input id="cfg-temp" type="number" step="0.1" min="0" max="2"/>
       <label class="lbl">System prompt</label><textarea id="cfg-sys" rows="3"></textarea>
       <label class="lbl cfg-check"><input id="cfg-yolo" type="checkbox"/> YOLO mode — run powershell &amp; write_file without asking</label>
+      <label class="lbl cfg-check"><input id="cfg-sandbox" type="checkbox"/> Sandbox tool execution (MXC)</label>
+      <p class="note">Commands run inside a Microsoft Execution Container: writes are fenced to the workspace and the temp directory, sensitive locations are denied, and no approval prompts appear.</p>
+      <p class="note" id="cfg-sandbox-na" hidden>Not available on this machine — Windows 11 with process containers required; approvals still apply.</p>
       <label class="lbl cfg-check"><input id="cfg-worktrees" type="checkbox"/> Use a separate Git worktree for each new task</label>
     </details>
     <details class="field bhr" id="cfg-ext">
@@ -2565,6 +2595,13 @@ async function openSettings(extensions = false): Promise<void> {
   el<HTMLInputElement>("#cfg-temp").value = String(cfg.temperature);
   el<HTMLTextAreaElement>("#cfg-sys").value = cfg.system;
   el<HTMLInputElement>("#cfg-yolo").checked = !!cfg.yolo;
+  el<HTMLInputElement>("#cfg-sandbox").checked = !!cfg.sandbox;
+  // MXC containers are a machine property Settings cannot conjure. Where they
+  // are missing the checkbox is disabled — it keeps showing (and saving) the
+  // stored value untouched — and the note says why approvals still apply.
+  const sandboxOk = await api.sandboxAvailable().catch(() => false);
+  el<HTMLInputElement>("#cfg-sandbox").disabled = !sandboxOk;
+  el<HTMLElement>("#cfg-sandbox-na").hidden = sandboxOk;
   el<HTMLInputElement>("#cfg-worktrees").checked = cfg.task_worktrees !== false;
   renderProviderList();
   const ext = el<HTMLDetailsElement>("#cfg-ext");
@@ -2740,6 +2777,7 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
   const temperature = parseFloat(el<HTMLInputElement>("#cfg-temp").value) || 1;
   const system = el<HTMLTextAreaElement>("#cfg-sys").value;
   const yolo = el<HTMLInputElement>("#cfg-yolo").checked;
+  const sandbox = el<HTMLInputElement>("#cfg-sandbox").checked;
   const taskWorktrees = el<HTMLInputElement>("#cfg-worktrees").checked;
   const cfg: Config = {
     // Settings decides what is *available*; the picker decides what is in use.
@@ -2753,6 +2791,7 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
     system,
     temperature,
     yolo,
+    sandbox,
     task_worktrees: taskWorktrees,
     models: [],
     context_window: defaultCtxWindow,
@@ -2762,6 +2801,7 @@ overlay.querySelector("#cfg-save")!.addEventListener("click", async () => {
   providers = draft;
   await syncModelState();
   setYoloIndicator(yolo);
+  setSandboxIndicator(sandbox);
   closeSettings();
 });
 overlay.addEventListener("click", (e) => {
@@ -2839,6 +2879,7 @@ async function init(): Promise<void> {
     defaultCtxWindow = cfg.context_window || 1_000_000;
     await syncModelState();
     setYoloIndicator(!!cfg.yolo);
+    setSandboxIndicator(!!cfg.sandbox);
     await refreshSessions();
     if (pinned) openSessions();
     if (currentSession) {

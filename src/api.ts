@@ -65,6 +65,9 @@ export type Config = {
   workspace: string;
   /** Auto-approve risky tools (powershell, write_file) instead of prompting. */
   yolo: boolean;
+  /** Run command tools inside MXC containers: writes fenced to the workspace,
+   *  sensitive locations denied, no per-command approval prompts. */
+  sandbox: boolean;
   /** Create an app-managed Git worktree for each new task. */
   task_worktrees: boolean;
   models: string[];
@@ -115,13 +118,21 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 export async function getConfig(): Promise<Config> {
-  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, task_worktrees: true, models: [], context_window: 1_000_000, provider_id: "", providers: [] };
+  if (!inTauri) return { base_url: "(browser preview)", api_key: "", model: "—", temperature: 1, system: "", workspace: ".", yolo: false, sandbox: false, task_worktrees: true, models: [], context_window: 1_000_000, provider_id: "", providers: [] };
   return invoke<Config>("get_config");
 }
 
 export async function saveConfig(cfg: Config): Promise<void> {
   if (!inTauri) return;
   await invoke("save_config", { config: cfg });
+}
+
+/// Whether this machine can spawn MXC process containers — what Settings
+/// shows next to the sandbox toggle, so "off because unsupported" is visible
+/// rather than mysterious.
+export async function sandboxAvailable(): Promise<boolean> {
+  if (!inTauri) return false;
+  return invoke<boolean>("sandbox_available");
 }
 
 /// Every model on offer across every enabled provider, tagged with its owner.

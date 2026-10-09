@@ -17,6 +17,12 @@ pub struct Config {
     /// Auto-approve risky tools (powershell, write_file) instead of prompting.
     #[serde(default)]
     pub yolo: bool,
+    /// Run command tools inside MXC process containers and hold host-side
+    /// file tools to the same fence, replacing the approval prompt with the
+    /// container boundary. Quietly degrades to prompt mode on machines
+    /// without container support.
+    #[serde(default)]
+    pub sandbox: bool,
     /// Give each new task in a Git project an app-managed worktree.
     #[serde(default = "default_true")]
     pub task_worktrees: bool,
@@ -216,6 +222,7 @@ impl Config {
             system: "You are e, a fast, capable coding agent running in a local harness with a workspace and tools: powershell (run PowerShell commands), read_file, write_file, list_dir.\nTool use policy: use a tool ONLY when it genuinely helps (inspect/read files, run or verify commands, modify the workspace, or when the user asks you to act). For conversational or directly-answerable requests, answer directly yourself and NEVER make a tool call.".to_string(),
             workspace: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
             yolo: false,
+            sandbox: false,
             task_worktrees: true,
             context_window: default_context_window(),
             // No provider ships with `e`: the first run sends you to Settings to
@@ -289,6 +296,11 @@ impl Config {
         if let Ok(v) = std::env::var("E_YOLO") {
             if let Some(b) = parse_bool(&v) {
                 base.yolo = b;
+            }
+        }
+        if let Ok(v) = std::env::var("E_SANDBOX") {
+            if let Some(b) = parse_bool(&v) {
+                base.sandbox = b;
             }
         }
         // Env overrides land on the provider the connection points at, not just
@@ -545,6 +557,7 @@ fn merge(base: &mut Config, c: Config) {
     // express a bool the user deliberately turned off, nor a list the user
     // deliberately emptied by re-enabling the last disabled plugin.
     base.yolo = c.yolo;
+    base.sandbox = c.sandbox;
     base.task_worktrees = c.task_worktrees;
     base.disabled_plugins = c.disabled_plugins;
 }
@@ -692,7 +705,16 @@ impl Agent {
         ToolContext {
             workspace: std::path::PathBuf::from(&self.config.workspace),
             session: self.session.clone(),
+            sandbox: self.sandboxed(),
         }
+    }
+
+    /// Whether this run actually fences: the setting, conjoined with the
+    /// machine's ability to spawn containers. The single place the two are
+    /// combined, so the prompt, the approval gate and the tools can never
+    /// disagree about which world they are in.
+    fn sandboxed(&self) -> bool {
+        self.config.sandbox && crate::engine::mxc::available()
     }
 
     /// Where this chat is working, spelled out for the model. Being explicit
@@ -748,13 +770,13 @@ impl Agent {
     /// written before this context existed) would otherwise keep quoting the
     /// old, wrong location forever.
     fn sync_system(&mut self) {
-        let hint = format!(
-            "{}\n\n{}\n\n{}\n\n{}",
-            platform_hint(),
-            self.project_block(),
-            crate::engine::jobs::AGENT_HINT,
-            self.identification_hint()
-        );
+        let mut blocks = vec![platform_hint(), self.project_block()];
+        if self.sandboxed() {
+            blocks.push(crate::engine::mxc::sandbox_hint().to_string());
+        }
+        blocks.push(crate::engine::jobs::AGENT_HINT.to_string());
+        blocks.push(self.identification_hint());
+        let hint = blocks.join("\n\n");
         let body = if self.config.system.trim().is_empty() {
             hint
         } else {
@@ -890,7 +912,10 @@ impl Agent {
                     emit.tool_result(&tc.id, &tc.name, false, &msg);
                     continue;
                 }
-                if RISKY.contains(&tc.name.as_str()) && !self.config.yolo {
+                // Sandbox mode replaces the prompt with the fence: a
+                // contained command cannot leave the workspace, so there is
+                // nothing left for an approval to withhold.
+                if RISKY.contains(&tc.name.as_str()) && !self.config.yolo && !self.sandboxed() {
                     let preview = tool_preview(tc);
                     if !crate::engine::approval::request(&self.session, &tc.name, &preview, cancelled) {
                         let msg = if cancelled.load(Ordering::SeqCst) { "Stopped by user" } else { "Denied by user" };
@@ -972,6 +997,7 @@ mod tests {
             system: String::new(),
             workspace: String::new(),
             yolo: false,
+            sandbox: false,
             task_worktrees: true,
             models: Vec::new(),
             context_window: 1_000_000,

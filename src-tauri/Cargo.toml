@@ -25,6 +25,7 @@ dirs = "6"
 # openpty elsewhere, behind one API.
 portable-pty = "0.9"
 keyring = { version = "3", features = ["windows-native"] }
+mxc-sdk = "1.0.0"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

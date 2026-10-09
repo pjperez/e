@@ -8,6 +8,7 @@ pub mod credentials;
 pub mod identity;
 pub mod jobs;
 pub mod mcp;
+pub mod mxc;
 pub mod plugins;
 pub mod provider;
 pub mod pty;

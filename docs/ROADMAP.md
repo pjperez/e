@@ -25,6 +25,9 @@ easier to follow or safer to trust don't earn their bytes.
 
 - Approval gates: `powershell` and `write_file` pause the run for an inline
   Approve/Deny, unless YOLO mode is on.
+- Sandbox mode: run commands inside Microsoft Execution Containers — writes
+  fenced to the workspace, secrets denied, optional per-project network
+  rules in `.e/policy.json` — replacing the approval prompt with the fence.
 - Stop at any point, mid-stream, without losing what was already produced.
 - Revert: restore the workspace to its pre-run state from the summary card.
 - Slash commands and `@file` references in the composer.

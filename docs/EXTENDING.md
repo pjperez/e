@@ -348,6 +348,37 @@ Switch projects, then `/reload`.
 Servers are subprocesses with their own environment — they never inherit app
 state, and anything in `env` is a secret you are handing to that process.
 
+## Sandbox policy
+
+With sandbox mode on (Settings → Tools, or `/sandbox`), command tools run
+inside a Microsoft Execution Container and the approval prompt is replaced by
+the fence: writes only to the chat's workspace and the temp directory, a deny
+list over the otherwise drive-wide read access, optional network rules.
+
+A project can extend that fence with `.e/policy.json` (in the workspace root,
+so it travels with clones):
+
+```json
+{
+  "deny": ["~/.vagrant", "D:/secrets"],
+  "network": { "allow": ["13.107.6.0/24"], "deny": ["10.0.0.0/8"] }
+}
+```
+
+| field | meaning |
+|---|---|
+| `deny` | extra unreadable locations; `~` expands to your home, other paths must be absolute |
+| `network.allow` | CIDRs the container may reach; any entry flips egress to default-deny |
+| `network.deny` | CIDRs refused even when egress is otherwise open |
+
+Defaults already deny `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`,
+`~/.git-credentials`, `~/_netrc`, and the state files inside `~/.e`
+(`config.json`, `install_id`, `sessions`) — `~/.e` itself stays readable
+because managed worktrees live under it. Host-side tools (`write_file`,
+`read_file`, `list_dir`) enforce the same list in-process, so no tool path
+bypasses the fence. Network rules are CIDRs: the MXC V1 schema has no
+hostname rules yet. A broken `policy.json` is an error, not a silent default.
+
 ## Headless
 
 The `e-rpc` binary drives the same engine over JSONL on stdio — commands in,

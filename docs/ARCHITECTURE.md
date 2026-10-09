@@ -65,6 +65,32 @@ Built-ins: `powershell`, `read_file`, `write_file`, `list_dir`, `skills`,
 `codemode`. See [EXTENDING.md](EXTENDING.md) for the trait and a worked
 example.
 
+## Sandbox (MXC)
+
+Sandbox mode moves the trust boundary from an approval prompt to the
+operating system: command tools run inside Microsoft Execution Containers
+(process containers, AppContainer-backed), and the approval gate is replaced
+by the fence. `engine/mxc.rs` owns everything MXC — the policy
+(`<workspace>/.e/policy.json`, see [EXTENDING.md](EXTENDING.md)), the
+container request, and the host-side file-tool gates.
+
+The recipe is not negotiable, because each piece of it was earned the hard
+way (see `examples/mxc-spike.rs`): `ui.disable: false` or console executables
+die at init with `0xC0000142`; the system drive read-only or desktop
+PowerShell will not start; a deny list on top of that grant, because the deny
+list — not omission — is what actually protects secrets; an explicit working
+directory; and both pipes drained concurrently or a full stderr pipe freezes
+stdout. Host-side tools (`write_file`, `read_file`, `list_dir`) never pass
+through a container, so the same policy is enforced in-process at those
+tools — the fence must not have a door that skips the OS.
+
+Foreground commands run through the SDK's `run` (120s timeout, output
+formatted identically to the plain path); background jobs keep their registry
+and polling but hold the container handle instead of a pid (`jobs.rs`),
+killing through it. Availability is probed once — a machine without
+container support quietly behaves as prompt mode rather than breaking runs,
+and Settings says so. Everything is inert until the toggle is on.
+
 ## Codemode
 
 `codemode` (in `engine/codemode.rs`, the pattern is Pi's) lets the model emit

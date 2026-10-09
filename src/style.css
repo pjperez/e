@@ -676,12 +676,12 @@ html[data-theme="light"] .empty-mark {
 .sb-right { display: flex; gap: 10px; white-space: nowrap; }
 #sb-prov { color: var(--text-dim); }
 #sb-reason { color: var(--text-faint); }
-#sb-yolo {
+#sb-yolo, #sb-sandbox {
   color: var(--warn); border: 1px solid var(--warn); border-radius: 999px;
   padding: 0 8px; font-size: 10px; font-weight: 600; letter-spacing: 0.12em;
   animation: pulse 1.4s infinite;
 }
-#sb-yolo[hidden] { display: none; }
+#sb-yolo[hidden], #sb-sandbox[hidden] { display: none; }
 
 /* ---------- error card ---------- */
 .errcard {
