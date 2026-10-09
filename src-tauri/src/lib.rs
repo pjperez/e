@@ -415,6 +415,61 @@ fn plugin_veto_result(id: String, reason: Option<String>) {
     plugins::veto_resolve(&id, reason);
 }
 
+/// One tool call made from inside a codemode script. Authorised only for a
+/// run actually in flight, and gated exactly like a call the model made
+/// itself: plugin veto, then approval for risky tools, then execution. A
+/// refusal is a result (`ok: false`), not an error, so the script's promise
+/// rejects with the reason instead of the round-trip collapsing.
+#[tauri::command(async)]
+fn codemode_tool_call(
+    state: tauri::State<'_, AppState>,
+    sid: String,
+    session: String,
+    name: String,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if !engine::codemode::run_active(&sid) {
+        return Err("no such codemode run".to_string());
+    }
+    // No recursion: a script that could start scripts could outrun every
+    // timeout and output cap put on it.
+    if name == "codemode" {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "output": "codemode cannot be called from inside a codemode script"
+        }));
+    }
+    let ws = state.store.lock().map_err(|_| "lock")?.resolved_workspace(&session);
+    let yolo = state.config().yolo;
+    if let Some(reason) = plugins::veto(&session, &name, &arguments) {
+        return Ok(serde_json::json!({ "ok": false, "output": format!("Blocked by a plugin: {reason}") }));
+    }
+    if engine::tools::RISKY.contains(&name.as_str()) && !yolo {
+        let tc = engine::ToolCall { id: String::new(), name: name.clone(), arguments: arguments.clone() };
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let preview = engine::agent::tool_preview(&tc);
+        if !engine::approval::request(&session, &name, &preview, &cancelled) {
+            return Ok(serde_json::json!({ "ok": false, "output": "Denied by user" }));
+        }
+    }
+    let ctx = engine::tools::ToolContext { workspace: ws.into(), session: session.clone() };
+    let (ok, output) = engine::tools::run_tool(&state.tools, &ctx, &name, arguments);
+    Ok(serde_json::json!({ "ok": ok, "output": output }))
+}
+
+/// The frontend's answer to `e:codemode_run`: the run's shaped output.
+#[tauri::command]
+fn codemode_result(sid: String, ok: bool, output: String) {
+    engine::codemode::resolve(&sid, ok, output);
+}
+
+/// The frontend announces its codemode host at boot, so the tool can refuse
+/// fast in windows (and processes) that cannot run scripts at all.
+#[tauri::command]
+fn set_codemode_active(active: bool) {
+    engine::codemode::set_hosted(active);
+}
+
 #[tauri::command]
 fn list_mcp_servers() -> Vec<engine::mcp::McpStatus> {
     engine::mcp::status()
@@ -1605,6 +1660,7 @@ pub fn run() {
         .setup(|app| {
             plugins::init(app.handle().clone());
             approval::init(app.handle().clone());
+            engine::codemode::init(app.handle().clone());
             engine::pty::init(app.handle().clone());
             // Closing a task cleans up in the background, so anything a crash
             // interrupted is still on disk. Collect it now, off the startup
@@ -1655,6 +1711,9 @@ pub fn run() {
             set_plugin_enabled,
             set_plugin_tools,
             plugin_tool_result,
+            codemode_tool_call,
+            codemode_result,
+            set_codemode_active,
             set_plugin_veto,
             plugin_veto_result,
             list_mcp_servers,

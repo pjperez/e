@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub mod approval;
 pub mod browse;
+pub mod codemode;
 pub mod credentials;
 pub mod identity;
 pub mod jobs;

@@ -689,7 +689,10 @@ impl Agent {
     }
 
     fn workspace_ctx(&self) -> ToolContext {
-        ToolContext { workspace: std::path::PathBuf::from(&self.config.workspace) }
+        ToolContext {
+            workspace: std::path::PathBuf::from(&self.config.workspace),
+            session: self.session.clone(),
+        }
     }
 
     /// Where this chat is working, spelled out for the model. Being explicit
@@ -866,7 +869,7 @@ impl Agent {
                 return stats;
             }
 
-            const RISKY: [&str; 2] = ["powershell", "write_file"];
+            const RISKY: [&str; 2] = crate::engine::tools::RISKY;
             let ctx = self.workspace_ctx();
             for tc in &completion.tool_calls {
                 if cancelled.load(Ordering::SeqCst) {
@@ -925,7 +928,9 @@ fn finish_stopped<F: Emitter>(mut stats: RunStats, emit: &F) -> RunStats {
 
 /// A short, human-readable description of what a tool call is about to do,
 /// shown in the approval prompt so the user can decide without guessing.
-fn tool_preview(tc: &crate::engine::ToolCall) -> String {
+/// Public because codemode's command path shows the same preview for calls a
+/// script makes — the user must be approving the same thing either way.
+pub fn tool_preview(tc: &crate::engine::ToolCall) -> String {
     let raw = tc
         .arguments
         .get("command")
